@@ -12,9 +12,10 @@ The full concept is in `KONZEPT.md`; its naming conventions and configuration mo
 
 ```
 crates/
-  docsweep-core/     Config, index, mail pipeline, secrets, recipes, recipe engine, schedules and automation
-    src/portal/      Recipe model, login secrets, `BrowserDriver`, `ConfirmationHandler` and `PortalFetcher` traits, engine
-  docsweep-browser/  Installed Chrome/Edge through CDP (chromiumoxide), `fetch_company`, `BrowserFetcher`; later recorder
+  docsweep-core/     Config, index, mail pipeline, secrets, recipes, recipe engine, schedules, automation and AI
+    src/portal/      Recipe model, login secrets, `BrowserDriver`, `ConfirmationHandler` and `PortalFetcher` traits, engine, `hosts`, `draft`, `recording`
+    src/ai/          `sanitize`, providers, prompts, checks of model output, recipe generation
+  docsweep-browser/  Installed Chrome/Edge through CDP (chromiumoxide), `fetch_company`, `BrowserFetcher`, `read_page`, `Recorder`
     tests/           Real-browser tests against a fictional portal; `tests/fixtures/portal` holds its pages
   docsweep-cli/      Binary `docsweep`
   docsweep-gui/      Desktop app "Docsweep" (Tauri 2), Cargo binary `docsweep-gui`
@@ -41,6 +42,8 @@ cargo test -p docsweep-core -- --ignored keychain handshake  # real keychain, ne
 cargo run -p docsweep-cli -- mail-scan --dry-run
 cargo run -p docsweep-cli -- fetch <company> --dry-run
 cargo run -p docsweep-cli -- test-recipe <file> [--company <id>]
+cargo run -p docsweep-cli -- recipe generate <company> --url <url> [--describe "..."]
+cargo run -p docsweep-cli -- recipe record <company> --url <url>   # opens a window
 cargo run -p docsweep-gui
 cargo install tauri-cli --locked      # once, for bundling
 (cd crates/docsweep-gui && cargo tauri build)
@@ -74,6 +77,12 @@ cargo install tauri-cli --locked      # once, for bundling
 - A `needs_review` document is completed in the GUI (`review::complete_review`). The next scan then recognises the file as stored and cleans up its mail.
 - The interface never receives a secret: commands only accept them and report whether one exists. Text from mails and PDFs is untrusted, so `ui/lib/dom.js` only creates text nodes; never assign HTML strings.
 - The web view has only `core:default`. File, mail and keychain access goes through the app's own commands, and those take index ids rather than paths.
+- AI is optional, and a portal run never needs it. Only `ai::sanitize::sanitize` can build a `SanitizedPrompt`, and `LlmProviderClient` takes nothing else, so all data for a provider passes through that one function. It copies from an allow-list instead of removing things. Add to the allow-list only what a selector needs. Instructions in `ai/prompts.rs` hold no data.
+- A provider's error body is never read, because it could echo the key: errors are fixed texts by status code. Providers do not follow redirects. Endpoints are constants, and tests pass their own to `Anthropic::new` or `OpenAiCompatible::new`; no configuration or environment variable may change them. `llm.model` is required for OpenAI and OpenRouter, because Docsweep does not guess their model names; `provider::ANTHROPIC_DEFAULT_MODEL` is the only hard-coded model.
+- Model output and page content are untrusted. `ai::output` only parses into the typed recipe model. A repair may change selectors of a `login` or `extract_list` step only: not its kind, list fields, `empty`, `max_pages` or whether a TOTP field exists. A model cannot set `ai_fallback`.
+- `portal::hosts::HostBinding` is the only check for hosts in recipes from elsewhere. Anything that leaves the known hosts needs a person who saw the old and the new host; automated paths refuse it instead. Shared recipes must use it too.
+- Repair (`Run::step_with_repair`) needs `ai_fallback: repair_step`, a configured provider, and no earlier repair in the run. It never runs after a submit, for a dry run, on a captcha or a detected confirmation, or on a page outside the recipe's hosts, and the first send per company and provider needs `ConfirmationHandler::approve_ai_send` (the default answer is no; consent is in the index table `ai_consents`). The recipe is only saved after the whole run succeeded with the new step, through `portal::draft::save_repaired_step`, which keeps a `.bak` and leaves a file alone that changed during the run. A repaired login is only typed into pages on the recipe's hosts, and the password only into `[type=password]`.
+- The recorder's listener (`docsweep-browser/src/recorder.js`) must never read a typed value, and a test checks its text for that. Its events come from a page, so `portal::recording::build_draft` checks selectors and addresses again. Recorder and AI only ever write draft files; a person decides whether to use them.
 - `defaults.output_dir` is the folder for companies without their own `output.dir`; settings that apply to everything belong on the Settings page.
 - Unsaved company forms are kept as drafts in the web view's `localStorage`. Never put secrets into anything stored there.
 - Core error messages are English for now; they need keys before the German translation.
@@ -83,7 +92,8 @@ cargo install tauri-cli --locked      # once, for bundling
 
 - No real credentials, mails or invoices in the repo. Tests use fixtures (saved HTML pages, sample mails with dummy PDFs) and a local IMAP test server (GreenMail).
 - Passwords, TOTP keys and API keys only through the `keyring` crate. The configuration holds only references (`keyring:<id>`).
-- Passwords, TOTP codes and cookies never go to a language model and never into logs or error messages.
+- Passwords, TOTP codes, TOTP keys, cookies, session tokens and API keys never go to a language model and never into logs, error messages or reports.
+- No request to a real provider, portal or mailbox in tests: providers are `ai::test_support::FakeProviderServer`.
 - Mails are moved or deleted only after the invoice is provably stored and in the index. "Delete" means moving to the trash by default.
 - No captcha circumvention.
 - Unencrypted IMAP must stay unreachable from the YAML configuration; it exists only for tests through the internal API.

@@ -2,7 +2,7 @@
 
 Docsweep is a free desktop app for macOS, Windows and Linux that collects incoming invoices for you. It saves PDF attachments from your mailbox under a consistent file name, fetches invoices from customer portals with recipes, keeps an index to catch duplicates, and tidies up the mails afterwards.
 
-> **Status: early development.** The mail pipeline, portal downloads, link mails that start a download, schedules, the `docsweep` command line tool and a first version of the desktop app work. There are no signed builds so far.
+> **Status: early development.** The mail pipeline, portal downloads, link mails that start a download, schedules, the recipe recorder, optional AI help for recipes, the `docsweep` command line tool and a first version of the desktop app work. There are no signed builds so far.
 
 ## How it works
 
@@ -187,13 +187,43 @@ companies:
 
 If an automatic run needs a person, the window comes up with the usual dialog and its time limit. If nobody answers, the run fails for that company and the others go on. Automatic runs are marked in the history, except for checks that found nothing to do, and problems show as a badge on "History" and a notice on the Scan page.
 
+## Recording and AI help
+
+A portal run needs no AI. If you would rather not write a recipe by hand, there are two ways to get a draft, written to `<company>.draft.yaml` in the recipes folder. An existing file is only replaced if you agree. Check a draft with `docsweep test-recipe <file> --company <id>`, then point `portal.recipe` at it. In the app, both are in the company editor under "Make a recipe".
+
+```sh
+docsweep recipe record example --url https://portal.example.com/login
+docsweep recipe generate example --url https://portal.example.com/login --describe "Invoices are under Billing"
+```
+
+**Recording** opens a browser window with the company's profile. Log in as usual, go to your invoices and click one document link in the list. Docsweep notes selectors and what kind of field you used, and never what you type: a password field and a code field become the `login` step, with the app filling in the values at each run. No page content and no cookies are kept. The draft says in its comments what is still to do, such as adding `logged_in`.
+
+**Generating** and **repairing** use a language model with your own API key. Without an `llm` section, nothing is ever sent. In the app, it is set up under Settings, in the card "AI help", where the key goes straight into the system keychain.
+
+```yaml
+llm:
+  provider: anthropic        # anthropic, openai or openrouter
+  api_key: keyring:llm-key   # store it with: docsweep secret set llm-key
+  model: claude-sonnet-5-5   # required for openai and openrouter; anthropic defaults to claude-fable-5-1, its most capable and expensive model
+```
+
+For Anthropic, Docsweep also asks the API to rerun a request on another model if a safety classifier wrongly declines it (`fallbacks: "default"`).
+
+To let a recipe be repaired, add `ai_fallback: repair_step` to its file (`off` is the default; `full_agent` is not available). If a `login` or `extract_list` step no longer matches, the provider gets one chance to suggest new selectors, at most once per run. The recipe is only saved once the whole run worked with the new step, the previous file stays as `<recipe>.bak`, and the report and history say so. A dry run sends nothing and only says that a repair would be possible. A login that was already submitted is not repaired in that run, because the credentials would go out twice.
+
+What protects you:
+
+- The model never sees passwords, TOTP codes, cookies, session tokens or keys. Everything sent goes through one sanitiser: of a page, only tag names, a few attributes that selectors need, and text remain. Field values, hidden fields, scripts, styles, comments, query strings and images are gone, and mail addresses and long digit runs such as IBANs are replaced. **Names and postal addresses in page text can remain.** So you see exactly this text and have to agree: each time you generate, and before the first repair per company and provider. After that, repairs go without asking, including in automatic runs, and each is reported.
+- Page content and answers are untrusted, because a page can try to talk a model into something. An answer is only parsed into the recipe format and validated; it cannot run anything. A repair can only change selectors of its own step, and the password only goes into a real password field. A generated recipe with a `goto` or `login` on a new host is only kept if you confirm it after seeing the old and new host; a repair cannot change a host at all, and sends nothing while the browser is on a host the recipe does not know.
+- A captcha goes to you as usual, never to a model. Downloads still go through the index comparison, the duplicate check and normal storage.
+
 ## Development
 
 See [CLAUDE.md](CLAUDE.md) for the workspace layout, commands and rules, and [KONZEPT.md](KONZEPT.md) for the full concept (in German).
 
 ## Kurzfassung auf Deutsch
 
-Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, von Hand, ausgelöst durch Weblink-Mails oder nach Zeitplan. Automatische Läufe sind aus, bis man sie einschaltet. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
+Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, von Hand, ausgelöst durch Weblink-Mails oder nach Zeitplan. Automatische Läufe sind aus, bis man sie einschaltet. Rezepte lassen sich im Browser aufzeichnen, und mit eigenem API-Schlüssel kann ein Sprachmodell Entwürfe schreiben und einzelne Schritte reparieren; es sieht nie Passwörter, Codes oder Cookies. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
 
 ## License
 
