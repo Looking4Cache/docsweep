@@ -1,0 +1,99 @@
+name: Release
+
+# Runs only for release tags. Signing belongs here and nowhere else, so ordinary
+# builds and pull requests never have access to signing secrets.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # create the draft release and attach its files
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM
+            os: macos-15
+            cli_archive: docsweep-cli-macos-arm64.tar.gz
+          - name: macOS Intel
+            os: macos-15-intel
+            cli_archive: docsweep-cli-macos-x64.tar.gz
+          - name: Windows
+            os: windows-latest
+            cli_archive: docsweep-cli-windows-x64.zip
+          - name: Linux
+            os: ubuntu-24.04
+            cli_archive: docsweep-cli-linux-x64.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libdbus-1-dev
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked --version "^2"
+
+      - name: Build and publish the app bundle
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS signing and notarization (KONZEPT.md section 10a), add when ready:
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows signing via Microsoft Artifact Signing, add when ready. It needs
+          # these secrets plus `bundle.windows.signCommand` in tauri.conf.json:
+          # AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          # AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          # AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        with:
+          projectPath: crates/docsweep-gui
+          tauriScript: cargo tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: Docsweep ${{ github.ref_name }}
+          releaseDraft: true
+
+      # A separate target directory keeps `docsweep` apart from the renamed GUI
+      # binary, which would collide with it on Linux and on case-insensitive
+      # file systems.
+      - name: Build the CLI
+        shell: bash
+        run: CARGO_TARGET_DIR=target-cli cargo build --release --locked -p docsweep-cli
+
+      - name: Package the CLI
+        shell: bash
+        env:
+          CLI_ARCHIVE: ${{ matrix.cli_archive }}
+        run: |
+          cd target-cli/release
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$GITHUB_WORKSPACE/$CLI_ARCHIVE" docsweep.exe
+          else
+            tar czf "$GITHUB_WORKSPACE/$CLI_ARCHIVE" docsweep
+          fi
+
+      - name: Attach the CLI to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLI_ARCHIVE: ${{ matrix.cli_archive }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" "$CLI_ARCHIVE" --repo "$GITHUB_REPOSITORY" --clobber
