@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicBool;
 
 use docsweep_core::names;
 use docsweep_core::paths::AppDirs;
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::{Manager, WindowEvent};
 
 /// Bundle ID, read from `tauri.conf.json` by the build script.
 const BUNDLE_ID: &str = env!("DOCSWEEP_BUNDLE_ID");
@@ -81,7 +81,7 @@ fn main() {
     app.run(|handle, event| {
         // macOS: clicking the Dock icon brings a hidden window back.
         #[cfg(target_os = "macos")]
-        if let RunEvent::Reopen { .. } = event {
+        if let tauri::RunEvent::Reopen { .. } = event {
             tray::show_window(handle);
         }
         #[cfg(not(target_os = "macos"))]
