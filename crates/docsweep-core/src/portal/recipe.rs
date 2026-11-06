@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::config::{Issue, Report, format_issues};
@@ -17,22 +17,26 @@ const DEFAULT_CONFIRMATION_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_PAGES: u32 = 50;
 
 /// A complete recipe.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     /// Values for `{name}` placeholders in `goto`, such as the domain of a
     /// multi-domain portal. A company can override them with `portal.params`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
     /// When a person has to help, and how long the run waits for them.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Confirmation::is_default")]
     pub confirmation: Confirmation,
     /// How long a step waits for the page before asking a person.
-    #[serde(default = "default_step_timeout")]
+    #[serde(
+        default = "default_step_timeout",
+        skip_serializing_if = "is_default_step_timeout"
+    )]
     pub step_timeout_secs: u64,
     pub steps: Vec<Step>,
-    /// Parsed for the AI milestone; has no effect yet.
-    #[serde(default)]
+    /// Whether a language model may repair a step that no longer matches the
+    /// portal. Nothing is sent anywhere unless this says so.
+    #[serde(default, skip_serializing_if = "AiFallback::is_off")]
     pub ai_fallback: AiFallback,
 }
 
@@ -40,16 +44,26 @@ fn default_step_timeout() -> u64 {
     DEFAULT_STEP_TIMEOUT_SECS
 }
 
+fn is_default_step_timeout(secs: &u64) -> bool {
+    *secs == DEFAULT_STEP_TIMEOUT_SECS
+}
+
 /// The `confirmation` section.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Confirmation {
     /// Selector that shows a captcha or a mail or push confirmation. It is
     /// checked after every step and while waiting for the page.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detect: Option<String>,
     #[serde(default = "default_confirmation_timeout")]
     pub timeout_secs: u64,
+}
+
+impl Confirmation {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl Default for Confirmation {
@@ -65,8 +79,9 @@ fn default_confirmation_timeout() -> u64 {
     DEFAULT_CONFIRMATION_TIMEOUT_SECS
 }
 
-/// The AI modes of a recipe.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+/// The AI modes of a recipe. `full_agent` from the concept can be written down,
+/// but validation refuses it: it is not available.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiFallback {
     #[default]
@@ -75,8 +90,14 @@ pub enum AiFallback {
     FullAgent,
 }
 
+impl AiFallback {
+    fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+}
+
 /// One step of a recipe.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Step {
     Goto(String),
@@ -87,7 +108,8 @@ pub enum Step {
 }
 
 impl Step {
-    fn name(&self) -> &'static str {
+    /// The name of this kind of step, as in a recipe file.
+    pub fn name(&self) -> &'static str {
         match self {
             Self::Goto(_) => "goto",
             Self::DismissCookieBanner(_) => "dismiss_cookie_banner",
@@ -99,7 +121,7 @@ impl Step {
 }
 
 /// `true` tries the usual banner buttons; a selector names the button.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged, expecting = "`true`, `false` or a selector")]
 pub enum CookieBanner {
     Enabled(bool),
@@ -107,44 +129,47 @@ pub enum CookieBanner {
 }
 
 /// The `login` step. The app fills these fields itself.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoginStep {
     pub user: String,
     pub password: String,
     pub submit: String,
     /// Field for the TOTP code, on the same or a following page.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp: Option<String>,
     /// Button for the TOTP code; without it, `submit` is used again.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp_submit: Option<String>,
     /// Button between user name and password, if they are on separate pages.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     /// Shows an active session, in which case the login is skipped. Profiles
     /// keep sessions, so recipes should name this.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logged_in: Option<String>,
 }
 
 /// The `extract_list` step. Field values are `selector`, for its text, or
 /// `selector@attribute`; `@attribute` alone reads the row itself.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractList {
     pub rows: String,
     pub fields: BTreeMap<String, String>,
     /// Shows an empty list, so that it is not taken for a page that never loaded.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub empty: Option<String>,
     /// Link or button to the next page of the list.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_page: Option<String>,
-    #[serde(default = "default_max_pages")]
+    #[serde(
+        default = "default_max_pages",
+        skip_serializing_if = "is_default_max_pages"
+    )]
     pub max_pages: u32,
     /// Each row leads to a page with its documents, as with orders.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_detail: Option<OpenDetail>,
 }
 
@@ -152,9 +177,13 @@ fn default_max_pages() -> u32 {
     DEFAULT_MAX_PAGES
 }
 
+fn is_default_max_pages(pages: &u32) -> bool {
+    *pages == DEFAULT_MAX_PAGES
+}
+
 /// A detail page with any number of documents per list row. A document inherits
 /// the fields of its row. No document at all counts as "missing".
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenDetail {
     /// The field of the list row that holds the link.
@@ -162,18 +191,18 @@ pub struct OpenDetail {
     pub rows: String,
     pub fields: BTreeMap<String, String>,
     /// Shows that this page has no documents, which saves waiting for them.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missing: Option<String>,
 }
 
 /// The `download_new` step.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadNew {
     /// The field that identifies a document across runs.
     pub key: String,
     /// Print documents that are HTML pages rather than PDFs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub html_to_pdf: bool,
 }
 
@@ -247,6 +276,14 @@ impl Recipe {
     /// Parses and validates YAML text.
     pub fn from_yaml(input: &str) -> Result<Self, RecipeError> {
         Self::parse(input, "the recipe")
+    }
+
+    /// This recipe as YAML. Comments of a loaded file are not kept.
+    pub fn to_yaml(&self) -> Result<String, RecipeError> {
+        serde_saphyr::to_string(self).map_err(|e| RecipeError::Syntax {
+            origin: "the recipe".to_owned(),
+            message: e.to_string(),
+        })
     }
 
     fn parse(input: &str, origin: &str) -> Result<Self, RecipeError> {
@@ -325,6 +362,12 @@ impl Recipe {
         let mut report = Report::default();
         if self.steps.is_empty() {
             report.add("steps", "at least one step is required");
+        }
+        if self.ai_fallback == AiFallback::FullAgent {
+            report.add(
+                "ai_fallback",
+                "`full_agent` is not available; use `off` or `repair_step`",
+            );
         }
         if self.step_timeout_secs == 0 {
             report.add("step_timeout_secs", "must be at least 1");
@@ -509,7 +552,7 @@ steps:
   - download_new:
       key: invoice_no
       html_to_pdf: true
-ai_fallback: repair_step             # off | repair_step | full_agent
+ai_fallback: repair_step             # off | repair_step
 "##;
 
     fn issues_of(yaml: &str) -> Vec<Issue> {
@@ -698,6 +741,50 @@ steps:
                 "steps[0].extract_list.open_detail.fields",
             ]
         );
+    }
+
+    #[test]
+    fn the_full_agent_mode_is_refused_and_off_is_the_default() {
+        let steps = r#"steps: [ { goto: "https://portal.test/" } ]"#;
+        let error = Recipe::from_yaml(&format!("ai_fallback: full_agent\n{steps}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`full_agent` is not available"), "{error}");
+        assert_eq!(
+            Recipe::from_yaml(steps).unwrap().ai_fallback,
+            AiFallback::Off
+        );
+    }
+
+    #[test]
+    fn a_recipe_survives_being_written_and_read_again() {
+        for yaml in [
+            CONCEPT_EXAMPLE,
+            r##"
+params: { domain: shop.example }
+confirmation: { detect: "#captcha", timeout_secs: 60 }
+step_timeout_secs: 5
+steps:
+  - goto: https://{domain}/orders
+  - dismiss_cookie_banner: "#accept"
+  - extract_list:
+      rows: .order
+      empty: .no-orders
+      next_page: a.next
+      max_pages: 3
+      fields: { order_no: .number, detail: a.details@href }
+      open_detail:
+        url: detail
+        rows: li.document
+        missing: .no-documents
+        fields: { invoice_no: .number, url: a@href }
+  - download_new: { key: invoice_no }
+"##,
+        ] {
+            let recipe = Recipe::from_yaml(yaml).unwrap();
+            let written = recipe.to_yaml().unwrap();
+            assert_eq!(Recipe::from_yaml(&written).unwrap(), recipe, "{written}");
+        }
     }
 
     #[test]

@@ -31,7 +31,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Automation::is_off")]
     pub automation: Automation,
     pub mail: MailConfig,
-    /// Optional AI provider; unused until the AI milestone.
+    /// Optional AI provider, with the user's own key. Without it, nothing is ever
+    /// sent to a language model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmConfig>,
     #[serde(default)]
@@ -132,6 +133,24 @@ pub enum DisposalMode {
 pub struct LlmConfig {
     pub provider: LlmProvider,
     pub api_key: SecretRef,
+    /// Required for `openai` and `openrouter`, whose model names Docsweep does
+    /// not guess. `anthropic` has a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl LlmConfig {
+    fn validate(&self, report: &mut Report) {
+        report.secret("llm.api_key", &self.api_key);
+        match &self.model {
+            Some(model) => report.not_blank("llm.model", model),
+            None if self.provider != LlmProvider::Anthropic => report.add(
+                "llm.model",
+                "is required for this provider; use the name of a model it offers",
+            ),
+            None => {}
+        }
+    }
 }
 
 /// Supported AI providers.
@@ -392,7 +411,7 @@ impl Config {
         }
         self.mail.validate(&mut report);
         if let Some(llm) = &self.llm {
-            report.secret("llm.api_key", &llm.api_key);
+            llm.validate(&mut report);
         }
         report.unique_ids(
             "companies",
@@ -680,6 +699,26 @@ mail:
                 move_to: "Rechnungen/Hetzner".into()
             }))
         );
+    }
+
+    #[test]
+    fn a_model_is_optional_for_anthropic_and_required_otherwise() {
+        let with = |llm: &str| Config::from_yaml(&format!("{MINIMAL_MAIL}\nllm: {llm}\n"));
+        let parsed = with(r#"{ provider: anthropic, api_key: "keyring:k" }"#).unwrap();
+        assert_eq!(parsed.llm.unwrap().model, None);
+        let parsed =
+            with(r#"{ provider: openai, api_key: "keyring:k", model: my-model }"#).unwrap();
+        assert_eq!(parsed.llm.unwrap().model.as_deref(), Some("my-model"));
+        for provider in ["openai", "openrouter"] {
+            let error = with(&format!(
+                r#"{{ provider: {provider}, api_key: "keyring:k" }}"#
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("llm.model"), "{error}");
+        }
+        let blank = with(r#"{ provider: anthropic, api_key: "keyring:k", model: " " }"#);
+        assert!(blank.unwrap_err().to_string().contains("llm.model"));
     }
 
     #[test]
