@@ -1495,6 +1495,46 @@ companies:
     }
 
     #[test]
+    fn an_imported_invoice_leads_the_next_scan_to_clean_up_the_link_mail() {
+        use crate::pickup::{LocalFolder, import_file};
+
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        assert!(mailbox.untouched());
+
+        let downloads = tempfile::tempdir().unwrap();
+        fs::write(
+            downloads.path().join("invoice.pdf"),
+            test_pdf::with_text(&["Rechnungsnummer: R-1", "Rechnungsdatum: 01.01.2030"]),
+        )
+        .unwrap();
+        let folder = LocalFolder::new(downloads.path().to_path_buf());
+        import_file(
+            &setup.config,
+            &setup.config.companies[0],
+            &index,
+            &folder,
+            "invoice.pdf",
+            None,
+            day(1),
+        )
+        .unwrap();
+        // Not before a scan: a pick-up alone does not touch the mailbox.
+        assert!(mailbox.untouched());
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(mailbox.trashed, [1]);
+        assert!(mailbox.flagged.is_empty());
+        assert!(portal.started.is_empty());
+        assert!(matches!(mails[0].outcome, Outcome::LinkResolved { .. }));
+        assert!(setup.dir.path().join("R-1.pdf").exists());
+    }
+
+    #[test]
     fn a_dry_run_only_shows_that_a_download_would_start_and_changes_nothing() {
         let setup = setup(MOVE, WITH_PORTAL);
         let rules = RuleSet::new(&setup.config);

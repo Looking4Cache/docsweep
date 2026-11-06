@@ -432,15 +432,42 @@ impl Index {
         mail_account: &str,
         mail_id: &str,
     ) -> Result<bool, IndexError> {
-        let mut statement = self.conn.prepare(
+        self.link_mail_matches(company_id, mail_account, mail_id, "'stored'")
+    }
+
+    /// Like [`Self::has_invoice_for_link_mail`], but a document waiting for review
+    /// counts too: it is here, even if its mail has to wait.
+    pub fn link_mail_has_document(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<bool, IndexError> {
+        self.link_mail_matches(
+            company_id,
+            mail_account,
+            mail_id,
+            "'stored', 'needs_review'",
+        )
+    }
+
+    /// `statuses` is one of the fixed lists above, never input.
+    fn link_mail_matches(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+        statuses: &str,
+    ) -> Result<bool, IndexError> {
+        let mut statement = self.conn.prepare(&format!(
             "SELECT invoice.file_path FROM invoices AS invoice
              JOIN invoices AS link ON link.company_id = invoice.company_id
              WHERE link.company_id = ?1 AND link.mail_account = ?2 AND link.mail_id = ?3
                AND link.status = 'portal_fetch_required'
-               AND invoice.source = 'portal' AND invoice.status = 'stored'
+               AND invoice.source = 'portal' AND invoice.status IN ({statuses})
                AND invoice.file_path IS NOT NULL
-               AND (invoice.id > link.id OR invoice.invoice_date >= link.invoice_date)",
-        )?;
+               AND (invoice.id > link.id OR invoice.invoice_date >= link.invoice_date)"
+        ))?;
         let paths = statement.query_map(params![company_id, mail_account, mail_id], |row| {
             row.get::<_, String>(0)
         })?;
@@ -450,6 +477,22 @@ impl Index {
             }
         }
         Ok(false)
+    }
+
+    /// The noted link mails that are not done yet, newest first. An index from
+    /// before `resolved_at` has no pick-ups to show, since a real run migrates it
+    /// before noting any for an assisted company.
+    pub fn waiting_link_mails(&self) -> Result<Vec<InvoiceRecord>, IndexError> {
+        if schema_version(&self.conn)? < AUTOMATION_VERSION {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT * FROM invoices
+             WHERE status = 'portal_fetch_required' AND resolved_at IS NULL
+             ORDER BY id DESC",
+        )?;
+        let rows = statement.query_map([], InvoiceRecord::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Records that a link mail's invoice is stored and the mail was cleaned up.
@@ -648,6 +691,16 @@ impl Index {
     /// Makes every later write fail, to test how callers react.
     pub(crate) fn break_for_test(&self) {
         self.conn.execute_batch("DROP TABLE invoices").unwrap();
+    }
+
+    /// Makes every later insert fail, while reads go on working.
+    pub(crate) fn refuse_inserts_for_test(&self) {
+        self.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER refuse BEFORE INSERT ON main.invoices
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
     }
 }
 

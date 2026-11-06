@@ -9,6 +9,7 @@ pub mod mail;
 pub mod names;
 pub mod naming;
 pub mod paths;
+pub mod pickup;
 pub mod portal;
 pub mod review;
 pub mod schedule;
