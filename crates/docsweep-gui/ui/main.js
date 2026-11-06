@@ -138,6 +138,8 @@ async function start() {
   app.configPath = state.config_path;
   app.passwords = new Map(state.stored_passwords);
   app.portalSecrets = new Map(state.stored_portal_secrets);
+  app.llmKeyStored = state.llm_key_stored;
+  app.anthropicDefaultModel = state.anthropic_default_model;
   watchPortalConfirmations();
   onAutomationStatus(({ running }) => {
     app.automationRunning = running;

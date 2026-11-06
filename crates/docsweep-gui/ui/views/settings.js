@@ -8,7 +8,7 @@ export function renderSettings(app) {
   const root = h("div", { class: "page" });
 
   // One card with its own save button, so changes stay easy to oversee.
-  function card({ title, lead, form, extra, save }) {
+  function card({ title, lead, form, extra, save, afterSave }) {
     const message = h("div", {});
     const saveButton = h("button", {
       class: "button button-primary",
@@ -19,6 +19,7 @@ export function renderSettings(app) {
           const config = save();
           await api.saveConfig(config);
           app.setConfig(config);
+          await afterSave?.(config);
           toast(t("common.saved"));
         } catch (error) {
           const unplaced = showIssues(form, error?.issues ?? []);
@@ -153,11 +154,96 @@ export function renderSettings(app) {
     });
   }
 
+  // The key goes into the keychain once and cannot be read back. The configuration
+  // only ever holds the reference to it.
+  function aiCard() {
+    const existing = app.config.llm;
+    let enabled = Boolean(existing);
+    let provider = existing?.provider ?? "anthropic";
+    let model = existing?.model ?? "";
+    const keyInput = h("input", { type: "password", autocomplete: "off" });
+
+    const modelHint = h("span", {});
+    const refreshHint = () => {
+      modelHint.textContent = provider === "anthropic"
+        ? t("ai.model_default", { model: app.anthropicDefaultModel })
+        : t("ai.model_required");
+    };
+    refreshHint();
+
+    const providers = h("div", { class: "segmented", role: "radiogroup" }, ["anthropic", "openai", "openrouter"].map((choice) =>
+      h("button", {
+        class: `segment${provider === choice ? " is-active" : ""}`,
+        role: "radio",
+        "aria-checked": String(provider === choice),
+        onclick: (event) => {
+          provider = choice;
+          for (const button of providers.children) {
+            button.classList.remove("is-active");
+            button.setAttribute("aria-checked", "false");
+          }
+          event.currentTarget.classList.add("is-active");
+          event.currentTarget.setAttribute("aria-checked", "true");
+          refreshHint();
+        },
+      }, t(`ai.provider.${choice}`))));
+
+    const details = h("div", { class: "form", hidden: !enabled },
+      h("div", { class: "field" }, h("span", { class: "field-label" }, t("ai.provider")), providers),
+      field({
+        label: t("ai.model"),
+        hint: modelHint,
+        path: "llm.model",
+        input: textInput({ value: model, class: "mono", oninput: (event) => { model = event.target.value.trim(); } }),
+      }),
+      field({
+        label: t("ai.key"),
+        hint: t(app.llmKeyStored ? "ai.key_stored" : "ai.key_hint"),
+        path: "llm.api_key",
+        input: keyInput,
+      }),
+    );
+    const form = h("div", { class: "form" },
+      checkbox({
+        checked: enabled,
+        title: t("ai.enabled"),
+        hint: t("ai.enabled_hint"),
+        onChange: (value) => {
+          enabled = value;
+          details.hidden = !enabled;
+        },
+      }),
+      details,
+    );
+    return card({
+      title: t("ai.title"),
+      lead: t("ai.lead"),
+      form,
+      save: () => {
+        const { llm: _unused, ...rest } = app.config;
+        if (!enabled) return rest;
+        if (!app.llmKeyStored && !keyInput.value) {
+          throw { message: "", issues: [{ path: "llm.api_key", message: t("ai.key_missing") }] };
+        }
+        const llm = { provider, api_key: existing?.api_key ?? "keyring:llm-key" };
+        if (model) llm.model = model;
+        return { ...rest, llm };
+      },
+      afterSave: async (config) => {
+        if (!config.llm || !keyInput.value) return;
+        await api.setSecret(config.llm.api_key.replace("keyring:", ""), keyInput.value);
+        keyInput.value = "";
+        app.llmKeyStored = true;
+      },
+    });
+  }
+
   replace(root,
     pageHeader(t("settings.title"), t("settings.lead")),
     folderCard(),
     cleanupCard(),
     automationCard(),
+    aiCard(),
     h("article", { class: "card" },
       h("h2", { class: "card-heading" }, t("settings.about")),
       h("dl", { class: "about" },

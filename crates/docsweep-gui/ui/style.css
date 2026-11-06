@@ -890,3 +890,24 @@ input[type="text"].mono { padding: 7px 9px; font-family: var(--mono); font-size:
   }
   .sweep span { width: 100%; opacity: 0.6; transform: none; }
 }
+
+/* What would go to an AI provider, exactly as it would go. */
+.dialog-wide { width: min(780px, calc(100vw - 48px)); max-width: none; }
+.prompt-text {
+  margin: 0;
+  max-height: 46vh;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.recipe-tools { padding-top: 14px; border-top: 1px solid var(--line); }
+.recipe-tools h4 { margin: 0; font-size: 13px; font-weight: 600; color: var(--ink); }
+.recipe-note { margin-top: 4px; color: var(--ink-2); }

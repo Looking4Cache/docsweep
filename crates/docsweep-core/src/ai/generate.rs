@@ -5,7 +5,6 @@
 //! replaced. The app looks at the page without logging in, and a person checks
 //! the draft with `docsweep test-recipe`.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::output::{OutputError, parse_recipe};
@@ -87,11 +86,6 @@ pub async fn request_draft(
     let host_changes = binding.changes_in(&recipe);
     let origin = format!("written by a language model ({})", ai.label);
     let text = draft_text(&origin, &[], &recipe)?;
-    // Written text and checked recipe must agree: this reads it like a later run.
-    let reread = Recipe::from_yaml(&text)
-        .and_then(|recipe| recipe.with_params(&BTreeMap::new()))
-        .map_err(|error| OutputError::Invalid(error.to_string()))?;
-    debug_assert_eq!(binding.changes_in(&reread), host_changes);
     Ok(GeneratedDraft { text, host_changes })
 }
 

@@ -1,6 +1,6 @@
 // Shared building blocks: fields, dialogs, messages.
 
-import { api, onPortalConfirmation, onPortalConfirmationEnded } from "./api.js";
+import { api, onAiSendConfirmation, onPortalConfirmation, onPortalConfirmationEnded } from "./api.js";
 import { h, icon, replace } from "./dom.js";
 import { t } from "./i18n.js";
 
@@ -97,9 +97,9 @@ export function badge(tone, text, iconName) {
 }
 
 // A modal built on the native <dialog>, which brings focus handling and Escape.
-export function showDialog(build) {
+export function showDialog(build, { wide = false } = {}) {
   return new Promise((resolve) => {
-    const dialog = h("dialog", { class: "dialog" });
+    const dialog = h("dialog", { class: wide ? "dialog dialog-wide" : "dialog" });
     const close = (value) => {
       dialog.close();
       dialog.remove();
@@ -132,6 +132,22 @@ export function confirmDialog({ title, text, items = [], confirmLabel, danger = 
     )).then(Boolean);
 }
 
+// Shows exactly what would leave this computer, before it does.
+export function sendDialog({ title, lead, text, confirmLabel, onClose }) {
+  return showDialog((close) => {
+    onClose?.(close);
+    return h("div", { class: "dialog-body" },
+      h("h2", {}, title),
+      h("p", { class: "dialog-text" }, lead),
+      h("pre", { class: "prompt-text", tabindex: "0" }, text),
+      h("div", { class: "dialog-actions" },
+        h("button", { class: "button", onclick: () => close(false) }, t("ai.dont_send")),
+        h("button", { class: "button button-primary", onclick: () => close(true) }, confirmLabel),
+      ),
+    );
+  }, { wide: true });
+}
+
 // The question of a running portal fetch. It closes by itself when the fetch
 // stops waiting, and cancelling it ends that fetch.
 export function watchPortalConfirmations() {
@@ -152,6 +168,20 @@ export function watchPortalConfirmations() {
           h("button", { class: "button button-primary", onclick: () => close(true) }, t("confirmation.done")),
         ),
       );
+    }).then((answer) => {
+      if (answer === "replaced") return;
+      closeOpen = null;
+      if (answer !== "ended") api.answerConfirmation(answer === true);
+    });
+  });
+  onAiSendConfirmation((request) => {
+    closeOpen?.("replaced");
+    sendDialog({
+      title: t("ai.repair_title", { name: request.company_name, provider: request.provider }),
+      lead: t("ai.repair_lead", { provider: request.provider }),
+      text: request.text,
+      confirmLabel: t("ai.send_to", { provider: request.provider }),
+      onClose: (close) => { closeOpen = close; },
     }).then((answer) => {
       if (answer === "replaced") return;
       closeOpen = null;

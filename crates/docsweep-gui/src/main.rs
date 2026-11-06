@@ -33,6 +33,8 @@ pub struct AppState {
     pub automatic_run: AtomicBool,
     /// The question to a person that a portal fetch is waiting on.
     pub confirmation: Arc<commands::ConfirmationSlot>,
+    /// A recipe draft that is waiting for a person's decision.
+    pub recipe_work: std::sync::Mutex<commands::RecipeWork>,
 }
 
 fn resolve_paths() -> Option<commands::Paths> {
@@ -62,6 +64,7 @@ fn main() {
             scanning: RunGate::default(),
             automatic_run: AtomicBool::new(false),
             confirmation: Arc::default(),
+            recipe_work: std::sync::Mutex::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
@@ -73,6 +76,12 @@ fn main() {
             commands::run_scan,
             commands::run_fetch,
             commands::answer_confirmation,
+            commands::prepare_recipe,
+            commands::send_recipe_prompt,
+            commands::save_recipe_draft,
+            commands::discard_recipe_work,
+            commands::record_recipe,
+            commands::finish_recording,
             commands::list_invoices,
             commands::list_runs,
             commands::complete_review,

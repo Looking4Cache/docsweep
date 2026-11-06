@@ -200,11 +200,30 @@ function fetchEntryRow(entry, companyName) {
   );
 }
 
-// The reports of portal fetches: one row per list entry, by urgency.
+function noticeText(notice) {
+  switch (notice.kind) {
+    case "repaired":
+      return t("row.recipe_repaired", { provider: notice.provider, step: notice.step, file: fileName(notice.backup) });
+    case "repair_possible":
+      return t("row.repair_possible", { step: notice.step });
+    default:
+      return t("row.repair_not_done", { step: notice.step, reason: notice.reason });
+  }
+}
+
+// The reports of portal fetches: one row per list entry, by urgency. Whatever
+// happened to a recipe comes first, because a person should look at that.
 function fetchReportList(reports) {
-  const order = ["failed", "review", "save", "missing", "known"];
+  const order = ["recipe", "failed", "review", "save", "missing", "known"];
   const groups = Object.fromEntries(order.map((name) => [name, []]));
   for (const report of reports) {
+    for (const item of report.notices ?? []) {
+      groups.recipe.push(h("li", { class: "mail-row" },
+        h("div", { class: "mail-main" },
+          h("span", { class: "mail-subject" }, report.company_name),
+          h("p", { class: "recipe-note" }, noticeText(item))),
+        item.kind === "repaired" && h("div", { class: "mail-side" }, badge("warning", t("row.recipe_repaired_badge"), "flag"))));
+    }
     if (report.error) {
       groups.failed.push(h("li", { class: "mail-row" },
         h("div", { class: "mail-main" },
@@ -269,6 +288,7 @@ export function summaryStats(summary, dryRun) {
     ["portal", summary.portal_fetches, t("summary.portal")],
     ["unknown", summary.unknown_invoices, t("summary.unknown")],
     ["unknown", summary.missing, t("summary.missing")],
+    ["review", summary.repaired, t("summary.repaired")],
     ["failed", summary.failed, t("summary.failed")],
   ].filter(([, value]) => value > 0);
   return h("dl", { class: "stats" }, stats.map(([tone, value, label]) =>

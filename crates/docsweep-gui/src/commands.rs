@@ -6,15 +6,26 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
-use docsweep_browser::{BrowserFetcher, FetchOptions, FetchPaths, WindowMode, fetch_company};
-use docsweep_core::config::{Config, ConfigError, Issue, MailAccount, SecretRef};
+use docsweep_browser::{
+    BrowserFetcher, ChromeOptions, FetchOptions, FetchPaths, Recorder, WindowMode, fetch_company,
+    read_page,
+};
+use docsweep_core::ai::generate::{generation_prompt, known_hosts, request_draft};
+use docsweep_core::ai::provider::{self, ANTHROPIC_DEFAULT_MODEL};
+use docsweep_core::ai::sanitize::{RawPage, SanitizedPrompt};
+use docsweep_core::config::{Company, Config, ConfigError, Issue, MailAccount, SecretRef};
 use docsweep_core::index::{Index, IndexError, InvoiceRecord};
 use docsweep_core::mail::execute::{self, AccountReport, ScanReport, ScanSummary, summarize};
 use docsweep_core::names;
 use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
-use docsweep_core::portal::driver::{ConfirmationAnswer, ConfirmationHandler, ConfirmationRequest};
+use docsweep_core::portal::draft::{WriteError, draft_path, draft_text, write_draft};
+use docsweep_core::portal::driver::{
+    AiSendRequest, ConfirmationAnswer, ConfirmationHandler, ConfirmationRequest,
+};
 use docsweep_core::portal::engine::{FetchReport, FetchSummary, summarize_fetches};
+use docsweep_core::portal::hosts::{HostChange, is_web_address};
+use docsweep_core::portal::recording::build_draft;
 use docsweep_core::review;
 use docsweep_core::schedule::Schedule;
 use docsweep_core::secrets::{KeyringStore, SecretStore, SecretString};
@@ -95,6 +106,9 @@ pub struct AppSnapshot {
     stored_passwords: Vec<(String, bool)>,
     /// For each company with a portal, which of its secrets are in the keychain.
     stored_portal_secrets: Vec<(String, PortalSecrets)>,
+    /// Whether the API key of the AI provider is in the keychain; never its value.
+    llm_key_stored: bool,
+    anthropic_default_model: &'static str,
 }
 
 /// Whether the secrets of a portal exist; never their values.
@@ -147,6 +161,12 @@ fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
             Some((company.id.clone(), stored))
         })
         .collect();
+    let llm_key_stored = is_stored(
+        config
+            .as_ref()
+            .and_then(|config| config.llm.as_ref())
+            .map(|llm| &llm.api_key),
+    );
     AppSnapshot {
         info,
         config_path: paths.config.clone(),
@@ -154,6 +174,8 @@ fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
         config_error,
         stored_passwords,
         stored_portal_secrets,
+        llm_key_stored,
+        anthropic_default_model: ANTHROPIC_DEFAULT_MODEL,
     }
 }
 
@@ -238,6 +260,274 @@ pub async fn test_mailbox(account: MailAccount) -> Result<u32, UiError> {
             .map_err(UiError::new)
     })
     .await
+}
+
+/// A recipe draft on its way to a file. Between the commands, it stays here and
+/// not in the interface, so that what was shown is also what gets sent or written.
+#[derive(Debug, Default)]
+pub struct RecipeWork {
+    prompt: Option<PreparedPrompt>,
+    draft: Option<PendingDraft>,
+    stop_recording: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct PreparedPrompt {
+    company_id: String,
+    address: String,
+    prompt: SanitizedPrompt,
+}
+
+#[derive(Debug)]
+struct PendingDraft {
+    path: PathBuf,
+    text: String,
+    host_changes: Vec<HostChange>,
+}
+
+/// The text a person has to agree to before anything is sent.
+#[derive(Debug, Serialize)]
+pub struct PromptView {
+    provider: String,
+    text: String,
+}
+
+/// A draft that has not been written yet.
+#[derive(Debug, Serialize)]
+pub struct DraftView {
+    /// As it would go into the company's recipe field.
+    file_name: String,
+    text: String,
+    host_changes: Vec<HostChange>,
+    /// Writing would replace this file.
+    exists: bool,
+}
+
+impl PendingDraft {
+    fn view(&self) -> DraftView {
+        DraftView {
+            file_name: self
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            text: self.text.clone(),
+            host_changes: self.host_changes.clone(),
+            exists: self.path.exists(),
+        }
+    }
+
+    /// Nothing is written unless a person agreed to every new host and to
+    /// replacing a file, whatever the interface says it has shown.
+    fn write(&self, hosts_confirmed: bool, overwrite: bool) -> Result<(), UiError> {
+        if !self.host_changes.is_empty() && !hosts_confirmed {
+            return Err(UiError::new(
+                "this draft leaves the portal's known host, which needs your confirmation",
+            ));
+        }
+        write_draft(&self.path, &self.text, overwrite).map_err(|error| match error {
+            WriteError::Exists(path) => UiError::new(format!(
+                "{} already exists; it was left as it is",
+                path.display()
+            )),
+            other => UiError::new(other),
+        })
+    }
+}
+
+fn company_of<'a>(config: &'a Config, company_id: &str) -> Result<&'a Company, UiError> {
+    config
+        .companies
+        .iter()
+        .find(|company| company.id == company_id)
+        .ok_or_else(|| UiError::new(format!("no company `{company_id}` in the configuration")))
+}
+
+fn require_web_address(address: &str) -> Result<(), UiError> {
+    if is_web_address(address) {
+        Ok(())
+    } else {
+        Err(UiError::new("the address must start with https://"))
+    }
+}
+
+fn locked(state: &AppState) -> std::sync::MutexGuard<'_, RecipeWork> {
+    state.recipe_work.lock().expect("lock is never poisoned")
+}
+
+/// Looks at the page without logging in, and returns what would be sent. Nothing
+/// has left this computer yet.
+#[tauri::command]
+pub async fn prepare_recipe(
+    state: State<'_, AppState>,
+    company_id: String,
+    address: String,
+    description: String,
+) -> Result<PromptView, UiError> {
+    require_web_address(&address)?;
+    let Some(_permit) = state.scanning.try_start() else {
+        return Err(UiError::new(ALREADY_RUNNING));
+    };
+    let paths = state.paths.clone();
+    let company = company_id.clone();
+    let target = address.clone();
+    let (view, prompt) = blocking(move || {
+        let config = Config::load(&paths.config)?;
+        let company = company_of(&config, &company)?;
+        let llm = config
+            .llm
+            .as_ref()
+            .ok_or_else(|| UiError::new("no AI provider is set up under Settings"))?;
+        let ai = provider::from_config(llm, &KeyringStore).map_err(UiError::new)?;
+        let runtime = current_thread_runtime()?;
+        let page = runtime
+            .block_on(read_page(&paths.dirs.profile_dir(&company.id), &target))
+            .map_err(UiError::new)?;
+        let description = Some(description.trim()).filter(|text| !text.is_empty());
+        let prompt = generation_prompt(
+            &ai,
+            company,
+            RawPage {
+                url: &page.address,
+                html: &page.html,
+            },
+            description,
+        )
+        .map_err(UiError::new)?;
+        let view = PromptView {
+            provider: ai.label.clone(),
+            text: prompt.text().to_owned(),
+        };
+        Ok((view, prompt))
+    })
+    .await?;
+    locked(&state).prompt = Some(PreparedPrompt {
+        company_id,
+        address,
+        prompt,
+    });
+    Ok(view)
+}
+
+/// Sends the text a person just saw, and checks the answer.
+#[tauri::command]
+pub async fn send_recipe_prompt(state: State<'_, AppState>) -> Result<DraftView, UiError> {
+    let prepared = locked(&state)
+        .prompt
+        .take()
+        .ok_or_else(|| UiError::new("nothing is waiting to be sent"))?;
+    let paths = state.paths.clone();
+    let pending = blocking(move || {
+        let config = Config::load(&paths.config)?;
+        let company = company_of(&config, &prepared.company_id)?;
+        let llm = config
+            .llm
+            .as_ref()
+            .ok_or_else(|| UiError::new("no AI provider is set up under Settings"))?;
+        let ai = provider::from_config(llm, &KeyringStore).map_err(UiError::new)?;
+        let recipes = paths.dirs.recipes_dir();
+        let binding = known_hosts(company, &recipes, &prepared.address);
+        let runtime = current_thread_runtime()?;
+        let draft = runtime
+            .block_on(request_draft(&ai, &prepared.prompt, &binding))
+            .map_err(UiError::new)?;
+        Ok(PendingDraft {
+            path: draft_path(&recipes, &company.id),
+            text: draft.text,
+            host_changes: draft.host_changes,
+        })
+    })
+    .await?;
+    let view = pending.view();
+    locked(&state).draft = Some(pending);
+    Ok(view)
+}
+
+/// Writes the waiting draft.
+#[tauri::command]
+pub fn save_recipe_draft(
+    state: State<'_, AppState>,
+    hosts_confirmed: bool,
+    overwrite: bool,
+) -> Result<(), UiError> {
+    let mut work = locked(&state);
+    let pending = work
+        .draft
+        .as_ref()
+        .ok_or_else(|| UiError::new("no draft is waiting"))?;
+    pending.write(hosts_confirmed, overwrite)?;
+    work.draft = None;
+    Ok(())
+}
+
+/// Forgets what is waiting, after a person said no.
+#[tauri::command]
+pub fn discard_recipe_work(state: State<'_, AppState>) {
+    let mut work = locked(&state);
+    work.prompt = None;
+    work.draft = None;
+}
+
+/// Opens a browser window and records until [`finish_recording`] or until the
+/// person closes it. Then the draft waits for [`save_recipe_draft`].
+#[tauri::command]
+pub async fn record_recipe(
+    state: State<'_, AppState>,
+    company_id: String,
+    address: String,
+) -> Result<DraftView, UiError> {
+    require_web_address(&address)?;
+    let Some(_permit) = state.scanning.try_start() else {
+        return Err(UiError::new(ALREADY_RUNNING));
+    };
+    let (stop, stopped) = oneshot::channel();
+    locked(&state).stop_recording = Some(stop);
+    let paths = state.paths.clone();
+    let recorded = blocking(move || {
+        let config = Config::load(&paths.config)?;
+        let company = company_of(&config, &company_id)?;
+        let runtime = current_thread_runtime()?;
+        let events = runtime.block_on(async {
+            let mut recorder = Recorder::start(
+                ChromeOptions {
+                    profile_dir: paths.dirs.profile_dir(&company.id),
+                    window: WindowMode::Visible,
+                },
+                &address,
+            )
+            .await
+            .map_err(UiError::new)?;
+            recorder
+                .wait_for_end(async {
+                    let _ = stopped.await;
+                })
+                .await;
+            Ok::<_, UiError>(recorder.finish().await)
+        })?;
+        let draft = build_draft(&address, &events).map_err(UiError::new)?;
+        let text = draft_text("recorded in the browser", &draft.notes, &draft.recipe)
+            .map_err(UiError::new)?;
+        Ok(PendingDraft {
+            path: draft_path(&paths.dirs.recipes_dir(), &company.id),
+            text,
+            host_changes: Vec::new(),
+        })
+    })
+    .await;
+    let mut work = locked(&state);
+    work.stop_recording = None;
+    let pending = recorded?;
+    let view = pending.view();
+    work.draft = Some(pending);
+    Ok(view)
+}
+
+/// The person says the recording is complete.
+#[tauri::command]
+pub fn finish_recording(state: State<'_, AppState>) {
+    if let Some(stop) = locked(&state).stop_recording.take() {
+        let _ = stop.send(());
+    }
 }
 
 /// The result of a preview or a real scan.
@@ -412,6 +702,15 @@ impl ConfirmationHandler for GuiConfirmation {
     fn expired(&mut self) {
         self.slot.close();
         let _ = self.app.emit("portal-confirmation-ended", ());
+    }
+
+    async fn approve_ai_send(&mut self, request: &AiSendRequest) -> bool {
+        let answer = self.slot.open();
+        crate::tray::show_window(&self.app);
+        if self.app.emit("ai-send-confirmation", request).is_err() {
+            return false;
+        }
+        matches!(answer.await, Ok(true))
     }
 }
 
@@ -936,6 +1235,68 @@ companies:
         )
         .unwrap_err();
         assert!(error.message.contains("nope"), "{}", error.message);
+    }
+
+    #[test]
+    fn snapshot_tells_whether_the_api_key_exists_but_never_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let with_llm =
+            format!("{VALID}\nllm: {{ provider: anthropic, api_key: \"keyring:llm-key\" }}\n");
+        std::fs::write(&paths.config, with_llm).unwrap();
+
+        assert!(!snapshot(&paths, &MemoryStore::default()).llm_key_stored);
+        let secrets = MemoryStore::with("llm-key", "sk-super-secret-value");
+        let snapshot = snapshot(&paths, &secrets);
+        assert!(snapshot.llm_key_stored);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("sk-super-secret-value"), "{json}");
+    }
+
+    fn pending(dir: &Path, host_changes: Vec<HostChange>) -> PendingDraft {
+        PendingDraft {
+            path: dir.join("acme.draft.yaml"),
+            text: "steps: []".to_owned(),
+            host_changes,
+        }
+    }
+
+    #[test]
+    fn a_new_host_is_never_written_without_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let change = HostChange {
+            step: "login".to_owned(),
+            old: "portal.test".to_owned(),
+            new: "evil.example".to_owned(),
+        };
+        let draft = pending(dir.path(), vec![change]);
+
+        let refused = draft.write(false, true).unwrap_err();
+        assert!(
+            refused.message.contains("confirmation"),
+            "{}",
+            refused.message
+        );
+        assert!(!draft.path.exists());
+
+        draft.write(true, false).unwrap();
+        assert!(draft.path.exists());
+    }
+
+    #[test]
+    fn an_existing_draft_is_only_replaced_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = pending(dir.path(), Vec::new());
+        assert!(!draft.view().exists);
+        assert_eq!(draft.view().file_name, "acme.draft.yaml");
+
+        std::fs::write(&draft.path, "mine").unwrap();
+        assert!(draft.view().exists);
+        assert!(draft.write(false, false).is_err());
+        assert_eq!(std::fs::read_to_string(&draft.path).unwrap(), "mine");
+
+        draft.write(false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&draft.path).unwrap(), "steps: []");
     }
 
     #[test]

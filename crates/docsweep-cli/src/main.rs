@@ -25,6 +25,7 @@ use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
 use docsweep_core::portal::draft::{WriteError, draft_path, draft_text, write_draft};
 use docsweep_core::portal::engine::FetchReport;
+use docsweep_core::portal::hosts::is_web_address;
 use docsweep_core::portal::recipe::Recipe;
 use docsweep_core::portal::recording::build_draft;
 use docsweep_core::secrets::{KeyringStore, SecretStore, SecretString};
@@ -240,8 +241,7 @@ fn test_recipe(
 }
 
 fn check_web_address(address: &str) -> Result<(), CliError> {
-    let lower = address.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
+    if is_web_address(address) {
         Ok(())
     } else {
         Err("--url must be an `http` or `https` address".into())

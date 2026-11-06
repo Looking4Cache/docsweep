@@ -12,6 +12,12 @@ export const api = {
   runScan: (dryRun) => invoke("run_scan", { dryRun }),
   runFetch: (companyId, dryRun, visible) => invoke("run_fetch", { companyId, dryRun, visible }),
   answerConfirmation: (done) => invoke("answer_confirmation", { done }),
+  prepareRecipe: (companyId, address, description) => invoke("prepare_recipe", { companyId, address, description }),
+  sendRecipePrompt: () => invoke("send_recipe_prompt"),
+  saveRecipeDraft: (hostsConfirmed, overwrite) => invoke("save_recipe_draft", { hostsConfirmed, overwrite }),
+  discardRecipeWork: () => invoke("discard_recipe_work"),
+  recordRecipe: (companyId, address) => invoke("record_recipe", { companyId, address }),
+  finishRecording: () => invoke("finish_recording"),
   listInvoices: () => invoke("list_invoices"),
   listRuns: () => invoke("list_runs"),
   completeReview: (id, invoiceNo, date) => invoke("complete_review", { id, invoiceNo, date }),
@@ -29,6 +35,10 @@ export function onTrayPreview(handler) {
 
 export function onPortalConfirmation(handler) {
   window.__TAURI__.event.listen("portal-confirmation", (event) => handler(event.payload));
+}
+
+export function onAiSendConfirmation(handler) {
+  window.__TAURI__.event.listen("ai-send-confirmation", (event) => handler(event.payload));
 }
 
 export function onPortalConfirmationEnded(handler) {

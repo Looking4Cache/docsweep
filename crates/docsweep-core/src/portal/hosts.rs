@@ -43,6 +43,11 @@ fn host_of(address: &str) -> Option<String> {
     })
 }
 
+/// Whether a person's input is an address that a browser may open for a recipe.
+pub fn is_web_address(address: &str) -> bool {
+    host_of(address).is_some()
+}
+
 impl HostBinding {
     /// The hosts of a recipe that is already trusted, with parameters filled in.
     pub fn of_recipe(recipe: &Recipe) -> Self {

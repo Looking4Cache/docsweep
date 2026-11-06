@@ -3,7 +3,7 @@ import { h, icon, replace } from "../lib/dom.js";
 import { formatDateTime, t, tn } from "../lib/i18n.js";
 import { reportList, summaryStats } from "../lib/report.js";
 import { describeSchedule } from "../lib/schedule.js";
-import { confirmDialog, emptyState, field, folderInput, notice, pageHeader, showIssues, textInput, toast, withBusy } from "../lib/ui.js";
+import { confirmDialog, emptyState, field, folderInput, notice, pageHeader, sendDialog, showDialog, showIssues, textInput, toast, withBusy } from "../lib/ui.js";
 
 const DRAFTS_KEY = "docsweep.company-drafts";
 
@@ -374,18 +374,20 @@ export function renderCompanies(app, options = {}) {
     }
     refreshSchedule();
 
+    const recipeInput = textInput({
+      value: draft.recipe ?? "",
+      class: "mono",
+      placeholder: "recipes/example.yaml",
+      oninput: (event) => { draft.recipe = event.target.value; },
+    });
+
     const portalFields = h("div", { class: "form", hidden: !draft.hasPortal },
       h("p", { class: "field-hint" }, t("companies.portal.note")),
       field({
         label: t("companies.portal.recipe"),
         hint: t("companies.portal.recipe_hint"),
         path: "portal.recipe",
-        input: textInput({
-          value: draft.recipe ?? "",
-          class: "mono",
-          placeholder: "recipes/example.yaml",
-          oninput: (event) => { draft.recipe = event.target.value; },
-        }),
+        input: recipeInput,
       }),
       h("div", { class: "form-row" },
         field({
@@ -405,6 +407,7 @@ export function renderCompanies(app, options = {}) {
       }),
       scheduleField,
       fetchPanel(),
+      recipeTools(),
     );
     const portalToggle = h("label", { class: "check" },
       h("input", {
@@ -498,6 +501,132 @@ export function renderCompanies(app, options = {}) {
           h("span", { class: "spacer" }),
           fetchButton,
         ),
+        result,
+      );
+    }
+
+    // Makes a draft file, never the recipe in use. A person decides on each thing
+    // that matters, and only the app's side holds what is sent or written. Neither
+    // address nor notes go into the stored form draft.
+    function recipeTools() {
+      if (draft.isNew || !draft.original?.portal) return null;
+      const id = draft.id;
+      const name = draft.name;
+      const result = h("div", {});
+      const address = textInput({ class: "mono", placeholder: "https://portal.example.com/login", inputmode: "url" });
+      const description = textInput({});
+      const addressField = field({ label: t("recipe.address"), hint: t("recipe.address_hint"), path: "recipe.address", input: address });
+      const aiReady = Boolean(app.config.llm);
+
+      const wanted = () => {
+        const value = address.value.trim();
+        showIssues(addressField.parentElement, value ? [] : [{ path: "recipe.address", message: t("recipe.address_missing") }]);
+        return value;
+      };
+
+      async function finishDraft(view) {
+        if (view.host_changes.length > 0) {
+          const keep = await confirmDialog({
+            title: t("recipe.host_title"),
+            text: t("recipe.host_text"),
+            items: view.host_changes.map((change) => ({ icon: "alert", danger: true, text: t("recipe.host_change", change) })),
+            confirmLabel: t("recipe.host_keep"),
+            danger: true,
+          });
+          if (!keep) {
+            await api.discardRecipeWork();
+            return;
+          }
+        }
+        if (view.exists) {
+          const replaceIt = await confirmDialog({
+            title: t("recipe.replace_title"),
+            text: t("recipe.replace_text", { file: view.file_name }),
+            confirmLabel: t("recipe.replace"),
+            danger: true,
+          });
+          if (!replaceIt) {
+            await api.discardRecipeWork();
+            return;
+          }
+        }
+        await api.saveRecipeDraft(view.host_changes.length > 0, view.exists);
+        const useButton = h("button", {
+          class: "button",
+          onclick: () => {
+            recipeInput.value = view.file_name;
+            recipeInput.dispatchEvent(new Event("input", { bubbles: true }));
+            replace(result, notice("info", t("recipe.used")));
+          },
+        }, t("recipe.use"));
+        replace(result,
+          notice("info", t("recipe.saved", { file: view.file_name })),
+          h("pre", { class: "prompt-text", tabindex: "0" }, view.text),
+          h("div", { class: "form-actions" }, h("span", { class: "spacer" }), useButton));
+      }
+
+      const generateButton = h("button", {
+        class: "button",
+        disabled: !aiReady,
+        onclick: () => {
+          const target = wanted();
+          if (!target) return;
+          replace(result);
+          let prompt;
+          withBusy(generateButton, t("recipe.looking"), async () => {
+            prompt = await api.prepareRecipe(id, target, description.value);
+          }).then(async () => {
+            const send = await sendDialog({
+              title: t("recipe.send_title", { provider: prompt.provider }),
+              lead: t("recipe.send_lead"),
+              text: prompt.text,
+              confirmLabel: t("ai.send_to", { provider: prompt.provider }),
+            });
+            if (!send) {
+              await api.discardRecipeWork();
+              return;
+            }
+            const view = await withBusy(generateButton, t("recipe.waiting", { provider: prompt.provider }), () => api.sendRecipePrompt());
+            await finishDraft(view);
+          }).catch((error) => replace(result, notice("danger", errorText(error))));
+        },
+      }, t("recipe.generate"));
+
+      const recordButton = h("button", {
+        class: "button",
+        onclick: async () => {
+          const target = wanted();
+          if (!target) return;
+          replace(result);
+          let closeDialog = () => {};
+          const dialog = showDialog((close) => {
+            closeDialog = close;
+            return h("div", { class: "dialog-body" },
+              h("h2", {}, t("recipe.recording_title", { name })),
+              h("p", { class: "dialog-text" }, t("recipe.recording_lead")),
+              h("div", { class: "dialog-actions" },
+                h("button", { class: "button button-primary", onclick: () => api.finishRecording() }, t("recipe.recording_finish"))),
+            );
+          });
+          try {
+            const view = await api.recordRecipe(id, target);
+            closeDialog();
+            await dialog;
+            await finishDraft(view);
+          } catch (error) {
+            closeDialog();
+            replace(result, notice("danger", errorText(error)));
+          }
+        },
+      }, t("recipe.record"));
+
+      return h("div", { class: "form recipe-tools" },
+        h("h4", {}, t("recipe.title")),
+        h("p", { class: "field-hint" }, t("recipe.lead")),
+        addressField,
+        aiReady && field({ label: t("recipe.describe"), hint: t("recipe.describe_hint"), optional: true, input: description }),
+        !aiReady && h("p", { class: "field-hint" }, t("recipe.generate_off")),
+        h("div", { class: "form-actions" }, h("span", { class: "spacer" }), recordButton, generateButton),
         result,
       );
     }
