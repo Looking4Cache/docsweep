@@ -1,0 +1,10 @@
+[package]
+name = "docsweep-browser"
+description = "Browser automation for Docsweep portal downloads (not implemented yet)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+docsweep-core.workspace = true

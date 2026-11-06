@@ -34,7 +34,7 @@ scripts/imap-tests.sh                 # IMAP tests against GreenMail (needs Java
 cargo run -p docsweep-cli -- mail-scan --dry-run
 cargo run -p docsweep-gui
 cargo install tauri-cli --locked      # once, for bundling
-cargo tauri build --config crates/docsweep-gui/tauri.conf.json
+(cd crates/docsweep-gui && cargo tauri build)
 ```
 
 `fmt`, `clippy -D warnings` and `test` must be green before every commit. Linux builds need `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev` and `libssl-dev`.

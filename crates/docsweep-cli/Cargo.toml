@@ -1,0 +1,15 @@
+[package]
+name = "docsweep-cli"
+description = "Command line tool of Docsweep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "docsweep"
+path = "src/main.rs"
+
+[dependencies]
+docsweep-core.workspace = true
+clap = { version = "4", features = ["derive"] }

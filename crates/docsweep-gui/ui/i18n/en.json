@@ -1,0 +1,5 @@
+{
+  "app.title": "Docsweep",
+  "app.placeholder": "The desktop app is not ready yet. Use the docsweep command line tool for now.",
+  "app.version": "Version {version}"
+}
