@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::names;
 use crate::naming::FilenameTemplate;
+use crate::schedule::Schedule;
+
+/// Fewer minutes between polls would only burden the mail server.
+pub const MIN_POLL_MINUTES: u32 = 5;
 
 /// The whole `docsweep.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,6 +27,9 @@ pub struct Config {
     /// Settings that apply unless a company says otherwise.
     #[serde(default, skip_serializing_if = "Defaults::is_empty")]
     pub defaults: Defaults,
+    /// Whether Docsweep runs on its own. Off unless someone turned it on.
+    #[serde(default, skip_serializing_if = "Automation::is_off")]
+    pub automation: Automation,
     pub mail: MailConfig,
     /// Optional AI provider; unused until the AI milestone.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,12 +53,31 @@ impl Defaults {
     }
 }
 
+/// The `automation` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Automation {
+    /// The master switch for `portal.schedule` and `mail.poll_minutes`, which do
+    /// nothing without it. Automatic runs save and clean up without a preview.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Automation {
+    fn is_off(&self) -> bool {
+        !self.enabled
+    }
+}
+
 /// The `mail` section.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailConfig {
     pub accounts: Vec<MailAccount>,
     pub disposal: GlobalDisposal,
+    /// Minutes between automatic scans; without it, mailboxes are not polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_minutes: Option<u32>,
 }
 
 /// One IMAP mailbox.
@@ -158,7 +184,7 @@ pub struct Portal {
     /// Values for the recipe's parameters, such as a domain.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
-    /// Cron expression with five fields.
+    /// Cron expression with five fields, in local time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
 }
@@ -409,6 +435,16 @@ impl MailConfig {
             report.not_blank(&format!("{path}.watch"), &account.watch);
         }
 
+        if self
+            .poll_minutes
+            .is_some_and(|minutes| minutes < MIN_POLL_MINUTES)
+        {
+            report.add(
+                "mail.poll_minutes",
+                &format!("must be at least {MIN_POLL_MINUTES} minutes"),
+            );
+        }
+
         let needs_folder = matches!(
             self.disposal.mode,
             DisposalMode::AllMove | DisposalMode::PdfMoveLinkDelete
@@ -472,12 +508,9 @@ impl Portal {
             report.add(&format!("{path}.recipe"), "must not be empty");
         }
         if let Some(schedule) = &self.schedule
-            && schedule.split_whitespace().count() != 5
+            && let Err(problem) = Schedule::parse(schedule)
         {
-            report.add(
-                &format!("{path}.schedule"),
-                "must be a cron expression with five fields, for example `0 9 10 * *`",
-            );
+            report.add(&format!("{path}.schedule"), &problem);
         }
     }
 }
@@ -746,6 +779,54 @@ mail:
             r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ credentials: "keyring:c", recipe: r.yaml, schedule: "nope" }} }}"#
         ));
         assert_eq!(issues_of(&yaml)[0].path, "companies[0].portal.schedule");
+    }
+
+    #[test]
+    fn a_schedule_with_a_wrong_value_is_rejected_with_a_clear_message() {
+        let yaml = company_yaml(&format!(
+            r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ credentials: "keyring:c", recipe: r.yaml, schedule: "99 9 10 * *" }} }}"#
+        ));
+        let issue = issues_of(&yaml).remove(0);
+        assert_eq!(issue.path, "companies[0].portal.schedule");
+        assert!(issue.message.contains("five fields"), "{}", issue.message);
+    }
+
+    #[test]
+    fn all_automation_stays_off_by_default() {
+        let yaml = company_yaml(&format!(
+            r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ credentials: "keyring:c", recipe: r.yaml, schedule: "0 9 10 * *" }} }}"#
+        ));
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert!(!config.automation.enabled);
+        assert_eq!(config.mail.poll_minutes, None);
+
+        let written = serde_saphyr::to_string(&config).unwrap();
+        assert!(!written.contains("automation"), "{written}");
+        assert!(!written.contains("poll_minutes"), "{written}");
+    }
+
+    #[test]
+    fn automation_settings_survive_saving() {
+        let yaml = format!("automation: {{ enabled: true }}\n{MINIMAL_MAIL}").replace(
+            "mode: all_delete }",
+            "mode: all_delete }\n  poll_minutes: 30",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.yaml");
+        Config::from_yaml(&yaml).unwrap().save(&path).unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert!(reloaded.automation.enabled);
+        assert_eq!(reloaded.mail.poll_minutes, Some(30));
+    }
+
+    #[test]
+    fn polling_too_often_is_rejected() {
+        let yaml = MINIMAL_MAIL.replace(
+            "mode: all_delete }",
+            "mode: all_delete }\n  poll_minutes: 1",
+        );
+        assert_eq!(issues_of(&yaml)[0].path, "mail.poll_minutes");
     }
 
     #[test]

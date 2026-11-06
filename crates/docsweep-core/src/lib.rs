@@ -9,5 +9,6 @@ pub mod naming;
 pub mod paths;
 pub mod portal;
 pub mod review;
+pub mod schedule;
 pub mod secrets;
 pub mod storage;

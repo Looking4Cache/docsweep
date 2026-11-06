@@ -37,6 +37,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 totp-rs = "6"
 url = "2"
 utf7-imap = "0.3"
+croner = "4"
 
 [dev-dependencies]
 base64 = "0.22"
