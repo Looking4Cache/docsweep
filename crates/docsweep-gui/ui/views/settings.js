@@ -39,6 +39,15 @@ export function renderSettings(app) {
     );
   }
 
+  // The configuration without a default, or with a new value for it.
+  function withDefault(key, value) {
+    const { defaults: old, ...rest } = app.config;
+    const defaults = { ...old };
+    if (value) defaults[key] = value;
+    else delete defaults[key];
+    return Object.keys(defaults).length > 0 ? { ...rest, defaults } : rest;
+  }
+
   function folderCard() {
     let folder = app.config.defaults?.output_dir ?? "";
     const form = h("div", { class: "form" },
@@ -53,11 +62,30 @@ export function renderSettings(app) {
     return card({
       title: t("settings.folder.title"),
       form,
-      save: () => {
-        const trimmed = folder.trim();
-        const { defaults: _unused, ...rest } = app.config;
-        return trimmed ? { ...rest, defaults: { output_dir: trimmed } } : rest;
-      },
+      save: () => withDefault("output_dir", folder.trim()),
+    });
+  }
+
+  function downloadsCard() {
+    let folder = app.config.defaults?.downloads_dir ?? "";
+    const form = h("div", { class: "form" },
+      field({
+        label: t("settings.downloads.label"),
+        hint: t("settings.downloads.hint"),
+        path: "defaults.downloads_dir",
+        optional: true,
+        input: folderInput({
+          value: folder,
+          placeholder: app.systemDownloadsDir ?? "",
+          onChange: (value) => { folder = value; },
+        }),
+      }),
+    );
+    return card({
+      title: t("settings.downloads.title"),
+      lead: t("settings.downloads.lead"),
+      form,
+      save: () => withDefault("downloads_dir", folder.trim()),
     });
   }
 
@@ -241,6 +269,7 @@ export function renderSettings(app) {
   replace(root,
     pageHeader(t("settings.title"), t("settings.lead")),
     folderCard(),
+    downloadsCard(),
     cleanupCard(),
     automationCard(),
     aiCard(),

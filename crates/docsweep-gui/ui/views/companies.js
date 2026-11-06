@@ -62,6 +62,8 @@ function blankDraft(domain = "") {
     disposalChoice: "default",
     moveTo: "",
     hasPortal: false,
+    portalMode: "recipe",
+    portalUrl: "",
     recipe: "",
     schedule: "",
   };
@@ -83,6 +85,8 @@ function draftFrom(company) {
     disposalChoice: disposal === "delete" ? "delete" : disposal?.move_to ? "move" : "default",
     moveTo: disposal?.move_to ?? "",
     hasPortal: Boolean(company.portal),
+    portalMode: company.portal?.mode ?? "recipe",
+    portalUrl: company.portal?.url ?? "",
     recipe: company.portal?.recipe ?? "",
     schedule: company.portal?.schedule ?? "",
     original: company,
@@ -97,14 +101,23 @@ function companyFrom(draft, id) {
     if (draft.mail.subject) company.mail.subject = draft.mail.subject;
     if (draft.mail.attachment) company.mail.attachment = draft.mail.attachment;
   }
-  if (draft.hasPortal) {
+  const url = draft.portalUrl?.trim() ?? "";
+  if (draft.hasPortal && draft.portalMode === "assisted") {
+    // You log in yourself, so no login stays behind, and nothing runs on its own.
+    // A recipe holds no secret, and is kept for a way back.
+    const { credentials: _login, totp: _code, schedule: _when, ...kept } = draft.original?.portal ?? {};
+    company.portal = { ...kept, mode: "assisted", url };
+  } else if (draft.hasPortal) {
     // Keeps recipe and credentials that were written by hand.
     company.portal = {
       credentials: `keyring:${id}`,
       recipe: `recipes/${id}.yaml`,
       ...(draft.original?.portal ?? {}),
     };
+    delete company.portal.mode;
     if (draft.recipe?.trim()) company.portal.recipe = draft.recipe.trim();
+    if (url) company.portal.url = url;
+    else delete company.portal.url;
     if (draft.schedule.trim()) company.portal.schedule = draft.schedule.trim();
     else delete company.portal.schedule;
   }
@@ -381,7 +394,50 @@ export function renderCompanies(app, options = {}) {
       oninput: (event) => { draft.recipe = event.target.value; },
     });
 
-    const portalFields = h("div", { class: "form", hidden: !draft.hasPortal },
+    const isAssisted = () => draft.portalMode === "assisted";
+    const modeHint = h("p", { class: "field-hint" });
+    const urlField = field({
+      label: t("companies.portal.url"),
+      hint: t("companies.portal.url_hint"),
+      path: "portal.url",
+      input: textInput({
+        value: draft.portalUrl ?? "",
+        class: "mono",
+        placeholder: "https://portal.example.com/login",
+        inputmode: "url",
+        oninput: (event) => { draft.portalUrl = event.target.value; },
+      }),
+    });
+    const refreshMode = () => {
+      modeHint.textContent = t(isAssisted() ? "companies.portal.mode_assisted_hint" : "companies.portal.mode_recipe_hint");
+      urlField.hidden = !isAssisted();
+      recipeFields.hidden = isAssisted();
+      // Typed secrets never stay in a form that does not use them.
+      if (isAssisted()) {
+        portalUser.value = "";
+        portalPassword.value = "";
+        portalTotp.value = "";
+      }
+    };
+    const modes = h("div", { class: "segmented", role: "radiogroup" }, ["recipe", "assisted"].map((choice) =>
+      h("button", {
+        class: `segment${(draft.portalMode ?? "recipe") === choice ? " is-active" : ""}`,
+        role: "radio",
+        "aria-checked": String((draft.portalMode ?? "recipe") === choice),
+        onclick: (event) => {
+          draft.portalMode = choice;
+          for (const button of modes.children) {
+            button.classList.remove("is-active");
+            button.setAttribute("aria-checked", "false");
+          }
+          event.currentTarget.classList.add("is-active");
+          event.currentTarget.setAttribute("aria-checked", "true");
+          refreshMode();
+          remember();
+        },
+      }, t(`companies.portal.mode_${choice}`))));
+
+    const recipeFields = h("div", { class: "form" },
       h("p", { class: "field-hint" }, t("companies.portal.note")),
       field({
         label: t("companies.portal.recipe"),
@@ -409,6 +465,12 @@ export function renderCompanies(app, options = {}) {
       fetchPanel(),
       recipeTools(),
     );
+    const portalFields = h("div", { class: "form", hidden: !draft.hasPortal },
+      h("div", { class: "field" }, h("span", { class: "field-label" }, t("companies.portal.mode")), modes, modeHint),
+      urlField,
+      recipeFields,
+    );
+    refreshMode();
     const portalToggle = h("label", { class: "check" },
       h("input", {
         type: "checkbox",
@@ -428,6 +490,7 @@ export function renderCompanies(app, options = {}) {
     // Values go into the keychain once. The fields are then cleared, and nothing
     // ever comes back from there.
     async function storeTypedSecrets(id, company) {
+      if (company.portal?.mode === "assisted") return;
       if (portalUser.value.trim() && portalPassword.value) {
         await api.setPortalCredentials(company.portal.credentials.replace("keyring:", ""), portalUser.value.trim(), portalPassword.value);
         portalUser.value = "";
@@ -443,7 +506,7 @@ export function renderCompanies(app, options = {}) {
 
     // Always a preview first; a real run only after confirming what it found.
     function fetchPanel() {
-      const saved = !draft.isNew && draft.original?.portal;
+      const saved = !draft.isNew && draft.original?.portal && draft.original.portal.mode !== "assisted";
       if (!saved) return h("p", { class: "field-hint" }, t("fetch.needs_saving"));
       const id = draft.id;
       const name = draft.name;
@@ -509,7 +572,7 @@ export function renderCompanies(app, options = {}) {
     // that matters, and only the app's side holds what is sent or written. Neither
     // address nor notes go into the stored form draft.
     function recipeTools() {
-      if (draft.isNew || !draft.original?.portal) return null;
+      if (draft.isNew || !draft.original?.portal || draft.original.portal.mode === "assisted") return null;
       const id = draft.id;
       const name = draft.name;
       const result = h("div", {});

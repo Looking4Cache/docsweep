@@ -140,6 +140,7 @@ async function start() {
   app.portalSecrets = new Map(state.stored_portal_secrets);
   app.llmKeyStored = state.llm_key_stored;
   app.anthropicDefaultModel = state.anthropic_default_model;
+  app.systemDownloadsDir = state.system_downloads_dir;
   watchPortalConfirmations();
   onAutomationStatus(({ running }) => {
     app.automationRunning = running;
