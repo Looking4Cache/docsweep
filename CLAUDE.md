@@ -48,7 +48,7 @@ cargo install tauri-cli --locked      # once, for bundling
 - The Bundle ID has a single source: `identifier` in `crates/docsweep-gui/tauri.conf.json`. `build.rs` exposes it as a constant. It must be final before the first signed build.
 - Only password-based IMAP is supported. OAuth2 mailboxes are deliberately out of scope.
 - Dry-run and real runs share one planning function (`mail::plan::plan_mail`). Only the executor changes anything, and a dry run only ever gets a `MailReader`.
-- A document without a recognised invoice number, or with a known number but a different file, is stored with status `needs_review`, and its mail stays in place with `\\Flagged`.
+- A document without a recognised invoice number, or with a known number but a different file, is stored with status `needs_review`, and its mail stays in place with `\Flagged`.
 - Link mails stay in place and are only noted as `portal_fetch_required` until portal downloads exist, regardless of the configured disposal.
 - The trash folder is found through IMAP `SPECIAL-USE` only. Without it the mail stays flagged; it is never deleted permanently as a fallback.
 - Pin GitHub Actions to commit SHAs.
