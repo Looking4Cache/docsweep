@@ -1,5 +1,6 @@
 //! Core of Docsweep: everything that does not depend on a user interface or a browser.
 
+pub mod automation;
 pub mod config;
 pub mod document;
 pub mod index;
