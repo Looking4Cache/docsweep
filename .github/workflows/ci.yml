@@ -61,3 +61,12 @@ jobs:
       - name: Run IMAP tests against GreenMail
         shell: bash
         run: scripts/imap-tests.sh
+
+      # Ubuntu 24.04 restricts the user namespaces that Chrome's sandbox needs.
+      - name: Allow Chrome's sandbox
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Run browser tests in headless Chrome
+        shell: bash
+        run: scripts/browser-tests.sh

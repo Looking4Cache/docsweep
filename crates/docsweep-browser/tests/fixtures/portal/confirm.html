@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fictional Portal: Please confirm</title></head>
+<body>
+<h1 id="confirm-required">We sent you a confirmation request. Please approve it.</h1>
+<script>
+  setInterval(async () => {
+    const reply = await fetch("/confirm/status");
+    if (reply.ok) location.href = "/invoices";
+  }, 200);
+</script>
+</body>
+</html>
