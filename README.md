@@ -10,7 +10,7 @@ Docsweep is a free desktop app for macOS, Windows and Linux that collects incomi
 2. `docsweep mail-scan --dry-run` shows what would happen, without changing anything.
 3. `docsweep mail-scan` saves the invoices and cleans up the mails.
 
-A mail is only moved or deleted after its invoice is stored and indexed. By default, "delete" means moving it to the trash. A mail that only links to a portal starts that company's download, and is cleaned up once a matching invoice is stored. Until then it stays in your inbox.
+A mail is only moved or deleted after its invoice is stored and indexed. By default, "delete" means moving it to the trash. A mail that only links to a portal starts that company's download, and is cleaned up once a matching invoice is stored. Until then it stays in your inbox. For portals that turn away automated browsers, you download the invoice yourself and Docsweep files it; see [Assisted mode](#assisted-mode).
 
 Only IMAP with a password or app password is supported. Mailboxes that require OAuth2, such as Microsoft 365, will not work.
 
@@ -162,6 +162,46 @@ The mail is only cleaned up by the normal rules (`disposal`, the trash by defaul
 
 A successful download that found nothing new is not enough, because the invoice may not be in the portal yet. The mail then stays in place, unflagged, and the portal is checked again at most once per day. A new link mail does not wait for that. A failed download leaves the mail in place and flags it.
 
+## Assisted mode
+
+Some portals use a bot check such as Cloudflare Turnstile, which rejects browsers under automation even with a person clicking. Docsweep does not hide its automation and solves no captchas. For these portals it automates nothing: you log in and download in your usual browser, and Docsweep files the PDF.
+
+```yaml
+companies:
+  - id: example
+    name: Example
+    mail: { from_domain: example.com, subject: "(?i)rechnung" }
+    portal:
+      mode: assisted                     # recipe (the default) | assisted
+      url: https://portal.example.com/login
+    output:
+      filename: "{date:%Y-%m-%d} - Example - {invoice_no}.pdf"
+```
+
+`portal.url` is required and must be `http` or `https`. An assisted company has no `credentials` or `totp`, because Docsweep keeps no login for it, and no `schedule`, because nothing runs on its own. Switching a company to this mode is a choice in its editor, or in this file; Docsweep does not do it by itself.
+
+1. A scan notes a link mail of this company and starts nothing, whether you started the scan or it runs automatically.
+2. The Scan page lists it under "Invoices to pick up", with a count in the navigation. Automatic runs do not open a browser or the window for it.
+3. "Pick up invoice" opens `portal.url` in your default browser. It does not attach to that browser, read its cookies or look at its pages.
+4. From that click until you end it, for at most 15 minutes, Docsweep looks once a second for new `.pdf` files directly in the downloads folder. It waits until a file stops growing, skips partial downloads (`.crdownload`, `.part`, `.download`), subfolders and symlinks, opens nothing else, and checks that the content really is a PDF.
+5. For each new PDF it brings its window up and asks whether this is an invoice of the company, showing the file name, the number and the date it read. Nothing is filed without your yes. A missing number or date means the file is saved for review, to complete under Invoices.
+6. The file is saved byte for byte under the company's file name, with the same duplicate check as a mail attachment. Only once it is in the index is the original deleted. A duplicate is reported, and its original stays where it is.
+7. The next scan finds the stored invoice and cleans up the link mail, under the rule for link mails above.
+
+The folder is `defaults.downloads_dir`, or under Settings; without it, your system's downloads folder.
+
+```yaml
+defaults:
+  downloads_dir: ~/Downloads
+```
+
+The same import works from the command line, for testing and scripting. Naming the file counts as the confirmation, so the original is deleted too once the invoice is indexed:
+
+```sh
+docsweep import example ~/Downloads/invoice.pdf --dry-run
+docsweep import example ~/Downloads/invoice.pdf
+```
+
 ## Automatic runs
 
 All automation is off until you turn it on. In the app, that is the section "Automatic runs" under Settings; in the file, it looks like this:
@@ -223,7 +263,7 @@ See [CLAUDE.md](CLAUDE.md) for the workspace layout, commands and rules, and [KO
 
 ## Kurzfassung auf Deutsch
 
-Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, von Hand, ausgelöst durch Weblink-Mails oder nach Zeitplan. Automatische Läufe sind aus, bis man sie einschaltet. Rezepte lassen sich im Browser aufzeichnen, und mit eigenem API-Schlüssel kann ein Sprachmodell Entwürfe schreiben und einzelne Schritte reparieren; es sieht nie Passwörter, Codes oder Cookies. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
+Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, von Hand, ausgelöst durch Weblink-Mails oder nach Zeitplan. Portale, die automatisierte Browser abweisen, bleiben im assistierten Modus Handarbeit: Man lädt die Rechnung im eigenen Browser herunter, und Docsweep legt das PDF nach einer Rückfrage ab. Automatische Läufe sind aus, bis man sie einschaltet. Rezepte lassen sich im Browser aufzeichnen, und mit eigenem API-Schlüssel kann ein Sprachmodell Entwürfe schreiben und einzelne Schritte reparieren; es sieht nie Passwörter, Codes oder Cookies. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
 
 ## License
 

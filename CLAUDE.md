@@ -14,6 +14,7 @@ The full concept is in `KONZEPT.md`; its naming conventions and configuration mo
 crates/
   docsweep-core/     Config, index, mail pipeline, secrets, recipes, recipe engine, schedules, automation and AI
     src/portal/      Recipe model, login secrets, `BrowserDriver`, `ConfirmationHandler` and `PortalFetcher` traits, engine, `hosts`, `draft`, `recording`
+    src/pickup.rs    Assisted mode: `PickupSession`, `DownloadsFolder`, `import_file`
     src/ai/          `sanitize`, providers, prompts, checks of model output, recipe generation
   docsweep-browser/  Installed Chrome/Edge through CDP (chromiumoxide), `fetch_company`, `BrowserFetcher`, `read_page`, `Recorder`
     tests/           Real-browser tests against a fictional portal; `tests/fixtures/portal` holds its pages
@@ -41,6 +42,7 @@ scripts/browser-tests.sh --visible    # also the test that opens a browser windo
 cargo test -p docsweep-core -- --ignored keychain handshake  # real keychain, needs internet
 cargo run -p docsweep-cli -- mail-scan --dry-run
 cargo run -p docsweep-cli -- fetch <company> --dry-run
+cargo run -p docsweep-cli -- import <company> <file.pdf> --dry-run
 cargo run -p docsweep-cli -- test-recipe <file> [--company <id>]
 cargo run -p docsweep-cli -- recipe generate <company> --url <url> [--describe "..."]
 cargo run -p docsweep-cli -- recipe record <company> --url <url>   # opens a window
@@ -62,6 +64,10 @@ cargo install tauri-cli --locked      # once, for bundling
 - A document without a recognised invoice number, or with a known number but a different file, is stored with status `needs_review`, and its mail stays in place with `\Flagged`.
 - A real scan notes a link mail as `portal_fetch_required` and then starts its company's recipe through `PortalFetcher`, once per company per scan and after all accounts were read, because a fetch can wait minutes for a person. A preview has no `PortalFetcher`, so it cannot start a browser.
 - A link mail is cleaned up (`disposal_for` with `MailKind::Link`) only if the fetch had no failures and `Index::has_invoice_for_link_mail` finds a stored portal invoice: newer than the mail's row, or dated on or after the mail, with its file still there. A successful fetch that finds nothing leaves the mail unflagged and noted; a failed fetch flags it. `resolved_at` marks a row as done. A mail that is still waiting is retried at most once per local day (`company_runs.last_link_fetch_on`); a new mail does not wait for that.
+- `portal.mode: assisted` is for portals that reject automated browsers. Docsweep then automates nothing: `PickupSession` (`pickup.rs`) opens `portal.url` from the configuration in the default browser, and a person logs in and downloads there. Never add stealth, flag removal, attaching to the person's browser, reading its cookies or solving captchas to this or any other mode, and do not inspect that browser in any way. Assisted companies have no `credentials`, `totp` or `schedule`, and validation refuses them. Switching modes is a person's choice.
+- For an assisted company a scan only notes the link mail: `fetch_due` is false, `fetch_for_link_mails` and `due_work` skip it, and `fetch_company` refuses it. `decide_link_mails` has no fetch to wait for, so the index alone decides. Automatic runs change the count in the navigation and nothing else; only a person's click starts a session.
+- A session looks at the downloads folder only between that click and its end, or `SESSION_LIMIT_MINUTES`. Past that, `poll` does not touch the folder. It takes what appeared since the start (`known`, compared by size and time, not with the clock, since a new file can carry an old time), once it stayed the same for two looks. File contents are opened through `DownloadsFolder::read` only for regular, finished, top-level `.pdf` files; tests watch that with a spy folder.
+- Nothing from a downloads folder is imported without `PickupSession::confirm`, which takes a name the session offered and refuses a file that changed since. `pickup::import_file` is the one import, for the app and `docsweep import`: `store_verified`, the index, and only then the original goes. On any failure or duplicate the original stays. A missing number or date means `needs_review`. Files are never converted.
 - A dry run reads an older index without migrating it, so every read of a newer column or table must handle its absence (`AUTOMATION_VERSION`, `PORTAL_KEY_VERSION`).
 - All automation is off unless `automation.enabled` is set; `portal.schedule` and `mail.poll_minutes` do nothing without it. `automation::run_tick` decides from a clock passed in and the index, and the GUI's loop (`src/automation.rs`) only supplies them. Only `RunGate` lets a run start, for scans, previews, manual fetches and ticks alike, and what cannot start stays due. A scheduled run counts as soon as it starts, so a failure waits for the next date instead of repeating a login.
 - Autostart is only driven by the app's own commands; the web view gets no permission for it. A start at login passes `--hidden` and starts in the tray.
