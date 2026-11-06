@@ -1223,6 +1223,42 @@ companies:
     }
 
     #[test]
+    fn link_mails_in_two_mailboxes_still_give_one_fetch() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let rules = RuleSet::new(&setup.config);
+        let mut reports = Vec::new();
+        for (account_id, id) in [("first", "1@x"), ("second", "2@x")] {
+            let context = PlanContext {
+                config: &setup.config,
+                rules: &rules,
+                index: Some(&index),
+                account_id,
+                today: day(1),
+            };
+            let mut mailbox = FakeMailbox::with(vec![link_mail(id)]);
+            block_on(scan_and_execute(
+                &context,
+                &index,
+                &mut mailbox,
+                &mut reports,
+            ))
+            .unwrap();
+        }
+        let mut portal = fetcher(fine);
+
+        block_on(fetch_for_link_mails(
+            &setup.config,
+            &index,
+            day(1),
+            reports.iter(),
+            &mut portal,
+        ));
+
+        assert_eq!(portal.started, ["acme"]);
+    }
+
+    #[test]
     fn a_waiting_company_is_retried_at_most_once_per_day() {
         let setup = setup(MOVE, WITH_PORTAL);
         let index = Index::open_in_memory().unwrap();

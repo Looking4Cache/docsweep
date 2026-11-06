@@ -87,7 +87,7 @@ pub fn due_work<Tz: TimeZone>(
 pub enum Tick {
     /// Automation is switched off.
     Off,
-    /// Another run is active; what is due stays due.
+    /// Something is due, but another run is active. It stays due.
     Busy,
     /// Nothing is due.
     Idle,
@@ -112,14 +112,16 @@ pub async fn run_tick<Tz: TimeZone, F: PortalFetcher>(
     if !config.automation.enabled {
         return Ok(Tick::Off);
     }
-    let Some(_permit) = gate.try_start() else {
-        return Ok(Tick::Busy);
-    };
+    // The gate is only taken if there is work, so that a tick with nothing to do
+    // never turns away someone starting a scan by hand.
     let index = Index::open(index_path)?;
     let due = due_work(config, &index, *last_poll, &now)?;
     if !due.poll && due.companies.is_empty() {
         return Ok(Tick::Idle);
     }
+    let Some(_permit) = gate.try_start() else {
+        return Ok(Tick::Busy);
+    };
     on_start();
 
     let mut report = ScanReport::default();
