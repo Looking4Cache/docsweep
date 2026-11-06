@@ -1,0 +1,670 @@
+//! Configuration model and YAML loader (`KONZEPT.md` section 8).
+//!
+//! Loading reports every problem at once, each with the path of the affected
+//! value. Error messages never quote values of secret fields, and YAML snippets
+//! are disabled because they could quote a plaintext password.
+
+use std::collections::HashSet;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use regex::Regex;
+use serde::Deserialize;
+
+use crate::names;
+use crate::naming::FilenameTemplate;
+
+/// The whole `docsweep.yaml`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub mail: MailConfig,
+    /// Optional AI provider; unused until the AI milestone.
+    pub llm: Option<LlmConfig>,
+    #[serde(default)]
+    pub companies: Vec<Company>,
+}
+
+/// The `mail` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailConfig {
+    pub accounts: Vec<MailAccount>,
+    pub disposal: GlobalDisposal,
+}
+
+/// One IMAP mailbox.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailAccount {
+    pub id: String,
+    /// `host:port`.
+    pub imap: String,
+    pub user: String,
+    pub password: SecretRef,
+    /// Folder to scan, for example `INBOX`.
+    pub watch: String,
+}
+
+impl MailAccount {
+    /// Splits `imap` into host and port. Valid after [`Config::from_yaml`].
+    pub fn endpoint(&self) -> Option<(&str, u16)> {
+        let (host, port) = self.imap.rsplit_once(':')?;
+        let port = port.parse().ok()?;
+        (!host.is_empty()).then_some((host, port))
+    }
+}
+
+/// Global default for cleaning up mails.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalDisposal {
+    pub mode: DisposalMode,
+    pub move_to: Option<String>,
+    #[serde(default = "default_true")]
+    pub delete_to_trash: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The three global cleanup modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisposalMode {
+    AllDelete,
+    AllMove,
+    PdfMoveLinkDelete,
+}
+
+/// The `llm` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    pub provider: LlmProvider,
+    pub api_key: SecretRef,
+}
+
+/// Supported AI providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    Anthropic,
+    Openai,
+    Openrouter,
+}
+
+/// A company, the top-level object of the configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Company {
+    pub id: String,
+    pub name: String,
+    pub mail: Option<MailRule>,
+    pub portal: Option<Portal>,
+    pub output: Output,
+    pub disposal: Option<CompanyDisposal>,
+}
+
+/// Which mails belong to a company. All given conditions must match.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailRule {
+    pub from_domain: String,
+    /// Regular expression for the subject.
+    pub subject: Option<String>,
+    /// Regular expression for attachment file names.
+    pub attachment: Option<String>,
+}
+
+/// Portal access; parsed and validated now, used from the recipe milestone on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Portal {
+    pub credentials: SecretRef,
+    pub totp: Option<SecretRef>,
+    pub recipe: PathBuf,
+    /// Cron expression with five fields.
+    pub schedule: Option<String>,
+}
+
+/// Where invoices are stored and how they are named.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Output {
+    pub dir: String,
+    pub filename: String,
+}
+
+impl Output {
+    /// The target directory with a leading `~` expanded.
+    pub fn resolved_dir(&self) -> PathBuf {
+        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+        expand_home(&self.dir, home.as_deref())
+    }
+}
+
+fn expand_home(dir: &str, home: Option<&Path>) -> PathBuf {
+    match (dir, home) {
+        ("~", Some(home)) => home.to_path_buf(),
+        (dir, Some(home)) if dir.starts_with("~/") => home.join(&dir[2..]),
+        _ => PathBuf::from(dir),
+    }
+}
+
+/// Per-company override of the global disposal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged, expecting = "`delete` or `{ move_to: <folder> }`")]
+pub enum CompanyDisposal {
+    Delete(DeleteKeyword),
+    Move(MoveTarget),
+}
+
+/// The literal `delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteKeyword {
+    Delete,
+}
+
+/// `{ move_to: <folder> }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoveTarget {
+    pub move_to: String,
+}
+
+/// A reference to a keychain entry, `keyring:<id>`.
+///
+/// Loading rejects everything else, so plaintext secrets cannot pass. `Debug`
+/// is redacted because an unvalidated value could be a plaintext secret.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    /// The keychain id, or `None` if this is not a valid reference.
+    pub fn id(&self) -> Option<&str> {
+        self.0
+            .strip_prefix(names::CONFIG_SECRET_PREFIX)
+            .filter(|id| is_valid_id(id))
+    }
+}
+
+impl fmt::Debug for SecretRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.id() {
+            Some(id) => write!(f, "SecretRef({id})"),
+            None => f.write_str("SecretRef(<invalid>)"),
+        }
+    }
+}
+
+/// A single validation problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issue {
+    /// Path of the value, for example `companies[1].mail.subject`.
+    pub path: String,
+    pub message: String,
+}
+
+/// Why a configuration could not be loaded.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("cannot read configuration file {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{origin} has a syntax or structure error: {message}")]
+    Syntax { origin: String, message: String },
+    #[error("{origin} has {} problem(s):{}", issues.len(), format_issues(issues))]
+    Invalid { origin: String, issues: Vec<Issue> },
+}
+
+fn format_issues(issues: &[Issue]) -> String {
+    issues
+        .iter()
+        .map(|issue| format!("\n  - {}: {}", issue.path, issue.message))
+        .collect()
+}
+
+impl Config {
+    /// Loads and validates a configuration file.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::parse(&input, &path.display().to_string())
+    }
+
+    /// Parses and validates YAML text.
+    pub fn from_yaml(input: &str) -> Result<Self, ConfigError> {
+        Self::parse(input, "the configuration")
+    }
+
+    fn parse(input: &str, origin: &str) -> Result<Self, ConfigError> {
+        let options = serde_saphyr::options! { with_snippet: false };
+        let config: Config = serde_saphyr::from_str_with_options(input, options).map_err(|e| {
+            ConfigError::Syntax {
+                origin: origin.to_owned(),
+                message: e.to_string(),
+            }
+        })?;
+        let issues = config.validate();
+        if issues.is_empty() {
+            Ok(config)
+        } else {
+            Err(ConfigError::Invalid {
+                origin: origin.to_owned(),
+                issues,
+            })
+        }
+    }
+
+    fn validate(&self) -> Vec<Issue> {
+        let mut report = Report::default();
+        self.mail.validate(&mut report);
+        if let Some(llm) = &self.llm {
+            report.secret("llm.api_key", &llm.api_key);
+        }
+        report.unique_ids(
+            "companies",
+            self.companies.iter().map(|company| company.id.as_str()),
+        );
+        for (i, company) in self.companies.iter().enumerate() {
+            company.validate(&format!("companies[{i}]"), &mut report);
+        }
+        report.issues
+    }
+}
+
+impl MailConfig {
+    fn validate(&self, report: &mut Report) {
+        if self.accounts.is_empty() {
+            report.add("mail.accounts", "at least one account is required");
+        }
+        report.unique_ids(
+            "mail.accounts",
+            self.accounts.iter().map(|account| account.id.as_str()),
+        );
+        for (i, account) in self.accounts.iter().enumerate() {
+            let path = format!("mail.accounts[{i}]");
+            report.id(&format!("{path}.id"), &account.id);
+            if account.endpoint().is_none() {
+                report.add(
+                    &format!("{path}.imap"),
+                    "must have the form `host:port`, for example `imap.example.com:993`",
+                );
+            }
+            report.not_blank(&format!("{path}.user"), &account.user);
+            report.secret(&format!("{path}.password"), &account.password);
+            report.not_blank(&format!("{path}.watch"), &account.watch);
+        }
+
+        let needs_folder = matches!(
+            self.disposal.mode,
+            DisposalMode::AllMove | DisposalMode::PdfMoveLinkDelete
+        );
+        match &self.disposal.move_to {
+            Some(folder) => report.not_blank("mail.disposal.move_to", folder),
+            None if needs_folder => report.add(
+                "mail.disposal.move_to",
+                "is required for the modes `all_move` and `pdf_move_link_delete`",
+            ),
+            None => {}
+        }
+    }
+}
+
+impl Company {
+    fn validate(&self, path: &str, report: &mut Report) {
+        report.id(&format!("{path}.id"), &self.id);
+        report.not_blank(&format!("{path}.name"), &self.name);
+        if self.mail.is_none() && self.portal.is_none() {
+            report.add(path, "needs at least one of `mail` and `portal`");
+        }
+        if let Some(rule) = &self.mail {
+            rule.validate(&format!("{path}.mail"), report);
+        }
+        if let Some(portal) = &self.portal {
+            portal.validate(&format!("{path}.portal"), report);
+        }
+        report.not_blank(&format!("{path}.output.dir"), &self.output.dir);
+        if let Err(problem) = FilenameTemplate::parse(&self.output.filename) {
+            report.add(&format!("{path}.output.filename"), &problem);
+        }
+        if let Some(CompanyDisposal::Move(target)) = &self.disposal {
+            report.not_blank(&format!("{path}.disposal.move_to"), &target.move_to);
+        }
+    }
+}
+
+impl MailRule {
+    fn validate(&self, path: &str, report: &mut Report) {
+        if !is_valid_domain(&self.from_domain) {
+            report.add(
+                &format!("{path}.from_domain"),
+                "must be a domain without `@`, for example `example.com`",
+            );
+        }
+        report.regex(&format!("{path}.subject"), self.subject.as_deref());
+        report.regex(&format!("{path}.attachment"), self.attachment.as_deref());
+    }
+}
+
+impl Portal {
+    fn validate(&self, path: &str, report: &mut Report) {
+        report.secret(&format!("{path}.credentials"), &self.credentials);
+        if let Some(totp) = &self.totp {
+            report.secret(&format!("{path}.totp"), totp);
+        }
+        if self.recipe.as_os_str().is_empty() {
+            report.add(&format!("{path}.recipe"), "must not be empty");
+        }
+        if let Some(schedule) = &self.schedule
+            && schedule.split_whitespace().count() != 5
+        {
+            report.add(
+                &format!("{path}.schedule"),
+                "must be a cron expression with five fields, for example `0 9 10 * *`",
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct Report {
+    issues: Vec<Issue>,
+}
+
+impl Report {
+    fn add(&mut self, path: &str, message: &str) {
+        self.issues.push(Issue {
+            path: path.to_owned(),
+            message: message.to_owned(),
+        });
+    }
+
+    fn not_blank(&mut self, path: &str, value: &str) {
+        if value.trim().is_empty() {
+            self.add(path, "must not be empty");
+        }
+    }
+
+    fn id(&mut self, path: &str, id: &str) {
+        if !is_valid_id(id) {
+            self.add(
+                path,
+                "must start with a lowercase letter or digit and contain only lowercase letters, digits, `-` and `_`",
+            );
+        }
+    }
+
+    fn unique_ids<'a>(&mut self, path: &str, ids: impl Iterator<Item = &'a str>) {
+        let mut seen = HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                self.add(path, &format!("the id `{id}` is used more than once"));
+            }
+        }
+    }
+
+    /// Never quotes the value: a rejected value may be a plaintext secret.
+    fn secret(&mut self, path: &str, secret: &SecretRef) {
+        if secret.id().is_none() {
+            self.add(
+                path,
+                "must be a reference of the form `keyring:<id>`; secrets must not be written into the configuration",
+            );
+        }
+    }
+
+    fn regex(&mut self, path: &str, pattern: Option<&str>) {
+        if let Some(pattern) = pattern
+            && let Err(error) = Regex::new(pattern)
+        {
+            self.add(path, &format!("is not a valid regular expression: {error}"));
+        }
+    }
+}
+
+fn is_valid_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn is_valid_domain(domain: &str) -> bool {
+    domain.contains('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_alphanumeric() || c == '-')
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example from section 8 of `KONZEPT.md`.
+    const CONCEPT_EXAMPLE: &str = r#"
+mail:
+  accounts:
+    - id: rechnungen
+      imap: imap.example.de:993
+      user: rechnungen@example.de
+      password: keyring:mail-rechnungen
+      watch: INBOX
+  disposal:                          # global default
+    mode: pdf_move_link_delete       # all_delete | all_move | pdf_move_link_delete
+    move_to: Rechnungen/Erledigt
+    delete_to_trash: true
+
+llm:
+  provider: anthropic                # anthropic | openai | openrouter
+  api_key: keyring:llm-key
+
+companies:
+  - id: telekom                      # link mails + portal
+    name: Telekom
+    mail: { from_domain: telekom.de, subject: "(?i)rechnung" }
+    portal:
+      credentials: keyring:telekom
+      totp: keyring:telekom-totp     # optional
+      recipe: recipes/telekom.yaml
+      schedule: "0 9 10 * *"
+    output:
+      dir: ~/Rechnungen/Eingang
+      filename: "{date:%Y-%m-%d} - Telekom - {invoice_no}.pdf"
+    disposal: delete                 # overrides the default
+
+  - id: hetzner                      # PDF mails only, no portal
+    name: Hetzner
+    mail: { from_domain: hetzner.com, attachment: "(?i).*\\.pdf" }
+    output:
+      dir: ~/Rechnungen/Eingang
+      filename: "{date:%Y-%m-%d} - Hetzner - {invoice_no}.pdf"
+    disposal: { move_to: Rechnungen/Hetzner }
+"#;
+
+    const MINIMAL_MAIL: &str = r#"
+mail:
+  accounts:
+    - { id: a, imap: "imap.example.com:993", user: u, password: "keyring:p", watch: INBOX }
+  disposal: { mode: all_delete }
+"#;
+
+    fn issues_of(yaml: &str) -> Vec<Issue> {
+        match Config::from_yaml(yaml) {
+            Err(ConfigError::Invalid { issues, .. }) => issues,
+            other => panic!("expected validation issues, got {other:?}"),
+        }
+    }
+
+    fn company_yaml(body: &str) -> String {
+        format!("{MINIMAL_MAIL}\ncompanies:\n  - {body}\n")
+    }
+
+    const VALID_OUTPUT: &str =
+        r#"output: { dir: /tmp/x, filename: "{date:%Y-%m-%d} - {invoice_no}.pdf" }"#;
+
+    #[test]
+    fn parses_the_concept_example_exactly() {
+        let config = Config::from_yaml(CONCEPT_EXAMPLE).unwrap();
+
+        let account = &config.mail.accounts[0];
+        assert_eq!(account.endpoint(), Some(("imap.example.de", 993)));
+        assert_eq!(account.password.id(), Some("mail-rechnungen"));
+        assert_eq!(config.mail.disposal.mode, DisposalMode::PdfMoveLinkDelete);
+        assert!(config.mail.disposal.delete_to_trash);
+        assert_eq!(config.llm.unwrap().provider, LlmProvider::Anthropic);
+
+        let telekom = &config.companies[0];
+        assert_eq!(
+            telekom.disposal,
+            Some(CompanyDisposal::Delete(DeleteKeyword::Delete))
+        );
+        let portal = telekom.portal.as_ref().unwrap();
+        assert_eq!(portal.totp.as_ref().unwrap().id(), Some("telekom-totp"));
+        assert_eq!(portal.schedule.as_deref(), Some("0 9 10 * *"));
+
+        let hetzner = &config.companies[1];
+        assert!(hetzner.portal.is_none());
+        assert_eq!(
+            hetzner.disposal,
+            Some(CompanyDisposal::Move(MoveTarget {
+                move_to: "Rechnungen/Hetzner".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn llm_and_companies_are_optional_and_trash_is_the_default() {
+        let config = Config::from_yaml(MINIMAL_MAIL).unwrap();
+        assert!(config.llm.is_none());
+        assert!(config.companies.is_empty());
+        assert!(config.mail.disposal.delete_to_trash);
+    }
+
+    #[test]
+    fn plaintext_secrets_are_rejected_without_being_quoted() {
+        let yaml = MINIMAL_MAIL.replace("keyring:p", "hunter2-secret");
+        let error = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(error.contains("mail.accounts[0].password"), "{error}");
+        assert!(error.contains("keyring:<id>"), "{error}");
+        assert!(!error.contains("hunter2-secret"), "{error}");
+    }
+
+    #[test]
+    fn syntax_errors_do_not_quote_neighbouring_secrets() {
+        let yaml = "mail:\n  accounts:\n    - password: hunter2-secret\n      imap: [\n";
+        let error = Config::from_yaml(yaml).unwrap_err().to_string();
+        assert!(!error.contains("hunter2-secret"), "{error}");
+    }
+
+    #[test]
+    fn invalid_secret_ref_debug_output_is_redacted() {
+        let secret = SecretRef("hunter2-secret".into());
+        assert!(!format!("{secret:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn unknown_fields_are_reported_with_their_name() {
+        let yaml = MINIMAL_MAIL.replace("mode: all_delete", "mode: all_delete, moveto: x");
+        let error = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(error.contains("moveto"), "{error}");
+    }
+
+    #[test]
+    fn unknown_disposal_mode_names_the_problem() {
+        let yaml = MINIMAL_MAIL.replace("all_delete", "everything");
+        let error = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(error.contains("everything"), "{error}");
+    }
+
+    #[test]
+    fn move_modes_require_a_folder() {
+        for mode in ["all_move", "pdf_move_link_delete"] {
+            let issues = issues_of(&MINIMAL_MAIL.replace("all_delete", mode));
+            assert_eq!(issues[0].path, "mail.disposal.move_to");
+        }
+    }
+
+    #[test]
+    fn all_problems_are_reported_together() {
+        let yaml = company_yaml(
+            r#"{ id: "Bad Id", name: "", mail: { from_domain: "a@b", subject: "(" },
+                 output: { dir: "", filename: "{nope}.pdf" } }"#,
+        );
+        let paths: Vec<String> = issues_of(&yaml).into_iter().map(|i| i.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "companies[0].id",
+                "companies[0].name",
+                "companies[0].mail.from_domain",
+                "companies[0].mail.subject",
+                "companies[0].output.dir",
+                "companies[0].output.filename",
+            ]
+        );
+    }
+
+    #[test]
+    fn company_needs_mail_or_portal() {
+        let issues = issues_of(&company_yaml(&format!(
+            "{{ id: x, name: X, {VALID_OUTPUT} }}"
+        )));
+        assert!(issues[0].message.contains("`mail` and `portal`"));
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let company =
+            format!("{{ id: x, name: X, mail: {{ from_domain: x.de }}, {VALID_OUTPUT} }}");
+        let yaml = format!("{MINIMAL_MAIL}\ncompanies:\n  - {company}\n  - {company}\n");
+        assert!(issues_of(&yaml)[0].message.contains("`x`"));
+    }
+
+    #[test]
+    fn bad_endpoint_and_schedule_are_rejected() {
+        let issues = issues_of(&MINIMAL_MAIL.replace("imap.example.com:993", "imap.example.com"));
+        assert_eq!(issues[0].path, "mail.accounts[0].imap");
+
+        let yaml = company_yaml(&format!(
+            r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ credentials: "keyring:c", recipe: r.yaml, schedule: "nope" }} }}"#
+        ));
+        assert_eq!(issues_of(&yaml)[0].path, "companies[0].portal.schedule");
+    }
+
+    #[test]
+    fn bare_move_keyword_explains_the_expected_form() {
+        let yaml = company_yaml(&format!(
+            "{{ id: x, name: X, mail: {{ from_domain: x.de }}, {VALID_OUTPUT}, disposal: move }}"
+        ));
+        let error = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(error.contains("move_to"), "{error}");
+    }
+
+    #[test]
+    fn missing_file_names_the_path() {
+        let error = Config::load(Path::new("/does/not/exist.yaml"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/does/not/exist.yaml"), "{error}");
+    }
+
+    #[test]
+    fn home_is_expanded_only_at_the_start() {
+        let home = Path::new("/h");
+        assert_eq!(expand_home("~/a", Some(home)), Path::new("/h/a"));
+        assert_eq!(expand_home("~", Some(home)), Path::new("/h"));
+        assert_eq!(expand_home("/x/~/a", Some(home)), Path::new("/x/~/a"));
+        assert_eq!(expand_home("~other", Some(home)), Path::new("~other"));
+    }
+}
