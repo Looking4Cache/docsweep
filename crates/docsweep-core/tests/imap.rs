@@ -387,12 +387,12 @@ companies:
   - id: acme
     name: Acme
     mail: {{ from_domain: acme.example }}
-    output: {{ dir: "{}", filename: "{{date:%Y-%m-%d}} - Acme - {{invoice_no}}.pdf" }}
+    output: {{ dir: '{}', filename: "{{date:%Y-%m-%d}} - Acme - {{invoice_no}}.pdf" }}
   - id: portal
     name: Portal
     mail: {{ from_domain: portal.example }}
     portal: {{ credentials: "keyring:c", recipe: recipes/portal.yaml }}
-    output: {{ dir: "{}", filename: "{{invoice_no}}.pdf" }}
+    output: {{ dir: '{}', filename: "{{invoice_no}}.pdf" }}
     disposal: delete
 "#,
         dir.display(),

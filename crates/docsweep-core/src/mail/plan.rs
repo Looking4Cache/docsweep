@@ -370,7 +370,7 @@ companies:
   - id: acme
     name: Acme
     mail: {{ from_domain: acme.example }}
-    output: {{ dir: "{dir}", filename: "{{date:%Y-%m-%d}} - Acme - {{invoice_no}}.pdf" }}
+    output: {{ dir: '{dir}', filename: "{{date:%Y-%m-%d}} - Acme - {{invoice_no}}.pdf" }}
     {company_extra}
 "#
         ))

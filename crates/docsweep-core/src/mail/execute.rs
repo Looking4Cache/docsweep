@@ -428,7 +428,7 @@ companies:
   - id: acme
     name: Acme
     mail: {{ from_domain: acme.example }}
-    output: {{ dir: "{}", filename: "{{invoice_no}}.pdf" }}
+    output: {{ dir: '{}', filename: "{{invoice_no}}.pdf" }}
     {extra}
 "#,
             dir.path().display()

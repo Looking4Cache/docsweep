@@ -224,6 +224,19 @@ pub enum ConfigError {
     Invalid { origin: String, issues: Vec<Issue> },
 }
 
+/// Adds advice for the mistake parsers describe worst: `"C:\\Users\\me"` is an
+/// invalid escape sequence in double-quoted YAML.
+fn explain_syntax_error(message: String) -> String {
+    if message.contains("quoted scalar") {
+        format!(
+            "{message}. A backslash starts an escape sequence inside double quotes; \
+             write Windows paths in single quotes or with forward slashes"
+        )
+    } else {
+        message
+    }
+}
+
 fn format_issues(issues: &[Issue]) -> String {
     issues
         .iter()
@@ -251,7 +264,7 @@ impl Config {
         let config: Config = serde_saphyr::from_str_with_options(input, options).map_err(|e| {
             ConfigError::Syntax {
                 origin: origin.to_owned(),
-                message: e.to_string(),
+                message: explain_syntax_error(e.to_string()),
             }
         })?;
         let issues = config.validate();
@@ -649,6 +662,23 @@ mail:
         ));
         let error = Config::from_yaml(&yaml).unwrap_err().to_string();
         assert!(error.contains("move_to"), "{error}");
+    }
+
+    #[test]
+    fn windows_paths_work_in_single_quotes_and_get_advice_in_double_quotes() {
+        let company = |dir: &str| {
+            company_yaml(&format!(
+                r#"{{ id: x, name: X, mail: {{ from_domain: x.de }},
+                     output: {{ dir: {dir}, filename: "{{invoice_no}}.pdf" }} }}"#
+            ))
+        };
+        let config = Config::from_yaml(&company(r"'C:\Users\me\Invoices'")).unwrap();
+        assert_eq!(config.companies[0].output.dir, r"C:\Users\me\Invoices");
+
+        let error = Config::from_yaml(&company(r#""C:\Users\me""#))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("single quotes"), "{error}");
     }
 
     #[test]
