@@ -1,7 +1,8 @@
 import { api, errorText } from "../lib/api.js";
 import { h, icon, replace } from "../lib/dom.js";
-import { t, tn } from "../lib/i18n.js";
+import { formatDateTime, t, tn } from "../lib/i18n.js";
 import { reportList, summaryStats } from "../lib/report.js";
+import { describeSchedule } from "../lib/schedule.js";
 import { confirmDialog, emptyState, field, folderInput, notice, pageHeader, showIssues, textInput, toast, withBusy } from "../lib/ui.js";
 
 const DRAFTS_KEY = "docsweep.company-drafts";
@@ -333,6 +334,46 @@ export function renderCompanies(app, options = {}) {
     const portalUser = textInput({ autocomplete: "off" });
     const portalPassword = secretInput("new-password");
     const portalTotp = secretInput("off");
+
+    // Says in words what the expression means and when it next comes up.
+    const scheduleHint = h("span", { class: "field-hint" });
+    const scheduleInput = textInput({
+      value: draft.schedule ?? "",
+      class: "mono",
+      placeholder: "0 9 10 * *",
+      oninput: (event) => {
+        draft.schedule = event.target.value;
+        refreshSchedule();
+      },
+    });
+    const scheduleField = field({
+      label: t("schedule.label"),
+      path: "portal.schedule",
+      optional: true,
+      hint: scheduleHint,
+      input: scheduleInput,
+    });
+    async function refreshSchedule() {
+      const expression = scheduleInput.value.trim();
+      const { next_run: nextRun, error } = expression
+        ? await api.describeSchedule(expression)
+        : { next_run: null, error: null };
+      if (expression !== scheduleInput.value.trim()) return;
+      // The same place where a problem appears after saving.
+      const problem = scheduleField.querySelector(".field-error");
+      problem.textContent = error ?? "";
+      problem.hidden = !error;
+      scheduleField.classList.toggle("has-error", Boolean(error));
+      scheduleHint.hidden = Boolean(error);
+      if (error) return;
+      scheduleHint.textContent = !expression ? t("schedule.none") : [
+        describeSchedule(expression),
+        t("schedule.next_run", { time: formatDateTime(nextRun) }),
+        !app.config.automation?.enabled && t("schedule.automation_off"),
+      ].filter(Boolean).join(" ");
+    }
+    refreshSchedule();
+
     const portalFields = h("div", { class: "form", hidden: !draft.hasPortal },
       h("p", { class: "field-hint" }, t("companies.portal.note")),
       field({
@@ -362,6 +403,7 @@ export function renderCompanies(app, options = {}) {
         optional: true,
         input: portalTotp,
       }),
+      scheduleField,
       fetchPanel(),
     );
     const portalToggle = h("label", { class: "check" },

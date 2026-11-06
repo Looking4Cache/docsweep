@@ -7,7 +7,7 @@ const STATUS_TONES = { stored: "success", needs_review: "warning", portal_fetch_
 const FILTERS = [
   ["all", () => true],
   ["review", (row) => row.status === "needs_review"],
-  ["portal", (row) => row.status === "portal_fetch_required"],
+  ["portal", (row) => row.status === "portal_fetch_required" && !row.resolved_at],
 ];
 
 function renderTemplate(template, date, number) {
@@ -95,7 +95,9 @@ export function renderInvoices(app) {
       h("td", {}, companyName(row.company_id)),
       h("td", { class: "cell-number" }, row.invoice_no ?? h("span", { class: "muted" }, t("invoices.no_number"))),
       h("td", { class: "cell-amount" }, formatAmount(row.amount, row.currency)),
-      h("td", {}, badge(STATUS_TONES[row.status], t(`status.${row.status}`))),
+      h("td", {}, row.resolved_at
+        ? badge("success", t("status.portal_resolved"))
+        : badge(STATUS_TONES[row.status], t(`status.${row.status}`))),
       h("td", { class: "cell-actions" },
         inReview && h("button", {
           class: "button button-small button-primary",

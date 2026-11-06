@@ -1,14 +1,14 @@
 import { api, errorText } from "../lib/api.js";
 import { h, replace } from "../lib/dom.js";
 import { t } from "../lib/i18n.js";
-import { field, folderInput, notice, pageHeader, showIssues, toast, withBusy } from "../lib/ui.js";
+import { field, folderInput, notice, pageHeader, showIssues, textInput, toast, withBusy } from "../lib/ui.js";
 import { cleanupForm } from "./mailboxes.js";
 
 export function renderSettings(app) {
   const root = h("div", { class: "page" });
 
   // One card with its own save button, so changes stay easy to oversee.
-  function card({ title, lead, form, save }) {
+  function card({ title, lead, form, extra, save }) {
     const message = h("div", {});
     const saveButton = h("button", {
       class: "button button-primary",
@@ -34,6 +34,7 @@ export function renderSettings(app) {
       form,
       message,
       h("div", { class: "form-actions" }, h("span", { class: "spacer" }), saveButton),
+      extra && h("div", { class: "card-extra" }, extra),
     );
   }
 
@@ -73,10 +74,90 @@ export function renderSettings(app) {
     });
   }
 
+  function checkbox({ checked, title, hint, onChange }) {
+    return h("label", { class: "check" },
+      h("input", { type: "checkbox", checked, onchange: (event) => onChange(event.target.checked, event.target) }),
+      h("span", {},
+        h("span", { class: "check-title" }, title),
+        h("span", { class: "field-hint" }, hint)));
+  }
+
+  // The system knows about autostart, not the configuration, so this applies at
+  // once and has no part in saving.
+  function autostartField() {
+    const message = h("div", {});
+    const host = h("div", { class: "form" });
+    api.autostartEnabled().then((enabled) => {
+      replace(host,
+        checkbox({
+          checked: enabled,
+          title: t("automation.autostart"),
+          hint: t("automation.autostart_hint"),
+          onChange: async (wanted, input) => {
+            replace(message);
+            try {
+              await api.setAutostart(wanted);
+              toast(t("common.saved"));
+            } catch (error) {
+              input.checked = !wanted;
+              replace(message, notice("danger", errorText(error)));
+            }
+          },
+        }),
+        message);
+    }).catch((error) => replace(host, notice("danger", errorText(error))));
+    return host;
+  }
+
+  function automationCard() {
+    let enabled = Boolean(app.config.automation?.enabled);
+    let minutes = String(app.config.mail.poll_minutes ?? "");
+    const form = h("div", { class: "form" },
+      notice("warning", t("automation.warning")),
+      checkbox({
+        checked: enabled,
+        title: t("automation.enabled"),
+        hint: t("automation.enabled_hint"),
+        onChange: (value) => { enabled = value; },
+      }),
+      field({
+        label: t("automation.poll"),
+        hint: t("automation.poll_hint"),
+        path: "mail.poll_minutes",
+        optional: true,
+        input: textInput({
+          value: minutes,
+          class: "input-short",
+          inputmode: "numeric",
+          oninput: (event) => { minutes = event.target.value.trim(); },
+        }),
+      }),
+    );
+    return card({
+      title: t("automation.title"),
+      lead: t("automation.lead"),
+      form,
+      extra: autostartField(),
+      save: () => {
+        const { automation: _unused, ...rest } = app.config;
+        const { poll_minutes: _alsoUnused, ...mail } = app.config.mail;
+        if (minutes) {
+          const value = Number(minutes);
+          if (!Number.isInteger(value) || value < 0) {
+            throw { message: "", issues: [{ path: "mail.poll_minutes", message: t("automation.poll_invalid") }] };
+          }
+          mail.poll_minutes = value;
+        }
+        return enabled ? { ...rest, automation: { enabled }, mail } : { ...rest, mail };
+      },
+    });
+  }
+
   replace(root,
     pageHeader(t("settings.title"), t("settings.lead")),
     folderCard(),
     cleanupCard(),
+    automationCard(),
     h("article", { class: "card" },
       h("h2", { class: "card-heading" }, t("settings.about")),
       h("dl", { class: "about" },

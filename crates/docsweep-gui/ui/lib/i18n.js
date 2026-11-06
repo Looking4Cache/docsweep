@@ -38,6 +38,13 @@ export function formatDateTime(iso) {
   return new Intl.DateTimeFormat(language, { dateStyle: "medium", timeStyle: "short" }).format(new Date(iso));
 }
 
+// The name of a cron weekday: 0 and 7 are Sunday.
+export function weekdayName(number) {
+  // 4 January 2026 is a Sunday.
+  const date = new Date(2026, 0, 4 + (number % 7));
+  return new Intl.DateTimeFormat(language, { weekday: "long" }).format(date);
+}
+
 export function formatAmount(amount, currency) {
   if (!amount) return "–";
   const value = Number(amount);

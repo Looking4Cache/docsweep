@@ -24,7 +24,7 @@ function effectItems(effects) {
   add(effects.moves, "scan.confirm_moves", "arrow");
   add(effects.trash, "scan.confirm_trash", "trash");
   add(effects.permanent, "scan.confirm_permanent", "trash", true);
-  add(effects.notes, "scan.confirm_notes", "link");
+  add(effects.fetches, "scan.confirm_fetches", "link");
   return items;
 }
 
@@ -70,8 +70,9 @@ export function renderScan(app) {
 
   function resultView(result, dryRun) {
     const { reports, summary } = result;
+    const fetches = result.fetches ?? [];
     const anyMail = reports.some((account) => account.mails.length > 0 || account.error);
-    if (!anyMail) {
+    if (!anyMail && fetches.length === 0) {
       return emptyState("check", t("scan.empty_title"), t("scan.empty_lead"),
         h("button", { class: "button", onclick: () => start(true) }, t("scan.preview_again")));
     }
@@ -79,7 +80,7 @@ export function renderScan(app) {
     return [
       result.warning && notice("warning", result.warning),
       summaryStats(summary, dryRun),
-      reportList(reports, { onCreateCompany: createCompanyFrom, done: !dryRun }),
+      reportList([...reports, ...fetches], { onCreateCompany: createCompanyFrom, done: !dryRun }),
       dryRun && h("div", { class: "action-bar" },
         h("span", { class: "action-note" }, icon("question"),
           hasEffects(effects) ? t("scan.preview_note") : t("scan.nothing_to_run")),
@@ -102,6 +103,19 @@ export function renderScan(app) {
         h("button", { class: "button", onclick: () => start(true) }, t("scan.preview_again")));
     }
     return pageHeader(t("scan.title"), null);
+  }
+
+  // What automatic runs are up to, so nobody has to open the history to find out.
+  function automationNotices() {
+    const problems = app.automaticProblems.length;
+    if (!app.automationRunning && problems === 0) return null;
+    return h("div", { class: "notices" },
+      app.automationRunning && notice("info", t("scan.auto_running")),
+      problems > 0 && h("div", { class: "notice notice-danger notice-with-action", role: "alert" },
+        icon("alert"),
+        h("span", {}, tn("scan.auto_problems", problems)),
+        h("button", { class: "button button-small", onclick: () => app.navigate("history") }, t("scan.auto_see_history"))),
+    );
   }
 
   function paint() {
@@ -137,10 +151,11 @@ export function renderScan(app) {
             : h("button", { class: "button button-primary button-large", onclick: () => start(true) }, t("scan.preview")),
         );
     }
-    replace(root, headerFor(current.phase), body);
+    replace(root, headerFor(current.phase), automationNotices(), body);
   }
 
   paintVisible = paint;
+  app.repaintScan = paint;
   paint();
   return root;
 }

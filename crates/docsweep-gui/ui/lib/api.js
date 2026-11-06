@@ -17,6 +17,10 @@ export const api = {
   completeReview: (id, invoiceNo, date) => invoke("complete_review", { id, invoiceNo, date }),
   revealInvoice: (id) => invoke("reveal_invoice", { id }),
   pickFolder: () => invoke("pick_folder"),
+  automationStatus: () => invoke("automation_status"),
+  describeSchedule: (expression) => invoke("describe_schedule", { expression }),
+  autostartEnabled: () => invoke("autostart_enabled"),
+  setAutostart: (enabled) => invoke("set_autostart", { enabled }),
 };
 
 export function onTrayPreview(handler) {
@@ -29,6 +33,10 @@ export function onPortalConfirmation(handler) {
 
 export function onPortalConfirmationEnded(handler) {
   window.__TAURI__.event.listen("portal-confirmation-ended", handler);
+}
+
+export function onAutomationStatus(handler) {
+  window.__TAURI__.event.listen("automation-status", (event) => handler(event.payload));
 }
 
 export function errorText(error) {

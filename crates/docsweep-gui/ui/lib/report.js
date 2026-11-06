@@ -9,6 +9,7 @@ const GROUP_ORDER = ["failed", "review", "save", "portal", "unknown", "other"];
 
 function groupOf(mail) {
   if (mail.outcome.kind === "failed") return "failed";
+  if (mail.outcome.kind === "link_resolved") return "save";
   const action = mail.plan.action;
   switch (action.kind) {
     case "invoices":
@@ -34,11 +35,12 @@ export function groupReports(reports) {
 
 // What a real run would do, for the confirmation dialog.
 export function plannedEffects(reports) {
-  const effects = { saves: 0, reviews: 0, moves: 0, trash: 0, permanent: 0, notes: 0 };
+  const effects = { saves: 0, reviews: 0, moves: 0, trash: 0, permanent: 0, fetches: 0 };
+  const fetching = new Set();
   for (const account of reports) {
     for (const mail of account.mails) {
       const action = mail.plan.action;
-      if (action.kind === "portal_fetch_required" && !action.already_recorded) effects.notes += 1;
+      if (action.kind === "portal_fetch_required" && action.fetch_due) fetching.add(action.company_id);
       if (action.kind !== "invoices") continue;
       for (const document of action.documents) {
         if (document.disposition.kind === "store") effects.saves += 1;
@@ -51,6 +53,7 @@ export function plannedEffects(reports) {
       if (disposal === "delete_permanently") effects.permanent += 1;
     }
   }
+  effects.fetches = fetching.size;
   return effects;
 }
 
@@ -77,15 +80,36 @@ function documentLine(document, failed) {
   }
 }
 
-function destination(action, done) {
-  if (action.kind !== "invoices") return badge("neutral", t("row.dest_stays"));
-  if (action.decision.kind === "keep_and_flag") return badge("warning", t("row.dest_keep"), "flag");
-  const disposal = action.decision.value;
+function disposalBadge(disposal, done) {
   if (disposal.kind === "move_to") {
     return badge("neutral", t(done ? "row.dest_moved" : "row.dest_move", { folder: disposal.value }), "arrow");
   }
   if (disposal.kind === "trash") return badge("neutral", t(done ? "row.dest_trashed" : "row.dest_trash"), "trash");
   return badge("danger", t(done ? "row.dest_permanent_done" : "row.dest_permanent"), "trash");
+}
+
+function destination(mail, done) {
+  const action = mail.plan.action;
+  if (mail.outcome.kind === "link_resolved") return disposalBadge(mail.outcome.disposal, true);
+  if (action.kind !== "invoices") return badge("neutral", t("row.dest_stays"));
+  if (action.decision.kind === "keep_and_flag") return badge("warning", t("row.dest_keep"), "flag");
+  return disposalBadge(action.decision.value, done);
+}
+
+// What is happening to the invoice behind a link mail.
+function linkMailNote(mail) {
+  switch (mail.outcome.kind) {
+    case "planned":
+      return t(mail.plan.action.fetch_due ? "row.portal_due" : "row.portal_checked_today");
+    case "link_resolved":
+      return t("row.portal_stored");
+    case "awaiting_invoice":
+      return t("row.portal_waiting");
+    case "failed":
+      return t("row.portal_not_stored");
+    default:
+      return t("row.portal");
+  }
 }
 
 function mailRow(mail, { onCreateCompany, done }) {
@@ -97,7 +121,7 @@ function mailRow(mail, { onCreateCompany, done }) {
   if (action.kind === "invoices") {
     details.push(action.documents.map((document) => documentLine(document, failed)));
   } else if (action.kind === "portal_fetch_required") {
-    details.push(h("div", { class: "doc is-muted" }, icon("link"), h("span", {}, t("row.portal"))));
+    details.push(h("div", { class: "doc is-muted" }, icon("link"), h("span", {}, linkMailNote(mail))));
   } else if (action.kind === "no_document") {
     details.push(h("div", { class: "doc is-muted" }, icon("dot"), h("span", {}, t("row.no_document"))));
   } else if (action.kind === "unknown_invoice") {
@@ -116,7 +140,7 @@ function mailRow(mail, { onCreateCompany, done }) {
       details,
     ),
     h("div", { class: "mail-side" },
-      !failed && destination(action, done),
+      !failed && destination(mail, done),
       action.kind === "unknown_invoice" && onCreateCompany && h("button", {
         class: "button button-small",
         onclick: () => onCreateCompany(plan.from),
@@ -134,6 +158,8 @@ const FETCH_GROUP_OF = {
   unresolved: "known",
   failed: "failed",
 };
+
+const FETCH_FILE_OUTCOMES = ["would_download", "stored", "stored_for_review"];
 
 function fetchEntryNote(entry) {
   const outcome = entry.outcome;
@@ -167,7 +193,9 @@ function fetchEntryRow(entry, companyName) {
       facts && h("div", { class: "mail-from" }, facts),
       failed
         ? h("p", { class: "row-failure" }, fetchEntryNote(entry))
-        : h("div", { class: "doc is-muted" }, icon("file"), h("span", { class: "doc-name" }, fetchEntryNote(entry))),
+        : h("div", { class: "doc is-muted" }, icon("file"),
+          // Only file names are set in the monospace font, not sentences.
+          h("span", { class: FETCH_FILE_OUTCOMES.includes(entry.outcome.kind) ? "doc-name" : "" }, fetchEntryNote(entry))),
     ),
   );
 }
@@ -195,7 +223,20 @@ function fetchReportList(reports) {
 
 // Renders groups in order of urgency. Empty groups do not appear.
 export function reportList(reports, { onCreateCompany, done = true } = {}) {
-  if (reports.some((report) => report.entries)) return fetchReportList(reports);
+  // The history keeps mailboxes and portal downloads in one list.
+  const fetches = reports.filter((report) => report.entries);
+  const accounts = reports.filter((report) => report.mails);
+  if (accounts.length === 0) return fetchReportList(fetches);
+  const mailSections = mailReportList(accounts, { onCreateCompany, done });
+  if (fetches.length === 0) return mailSections;
+  return [
+    mailSections,
+    h("h2", { class: "report-heading" }, t("report.portal_downloads")),
+    fetchReportList(fetches),
+  ];
+}
+
+function mailReportList(reports, { onCreateCompany, done }) {
   const { groups, accountErrors } = groupReports(reports);
   const options = { onCreateCompany, done };
   const sections = [];

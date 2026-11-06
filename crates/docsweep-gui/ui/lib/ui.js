@@ -88,7 +88,7 @@ export function showIssues(container, issues, mapPath = (path) => path) {
 
 export function notice(tone, text) {
   return h("div", { class: `notice notice-${tone}`, role: tone === "danger" ? "alert" : "status" },
-    icon(tone === "danger" || tone === "warning" ? "alert" : "check"),
+    icon({ danger: "alert", warning: "alert", info: "history" }[tone] ?? "check"),
     h("span", {}, text));
 }
 

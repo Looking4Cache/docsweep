@@ -1,4 +1,4 @@
-import { api, errorText, onTrayPreview } from "./lib/api.js";
+import { api, errorText, onAutomationStatus, onTrayPreview } from "./lib/api.js";
 import { h, icon, mark, replace } from "./lib/dom.js";
 import { loadTranslations, t } from "./lib/i18n.js";
 import { notice, watchPortalConfirmations } from "./lib/ui.js";
@@ -22,8 +22,21 @@ const VIEWS = {
 const root = document.getElementById("app");
 const content = h("main", { class: "content" });
 const reviewBadge = h("span", { class: "nav-badge", hidden: true });
+const problemBadge = h("span", { class: "nav-badge nav-badge-danger", hidden: true });
+const NAV_BADGES = { invoices: reviewBadge, history: problemBadge };
+// The newest run someone has seen in the history. Only a convenience: without
+// storage, old problems simply show again.
+const HISTORY_SEEN_KEY = "docsweep.history-seen";
 let activeView = "scan";
 let info = {};
+
+function historySeen() {
+  try {
+    return Number(localStorage.getItem(HISTORY_SEEN_KEY)) || 0;
+  } catch {
+    return 0;
+  }
+}
 
 // Shared with the views.
 const app = {
@@ -41,6 +54,10 @@ const app = {
   portalSecretsOf: (id) => app.portalSecrets.get(id) ?? { credentials: false, totp: false },
   setPortalSecretStored: (id, kind) => app.portalSecrets.set(id, { ...app.portalSecretsOf(id), [kind]: true }),
   navigate,
+  // Whether an automatic run is active, and those with problems nobody has seen.
+  automationRunning: false,
+  automaticProblems: [],
+  repaintScan: null,
   async refreshBadges() {
     try {
       const invoices = await api.listInvoices();
@@ -50,8 +67,30 @@ const app = {
     } catch {
       reviewBadge.hidden = true;
     }
+    try {
+      const seen = historySeen();
+      const runs = await api.listRuns();
+      showProblems(runs.filter((run) => run.automatic && run.summary?.failed > 0 && run.id > seen));
+    } catch {
+      showProblems([]);
+    }
+  },
+  markHistorySeen(runs) {
+    try {
+      if (runs.length > 0) localStorage.setItem(HISTORY_SEEN_KEY, String(runs[0].id));
+    } catch {
+      // Without storage, the badge simply comes back at the next refresh.
+    }
+    showProblems([]);
   },
 };
+
+function showProblems(runs) {
+  app.automaticProblems = runs;
+  problemBadge.hidden = runs.length === 0;
+  problemBadge.textContent = runs.length;
+  if (activeView === "scan") app.repaintScan?.();
+}
 
 const nav = h("nav", { class: "nav" });
 
@@ -61,7 +100,7 @@ function paintNav() {
       class: `nav-item${name === activeView ? " is-active" : ""}`,
       "aria-current": name === activeView ? "page" : undefined,
       onclick: () => navigate(name),
-    }, icon(name), h("span", {}, t(`nav.${name}`)), name === "invoices" && reviewBadge)));
+    }, icon(name), h("span", {}, t(`nav.${name}`)), NAV_BADGES[name])));
 }
 
 function navigate(view, options) {
@@ -100,6 +139,15 @@ async function start() {
   app.passwords = new Map(state.stored_passwords);
   app.portalSecrets = new Map(state.stored_portal_secrets);
   watchPortalConfirmations();
+  onAutomationStatus(({ running }) => {
+    app.automationRunning = running;
+    if (activeView === "scan") app.repaintScan?.();
+    if (!running && app.config) app.refreshBadges();
+  });
+  api.automationStatus().then(({ running }) => {
+    app.automationRunning = running;
+    if (activeView === "scan") app.repaintScan?.();
+  });
 
   onTrayPreview(() => {
     if (!app.config) return;
