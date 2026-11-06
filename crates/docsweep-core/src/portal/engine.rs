@@ -31,7 +31,7 @@ use crate::ai::output::parse_repaired_step;
 use crate::ai::prompts::Instructions;
 use crate::ai::provider::Ai;
 use crate::ai::sanitize::{RawPage, RawPrompt, looks_like_captcha, sanitize};
-use crate::config::{Company, Config};
+use crate::config::{Company, Config, SecretRef};
 use crate::document::{self, looks_like_pdf};
 use crate::index::{DuplicateCheck, Index, IndexError, NewInvoice, Source, Status};
 use crate::mail::plan::{Disposition, PlanError, ReviewReason, disposition_of, target_of};
@@ -63,6 +63,12 @@ const COMMON_COOKIE_BUTTONS: &str = "#onetrust-accept-btn-handler, \
 pub enum FetchError {
     #[error("the company `{0}` has no portal")]
     NoPortal(String),
+    #[error(
+        "the company `{0}` uses assisted mode: you log in and download in your own browser, so Docsweep runs no recipe for it"
+    )]
+    Assisted(String),
+    #[error("the company `{0}` has no `portal.recipe`")]
+    NoRecipe(String),
     #[error(
         "no portal credentials `{id}` in the keychain; store them with `docsweep secret set-portal {id}`"
     )]
@@ -186,7 +192,8 @@ fn load_login_secrets(
 
     let id = portal
         .credentials
-        .id()
+        .as_ref()
+        .and_then(SecretRef::id)
         .ok_or(FetchError::InvalidReference)?;
     let stored = secrets.get(id).map_err(|error| match error {
         SecretError::NotFound { id } => FetchError::CredentialsNotFound { id },

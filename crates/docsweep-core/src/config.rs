@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::names;
 use crate::naming::FilenameTemplate;
+use crate::portal::hosts::is_web_address;
 use crate::schedule::Schedule;
 
 /// Fewer minutes between polls would only burden the mail server.
@@ -46,11 +47,15 @@ pub struct Defaults {
     /// Folder for invoices of companies without their own `output.dir`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+    /// Where the browser saves downloads, for assisted pick-ups; without it, the
+    /// system's downloads folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downloads_dir: Option<String>,
 }
 
 impl Defaults {
     fn is_empty(&self) -> bool {
-        self.output_dir.is_none()
+        self.output_dir.is_none() && self.downloads_dir.is_none()
     }
 }
 
@@ -190,22 +195,57 @@ pub struct MailRule {
     pub attachment: Option<String>,
 }
 
+/// How invoices get out of a portal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalMode {
+    /// Docsweep logs in with a recipe.
+    #[default]
+    Recipe,
+    /// A person logs in and downloads in their ordinary browser, for portals that
+    /// reject automated browsers. Docsweep only opens `url` and files the PDF.
+    Assisted,
+}
+
+impl PortalMode {
+    fn is_recipe(&self) -> bool {
+        *self == Self::Recipe
+    }
+}
+
 /// Portal access. `credentials` holds user name and password in the format of
-/// `portal::credentials`, `totp` the setup key of the second factor.
+/// `portal::credentials`, `totp` the setup key of the second factor. Both and
+/// `recipe` are required in `recipe` mode, and validation sees to that.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Portal {
-    pub credentials: SecretRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "PortalMode::is_recipe")]
+    pub mode: PortalMode,
+    /// The address an assisted pick-up opens in the default browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<SecretRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp: Option<SecretRef>,
     /// Relative paths start in the recipes directory.
-    pub recipe: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<PathBuf>,
     /// Values for the recipe's parameters, such as a domain.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
     /// Cron expression with five fields, in local time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
+}
+
+impl Company {
+    /// Whether a person fetches this company's invoices by hand.
+    pub fn is_assisted(&self) -> bool {
+        self.portal
+            .as_ref()
+            .is_some_and(|portal| portal.mode == PortalMode::Assisted)
+    }
 }
 
 /// Where invoices are stored and how they are named.
@@ -216,6 +256,13 @@ pub struct Output {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
     pub filename: String,
+}
+
+/// The downloads folder the system names for this user.
+pub fn system_downloads_dir() -> Option<PathBuf> {
+    directories::UserDirs::new()?
+        .download_dir()
+        .map(Path::to_path_buf)
 }
 
 fn expand_home(dir: &str, home: Option<&Path>) -> PathBuf {
@@ -350,6 +397,16 @@ impl Config {
         expand_home(dir, home.as_deref())
     }
 
+    /// The folder an assisted pick-up looks at, with a leading `~` expanded.
+    /// `None` only if nothing is set and the system names no downloads folder.
+    pub fn downloads_dir(&self) -> Option<PathBuf> {
+        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+        match &self.defaults.downloads_dir {
+            Some(dir) => Some(expand_home(dir, home.as_deref())),
+            None => system_downloads_dir(),
+        }
+    }
+
     /// Validates and writes the configuration atomically.
     ///
     /// Writing does not preserve YAML comments. The first time an existing file
@@ -408,6 +465,9 @@ impl Config {
         let mut report = Report::default();
         if let Some(dir) = &self.defaults.output_dir {
             report.not_blank("defaults.output_dir", dir);
+        }
+        if let Some(dir) = &self.defaults.downloads_dir {
+            report.not_blank("defaults.downloads_dir", dir);
         }
         self.mail.validate(&mut report);
         if let Some(llm) = &self.llm {
@@ -519,17 +579,67 @@ impl MailRule {
 
 impl Portal {
     fn validate(&self, path: &str, report: &mut Report) {
-        report.secret(&format!("{path}.credentials"), &self.credentials);
+        if let Some(url) = &self.url
+            && !is_web_address(url)
+        {
+            report.add(
+                &format!("{path}.url"),
+                "must be an `http` or `https` address, for example `https://portal.example.com/`",
+            );
+        }
         if let Some(totp) = &self.totp {
             report.secret(&format!("{path}.totp"), totp);
         }
-        if self.recipe.as_os_str().is_empty() {
-            report.add(&format!("{path}.recipe"), "must not be empty");
+        match self.mode {
+            PortalMode::Recipe => self.validate_recipe_mode(path, report),
+            PortalMode::Assisted => self.validate_assisted_mode(path, report),
         }
         if let Some(schedule) = &self.schedule
             && let Err(problem) = Schedule::parse(schedule)
         {
             report.add(&format!("{path}.schedule"), &problem);
+        }
+    }
+
+    fn validate_recipe_mode(&self, path: &str, report: &mut Report) {
+        match &self.credentials {
+            Some(credentials) => report.secret(&format!("{path}.credentials"), credentials),
+            None => report.add(
+                &format!("{path}.credentials"),
+                "is required, unless `mode` is `assisted`",
+            ),
+        }
+        match &self.recipe {
+            Some(recipe) if recipe.as_os_str().is_empty() => {
+                report.add(&format!("{path}.recipe"), "must not be empty");
+            }
+            Some(_) => {}
+            None => report.add(
+                &format!("{path}.recipe"),
+                "is required, unless `mode` is `assisted`",
+            ),
+        }
+    }
+
+    fn validate_assisted_mode(&self, path: &str, report: &mut Report) {
+        if self.url.is_none() {
+            report.add(
+                &format!("{path}.url"),
+                "is required when `mode` is `assisted`",
+            );
+        }
+        const LOGS_IN_BY_HAND: &str = "must be removed when `mode` is `assisted`: you log in yourself, so Docsweep keeps no login";
+        if self.credentials.is_some() {
+            report.add(&format!("{path}.credentials"), LOGS_IN_BY_HAND);
+        }
+        if self.totp.is_some() {
+            report.add(&format!("{path}.totp"), LOGS_IN_BY_HAND);
+        }
+        if self.schedule.is_some() {
+            report.add(
+                &format!("{path}.schedule"),
+                "must be removed when `mode` is `assisted`: nothing runs on its own, a link mail shows the invoice to pick up",
+            );
         }
     }
 }
@@ -1020,6 +1130,143 @@ mail:
         let reloaded = Config::load(&path).unwrap();
         assert_eq!(reloaded.defaults.output_dir.as_deref(), Some("~/Invoices"));
         assert_eq!(reloaded.companies[0].output.dir, None);
+    }
+
+    const ASSISTED: &str = r#"portal: { mode: assisted, url: "https://portal.example.com/login" }"#;
+
+    #[test]
+    fn recipe_is_the_default_mode_and_existing_configurations_load_unchanged() {
+        let config = Config::from_yaml(CONCEPT_EXAMPLE).unwrap();
+        let telekom = &config.companies[0];
+        let portal = telekom.portal.as_ref().unwrap();
+        assert_eq!(portal.mode, PortalMode::Recipe);
+        assert!(!telekom.is_assisted());
+        assert_eq!(portal.credentials.as_ref().unwrap().id(), Some("telekom"));
+        assert_eq!(
+            portal.recipe.as_deref(),
+            Some(Path::new("recipes/telekom.yaml"))
+        );
+        assert_eq!(config.defaults, Defaults::default());
+
+        let written = serde_saphyr::to_string(&config).unwrap();
+        for new_field in ["mode: recipe", "url:", "downloads_dir"] {
+            assert!(!written.contains(new_field), "{written}");
+        }
+    }
+
+    #[test]
+    fn recipe_mode_still_requires_credentials_and_a_recipe() {
+        let yaml = company_yaml(&format!(
+            "{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ schedule: \"0 9 10 * *\" }} }}"
+        ));
+        let paths: Vec<String> = issues_of(&yaml).into_iter().map(|i| i.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "companies[0].portal.credentials",
+                "companies[0].portal.recipe"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_assisted_company_needs_only_a_web_address_and_keeps_it_through_saving() {
+        let yaml = company_yaml(&format!("{{ id: x, name: X, {VALID_OUTPUT}, {ASSISTED} }}"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.yaml");
+        Config::from_yaml(&yaml).unwrap().save(&path).unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        let company = &reloaded.companies[0];
+        assert!(company.is_assisted());
+        let portal = company.portal.as_ref().unwrap();
+        assert_eq!(
+            portal.url.as_deref(),
+            Some("https://portal.example.com/login")
+        );
+        assert!(portal.credentials.is_none() && portal.recipe.is_none());
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("keyring:x"), "{written}");
+    }
+
+    #[test]
+    fn an_assisted_company_without_an_address_is_rejected() {
+        let yaml = company_yaml(&format!(
+            "{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ mode: assisted }} }}"
+        ));
+        let issue = issues_of(&yaml).remove(0);
+        assert_eq!(issue.path, "companies[0].portal.url");
+        assert!(issue.message.contains("required"), "{}", issue.message);
+    }
+
+    #[test]
+    fn only_web_addresses_are_accepted_and_a_bad_one_is_not_quoted() {
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ftp://files.example.net/",
+            "mailto:me@example.net",
+            "files.example.net",
+            "",
+        ] {
+            let yaml = company_yaml(&format!(
+                r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ mode: assisted, url: "{url}" }} }}"#
+            ));
+            let issue = issues_of(&yaml).remove(0);
+            assert_eq!(issue.path, "companies[0].portal.url", "{url}");
+            assert!(issue.message.contains("`http`"), "{}", issue.message);
+            assert!(url.is_empty() || !issue.message.contains(url));
+        }
+        let plain_http = company_yaml(&format!(
+            r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ mode: assisted, url: "http://127.0.0.1:8000/" }} }}"#
+        ));
+        assert!(Config::from_yaml(&plain_http).is_ok());
+    }
+
+    #[test]
+    fn an_assisted_company_refuses_a_schedule_with_a_clear_message() {
+        let yaml = company_yaml(&format!(
+            r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ mode: assisted, url: "https://p.example/", schedule: "0 9 10 * *" }} }}"#
+        ));
+        let issue = issues_of(&yaml).remove(0);
+        assert_eq!(issue.path, "companies[0].portal.schedule");
+        assert!(issue.message.contains("assisted"), "{}", issue.message);
+    }
+
+    #[test]
+    fn an_assisted_company_keeps_no_login() {
+        let yaml = company_yaml(&format!(
+            r#"{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ mode: assisted, url: "https://p.example/", credentials: "keyring:c", totp: "keyring:t" }} }}"#
+        ));
+        let paths: Vec<String> = issues_of(&yaml).into_iter().map(|i| i.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "companies[0].portal.credentials",
+                "companies[0].portal.totp"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_names_the_problem() {
+        let yaml = company_yaml(&format!(
+            "{{ id: x, name: X, {VALID_OUTPUT}, portal: {{ mode: stealth }} }}"
+        ));
+        let error = Config::from_yaml(&yaml).unwrap_err().to_string();
+        assert!(error.contains("stealth"), "{error}");
+    }
+
+    #[test]
+    fn the_downloads_folder_can_be_set_and_expands_home() {
+        let yaml = format!("defaults: {{ downloads_dir: /my/downloads }}\n{MINIMAL_MAIL}");
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(config.downloads_dir().unwrap(), Path::new("/my/downloads"));
+        let blank = format!("defaults: {{ downloads_dir: \" \" }}\n{MINIMAL_MAIL}");
+        assert_eq!(issues_of(&blank)[0].path, "defaults.downloads_dir");
+        // Without the setting, whatever the system says; a test machine may say nothing.
+        let unset = Config::from_yaml(MINIMAL_MAIL).unwrap();
+        assert_eq!(unset.downloads_dir(), system_downloads_dir());
     }
 
     #[test]

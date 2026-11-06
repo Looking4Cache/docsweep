@@ -69,9 +69,13 @@ fn load_recipe(
         .portal
         .as_ref()
         .ok_or_else(|| FetchError::NoPortal(company.id.clone()).to_string())?;
-    let file = match &options.recipe_file {
-        Some(file) => file.clone(),
-        None => recipe_path(&paths.recipes_dir, &portal.recipe),
+    if company.is_assisted() {
+        return Err(FetchError::Assisted(company.id.clone()).to_string());
+    }
+    let file = match (&options.recipe_file, &portal.recipe) {
+        (Some(file), _) => file.clone(),
+        (None, Some(recipe)) => recipe_path(&paths.recipes_dir, recipe),
+        (None, None) => return Err(FetchError::NoRecipe(company.id.clone()).to_string()),
     };
     Recipe::load(&file)
         .and_then(|recipe| recipe.with_params(&portal.params))

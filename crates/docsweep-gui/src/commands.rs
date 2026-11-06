@@ -155,7 +155,7 @@ fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
         .filter_map(|company| {
             let portal = company.portal.as_ref()?;
             let stored = PortalSecrets {
-                credentials: is_stored(Some(&portal.credentials)),
+                credentials: is_stored(portal.credentials.as_ref()),
                 totp: is_stored(portal.totp.as_ref()),
             };
             Some((company.id.clone(), stored))

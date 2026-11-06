@@ -57,7 +57,7 @@ pub fn generation_prompt(
 pub fn known_hosts(company: &Company, recipes_dir: &Path, address: &str) -> HostBinding {
     let binding = HostBinding::of_address(address);
     let existing = company.portal.as_ref().and_then(|portal| {
-        Recipe::load(&recipe_path(recipes_dir, &portal.recipe))
+        Recipe::load(&recipe_path(recipes_dir, portal.recipe.as_ref()?))
             .and_then(|recipe| recipe.with_params(&portal.params))
             .ok()
     });
