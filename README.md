@@ -2,7 +2,7 @@
 
 Docsweep is a free desktop app for macOS, Windows and Linux that collects incoming invoices for you. It saves PDF attachments from your mailbox under a consistent file name, fetches invoices from customer portals with recipes, keeps an index to catch duplicates, and tidies up the mails afterwards.
 
-> **Status: early development.** The mail pipeline, portal downloads started by hand, the `docsweep` command line tool and a first version of the desktop app work. There is no schedule yet, link mails do not start a download yet, and there are no signed builds so far.
+> **Status: early development.** The mail pipeline, portal downloads, link mails that start a download, schedules, the `docsweep` command line tool and a first version of the desktop app work. There are no signed builds so far.
 
 ## How it works
 
@@ -10,7 +10,7 @@ Docsweep is a free desktop app for macOS, Windows and Linux that collects incomi
 2. `docsweep mail-scan --dry-run` shows what would happen, without changing anything.
 3. `docsweep mail-scan` saves the invoices and cleans up the mails.
 
-A mail is only moved or deleted after its invoice is stored and indexed. By default, "delete" means moving it to the trash. Mails that only link to a portal stay in your inbox and are noted for now.
+A mail is only moved or deleted after its invoice is stored and indexed. By default, "delete" means moving it to the trash. A mail that only links to a portal starts that company's download, and is cleaned up once a matching invoice is stored. Until then it stays in your inbox.
 
 Only IMAP with a password or app password is supported. Mailboxes that require OAuth2, such as Microsoft 365, will not work.
 
@@ -151,13 +151,49 @@ Docsweep never tries to get around a captcha or bot detection. If the `detect` s
 
 Documents are fetched from inside the page, so the browser's rules apply: a document on another host only works if that host allows it. Number and date in the file take priority over those in the list, and a file without any number is stored for review, just as with mails.
 
+## Link mails
+
+A mail that matches a company with a portal but has no PDF is a link mail. In a real scan, by `docsweep mail-scan` or in the app, it starts that company's recipe, at most once per company per scan. A preview or dry run never starts a browser; it only says that a download would start.
+
+The mail is only cleaned up by the normal rules (`disposal`, the trash by default) if both of these hold:
+
+- the download finished without failures, and
+- the index holds a stored portal invoice of that company that matches the mail: its entry is newer than the mail's, or its invoice date is on or after the mail's date.
+
+A successful download that found nothing new is not enough, because the invoice may not be in the portal yet. The mail then stays in place, unflagged, and the portal is checked again at most once per day. A new link mail does not wait for that. A failed download leaves the mail in place and flags it.
+
+## Automatic runs
+
+All automation is off until you turn it on. In the app, that is the section "Automatic runs" under Settings; in the file, it looks like this:
+
+```yaml
+automation:
+  enabled: true          # the master switch; schedules and polling do nothing without it
+
+mail:
+  poll_minutes: 30       # optional: check the mailboxes every 30 minutes, at least 5
+  # accounts and disposal as above
+
+companies:
+  - id: example
+    portal:
+      schedule: "0 9 10 * *"   # optional: on the 10th at 9:00 local time
+      # credentials and recipe as above
+```
+
+**Automatic runs save invoices and clean up mails without a preview.** They only happen while the app is open; closing its window keeps it in the tray, and it goes on working there. "Start Docsweep at login" under Settings starts it in the tray. The command line tool has no long-running mode.
+
+`portal.schedule` is a cron expression with five fields: minute, hour, day, month, weekday. An invalid one is refused when the configuration is loaded. Dates missed while the app was closed are caught up once at the next start, not once per date. A new schedule starts counting when it is first seen. A scheduled run that fails waits for its next date. Only one run happens at a time, whether started by hand or automatically; one that has to wait starts right afterwards.
+
+If an automatic run needs a person, the window comes up with the usual dialog and its time limit. If nobody answers, the run fails for that company and the others go on. Automatic runs are marked in the history, except for checks that found nothing to do, and problems show as a badge on "History" and a notice on the Scan page.
+
 ## Development
 
 See [CLAUDE.md](CLAUDE.md) for the workspace layout, commands and rules, and [KONZEPT.md](KONZEPT.md) for the full concept (in German).
 
 ## Kurzfassung auf Deutsch
 
-Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, derzeit von Hand gestartet. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
+Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, von Hand, ausgelöst durch Weblink-Mails oder nach Zeitplan. Automatische Läufe sind aus, bis man sie einschaltet. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
 
 ## License
 

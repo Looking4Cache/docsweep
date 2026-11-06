@@ -12,9 +12,9 @@ The full concept is in `KONZEPT.md`; its naming conventions and configuration mo
 
 ```
 crates/
-  docsweep-core/     Config, index, mail pipeline, secrets, recipes and recipe engine; later scheduler
-    src/portal/      Recipe model, login secrets, `BrowserDriver` and `ConfirmationHandler` traits, engine
-  docsweep-browser/  Installed Chrome/Edge through CDP (chromiumoxide), `fetch_company`; later recorder
+  docsweep-core/     Config, index, mail pipeline, secrets, recipes, recipe engine, schedules and automation
+    src/portal/      Recipe model, login secrets, `BrowserDriver`, `ConfirmationHandler` and `PortalFetcher` traits, engine
+  docsweep-browser/  Installed Chrome/Edge through CDP (chromiumoxide), `fetch_company`, `BrowserFetcher`; later recorder
     tests/           Real-browser tests against a fictional portal; `tests/fixtures/portal` holds its pages
   docsweep-cli/      Binary `docsweep`
   docsweep-gui/      Desktop app "Docsweep" (Tauri 2), Cargo binary `docsweep-gui`
@@ -23,7 +23,7 @@ crates/
 scripts/             Developer scripts: IMAP and browser test runners
 ```
 
-`docsweep-core` never depends on the browser crate. Portal fetches dock on through the traits in `portal::driver`, so the engine is tested with a fake driver in ordinary `cargo test`. The CLI and GUI call `docsweep_browser::fetch_company`.
+`docsweep-core` never depends on the browser crate. Portal fetches dock on through the traits in `portal::driver`, so the engine is tested with a fake driver in ordinary `cargo test`. The CLI and GUI call `docsweep_browser::fetch_company`, and hand `docsweep_browser::BrowserFetcher` to real scans and automatic runs.
 
 ## Commands
 
@@ -57,7 +57,12 @@ cargo install tauri-cli --locked      # once, for bundling
 - Only password-based IMAP is supported. OAuth2 mailboxes are deliberately out of scope.
 - Dry-run and real runs share one planning function (`mail::plan::plan_mail`). Only the executor changes anything, and a dry run only ever gets a `MailReader`.
 - A document without a recognised invoice number, or with a known number but a different file, is stored with status `needs_review`, and its mail stays in place with `\Flagged`.
-- Link mails stay in place and are only noted as `portal_fetch_required`, regardless of the configured disposal. Portal downloads run by hand for now; step 6 of the roadmap resolves these rows and disposes of the mails, starting after `docsweep_browser::fetch_company`.
+- A real scan notes a link mail as `portal_fetch_required` and then starts its company's recipe through `PortalFetcher`, once per company per scan and after all accounts were read, because a fetch can wait minutes for a person. A preview has no `PortalFetcher`, so it cannot start a browser.
+- A link mail is cleaned up (`disposal_for` with `MailKind::Link`) only if the fetch had no failures and `Index::has_invoice_for_link_mail` finds a stored portal invoice: newer than the mail's row, or dated on or after the mail, with its file still there. A successful fetch that finds nothing leaves the mail unflagged and noted; a failed fetch flags it. `resolved_at` marks a row as done. A mail that is still waiting is retried at most once per local day (`company_runs.last_link_fetch_on`); a new mail does not wait for that.
+- A dry run reads an older index without migrating it, so every read of a newer column or table must handle its absence (`AUTOMATION_VERSION`, `PORTAL_KEY_VERSION`).
+- All automation is off unless `automation.enabled` is set; `portal.schedule` and `mail.poll_minutes` do nothing without it. `automation::run_tick` decides from a clock passed in and the index, and the GUI's loop (`src/automation.rs`) only supplies them. Only `RunGate` lets a run start, for scans, previews, manual fetches and ticks alike, and what cannot start stays due. A scheduled run counts as soon as it starts, so a failure waits for the next date instead of repeating a login.
+- Autostart is only driven by the app's own commands; the web view gets no permission for it. A start at login passes `--hidden` and starts in the tray.
+- `portal.schedule` is validated by `schedule::Schedule`: exactly five fields, and it must come true at some point. The GUI's own words for it are in `ui/lib/schedule.js`, so they go through the catalogues.
 - Recipes hold no secrets and live in the recipes directory; relative `portal.recipe` paths start there, and a leading `recipes/` does not count twice. The format is in `README.md` and `portal/recipe.rs`.
 - `portal.credentials` holds `{"user":"...","password":"..."}` in one keychain entry, `portal.totp` the Base32 setup key (`portal/credentials.rs`). `serde_json` errors are never passed on, because they can quote their input.
 - Portal runs share the mail pipeline's rules: `storage::store_verified`, `FilenameTemplate`, `extract_facts`, `check_duplicate`, `needs_review`. The number and date in the file win, and those of the list only fill gaps. The column `portal_key` recognises a list entry on later runs.
