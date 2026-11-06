@@ -1,14 +1,16 @@
 //! What the recipe engine needs from a browser and from a person.
 //!
-//! Both are traits so that the engine's logic can be tested without a browser.
-//! The real browser is in `docsweep-browser`; the command line and the desktop
-//! app each bring their own way of asking a person.
+//! All are traits so that the logic can be tested without a browser. The real
+//! browser is in `docsweep-browser`; the command line and the desktop app each
+//! bring their own way of asking a person.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use super::engine::FetchReport;
 use super::recipe::FieldSelector;
+use crate::config::Company;
 use crate::secrets::SecretString;
 
 /// Why the browser could not do something. Implementations must never put a
@@ -96,4 +98,14 @@ pub trait ConfirmationHandler {
     async fn ask(&mut self, request: &ConfirmationRequest) -> ConfirmationAnswer;
     /// The time limit has passed, so a visible question can be taken back.
     fn expired(&mut self) {}
+}
+
+/// Starts the recipe of a company for real. Mail scans and the schedule use this,
+/// and only real runs get one, so a preview cannot start a browser.
+#[allow(
+    async_fn_in_trait,
+    reason = "only used through generics inside this workspace"
+)]
+pub trait PortalFetcher {
+    async fn fetch(&mut self, company: &Company) -> FetchReport;
 }

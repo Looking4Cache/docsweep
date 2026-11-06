@@ -7,13 +7,20 @@ use std::fs;
 use async_imap::Client;
 use base64::Engine;
 use chrono::NaiveDate;
+use docsweep_core::config::Company;
 use docsweep_core::config::Config;
 use docsweep_core::index::{Index, Status};
-use docsweep_core::mail::execute::{Outcome, scan_and_execute, scan_read_only};
+use docsweep_core::index::{NewInvoice, Source};
+use docsweep_core::mail::execute::{
+    MailReport, Outcome, apply_link_steps, decide_link_mails, fetch_for_link_mails,
+    scan_and_execute, scan_read_only,
+};
 use docsweep_core::mail::imap::{ImapMailbox, ImapReader, ImapWriter, TransportSecurity};
 use docsweep_core::mail::plan::{MailAction, PlanContext};
 use docsweep_core::mail::rules::RuleSet;
 use docsweep_core::mail::{MailReader, MailWriter};
+use docsweep_core::portal::driver::PortalFetcher;
+use docsweep_core::portal::engine::FetchReport;
 use docsweep_core::secrets::SecretString;
 use futures_util::TryStreamExt;
 use lopdf::content::{Content, Operation};
@@ -541,4 +548,206 @@ async fn real_run_stores_indexes_and_cleans_up_only_what_is_safe() {
         .unwrap_or_else(|| panic!("no Done folder in {separator:?}"))
         .clone();
     assert_eq!(inspector.count(&done).await, 1);
+}
+
+fn link_config(dir: &std::path::Path) -> Config {
+    Config::from_yaml(&format!(
+        r#"
+mail:
+  accounts:
+    - {{ id: main, imap: "unused.example:993", user: u, password: "keyring:p", watch: INBOX }}
+  disposal: {{ mode: all_move, move_to: Invoices/Done }}
+companies:
+  - id: portal
+    name: Portal
+    mail: {{ from_domain: portal.example }}
+    portal: {{ credentials: "keyring:c", recipe: recipes/portal.yaml }}
+    output: {{ dir: '{}', filename: "{{invoice_no}}.pdf" }}
+"#,
+        dir.display()
+    ))
+    .unwrap()
+}
+
+/// Says that a fetch went well; `store` decides whether it found an invoice.
+struct FakePortal<'a> {
+    index: &'a Index,
+    dir: &'a std::path::Path,
+    store: bool,
+    error: Option<&'static str>,
+    started: u32,
+}
+
+impl PortalFetcher for FakePortal<'_> {
+    async fn fetch(&mut self, company: &Company) -> FetchReport {
+        self.started += 1;
+        if self.store {
+            let file = self.dir.join("R-1.pdf");
+            fs::write(&file, b"x").unwrap();
+            self.index
+                .insert(&NewInvoice {
+                    company_id: company.id.clone(),
+                    invoice_date: Some(today()),
+                    invoice_no: Some("R-1".into()),
+                    amount: None,
+                    currency: None,
+                    file_path: file,
+                    file_hash: "h".into(),
+                    source: Source::Portal,
+                    mail_account: None,
+                    mail_id: None,
+                    portal_key: Some("R-1".into()),
+                    status: Status::Stored,
+                })
+                .unwrap();
+        }
+        FetchReport {
+            company_id: company.id.clone(),
+            company_name: company.name.clone(),
+            entries: Vec::new(),
+            error: self.error.map(str::to_owned),
+        }
+    }
+}
+
+/// One real scan: read, fetch, then a fresh connection to settle the link mails.
+async fn scan_links(
+    config: &Config,
+    index: &Index,
+    portal: &mut FakePortal<'_>,
+    day: NaiveDate,
+) -> Vec<MailReport> {
+    let rules = RuleSet::new(config);
+    let context = PlanContext {
+        config,
+        rules: &rules,
+        index: Some(index),
+        account_id: "main",
+        today: day,
+    };
+    let mut mails = Vec::new();
+    let mut writable = writer("INBOX").await;
+    scan_and_execute(&context, index, &mut writable, &mut mails)
+        .await
+        .unwrap();
+    writable.logout().await;
+
+    let fetches = fetch_for_link_mails(config, index, day, mails.iter(), portal).await;
+    let steps = decide_link_mails(config, index, "main", &mut mails, &fetches);
+    let mut writable = writer("INBOX").await;
+    apply_link_steps(index, "main", &mut writable, &mut mails, steps).await;
+    writable.logout().await;
+    mails
+}
+
+fn is_flagged(flags: &[String]) -> bool {
+    flags.iter().any(|flag| flag.contains("Flagged"))
+}
+
+#[tokio::test]
+#[ignore = "needs GreenMail, see scripts/imap-tests.sh"]
+async fn link_mails_stay_until_their_invoice_is_stored_and_are_then_moved() {
+    let mut inspector = Inspector::reset().await;
+    inspector
+        .add(&raw_mail(
+            "b@portal.example",
+            "Rechnung online",
+            "link-1@x",
+            None,
+        ))
+        .await;
+    inspector
+        .add(&raw_mail(
+            "b@portal.example",
+            "Rechnung online",
+            "link-2@x",
+            None,
+        ))
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = link_config(dir.path());
+    let index = Index::open(&dir.path().join("docsweep.db")).unwrap();
+    let mut portal = FakePortal {
+        index: &index,
+        dir: dir.path(),
+        store: false,
+        error: None,
+        started: 0,
+    };
+
+    // Nothing in the portal yet: both stay, unflagged, for one fetch.
+    let mails = scan_links(&config, &index, &mut portal, today()).await;
+    assert_eq!(portal.started, 1);
+    assert!(mails.iter().all(|m| m.outcome == Outcome::AwaitingInvoice));
+    let inbox = inspector.contents("INBOX").await;
+    assert_eq!(inbox.len(), 2);
+    assert!(!inbox.iter().any(|(_, flags)| is_flagged(flags)));
+
+    // Later the same day nobody opens the portal.
+    scan_links(&config, &index, &mut portal, today()).await;
+    assert_eq!(portal.started, 1);
+
+    // The next day the invoice is there.
+    portal.store = true;
+    let next_day = today().succ_opt().unwrap();
+    let mails = scan_links(&config, &index, &mut portal, next_day).await;
+    assert_eq!(portal.started, 2);
+    assert!(
+        mails
+            .iter()
+            .all(|m| matches!(m.outcome, Outcome::LinkResolved { .. }))
+    );
+    assert!(inspector.contents("INBOX").await.is_empty());
+    let folders: Vec<String> = inspector
+        .session
+        .list(Some(""), Some("*"))
+        .await
+        .unwrap()
+        .map_ok(|name| name.name().to_owned())
+        .try_collect()
+        .await
+        .unwrap();
+    let done = folders.iter().find(|name| name.ends_with("Done")).unwrap();
+    assert_eq!(inspector.count(done).await, 2);
+    assert!(
+        index
+            .invoices_of("portal")
+            .unwrap()
+            .iter()
+            .filter(|row| row.status == Status::PortalFetchRequired)
+            .all(|row| row.resolved_at.is_some())
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs GreenMail, see scripts/imap-tests.sh"]
+async fn a_failed_fetch_keeps_and_flags_the_link_mail() {
+    let mut inspector = Inspector::reset().await;
+    inspector
+        .add(&raw_mail(
+            "b@portal.example",
+            "Rechnung online",
+            "link@x",
+            None,
+        ))
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = link_config(dir.path());
+    let index = Index::open(&dir.path().join("docsweep.db")).unwrap();
+    let mut portal = FakePortal {
+        index: &index,
+        dir: dir.path(),
+        store: true,
+        error: Some("the portal did not answer"),
+        started: 0,
+    };
+
+    let mails = scan_links(&config, &index, &mut portal, today()).await;
+
+    assert!(matches!(mails[0].outcome, Outcome::Failed { .. }));
+    let inbox = inspector.contents("INBOX").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(is_flagged(&inbox[0].1), "{inbox:?}");
 }

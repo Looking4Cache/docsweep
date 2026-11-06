@@ -13,12 +13,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::NaiveDate;
 use docsweep_browser::{
-    ChromeDriver, ChromeOptions, FetchOptions, FetchPaths, WindowMode, fetch_company,
+    BrowserFetcher, ChromeDriver, ChromeOptions, FetchOptions, FetchPaths, WindowMode,
+    fetch_company,
 };
 use docsweep_core::config::Config;
 use docsweep_core::document::{looks_like_pdf, test_pdf};
 use docsweep_core::index::{Index, Status};
+use docsweep_core::mail::execute::{
+    Outcome, apply_link_steps, decide_link_mails, fetch_for_link_mails, scan_and_execute,
+};
+use docsweep_core::mail::plan::PlanContext;
+use docsweep_core::mail::rules::RuleSet;
+use docsweep_core::mail::{MailError, MailReader, MailWriter};
+use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::driver::{
     BrowserDriver, ConfirmationAnswer, ConfirmationHandler, ConfirmationReason, ConfirmationRequest,
 };
@@ -340,6 +349,7 @@ mail:
 companies:
   - id: fictional
     name: Fictional
+    mail: {{ from_domain: portal.test }}
     portal:
       credentials: "keyring:fictional"
       totp: "keyring:fictional-totp"
@@ -494,6 +504,100 @@ fn logs_in_downloads_prints_stores_and_then_finds_nothing_new() {
         "the session should persist"
     );
     assert_eq!(world.files().len(), 3);
+}
+
+/// A mailbox with one link mail that records what happens to it.
+#[derive(Default)]
+struct OneLinkMail {
+    trashed: u32,
+    flagged: u32,
+}
+
+impl OneLinkMail {
+    const RAW: &[u8] =
+        b"From: Billing <billing@portal.test>\r\nSubject: Your invoice is online\r\n\
+        Date: Tue, 03 Nov 2026 10:00:00 +0100\r\nMessage-ID: <link@portal.test>\r\n\r\nHello\r\n";
+}
+
+impl MailReader for OneLinkMail {
+    async fn list_headers(&mut self) -> Result<Vec<(u32, Vec<u8>)>, MailError> {
+        Ok(vec![(1, Self::RAW.to_vec())])
+    }
+    async fn fetch_raw(&mut self, _uid: u32) -> Result<Vec<u8>, MailError> {
+        Ok(Self::RAW.to_vec())
+    }
+}
+
+impl MailWriter for OneLinkMail {
+    async fn move_to(&mut self, _uid: u32, folder: &str) -> Result<(), MailError> {
+        panic!("link mails go to the trash here, not to {folder}");
+    }
+    async fn move_to_trash(&mut self, _uid: u32) -> Result<(), MailError> {
+        self.trashed += 1;
+        Ok(())
+    }
+    async fn delete_permanently(&mut self, _uid: u32) -> Result<(), MailError> {
+        panic!("deleting permanently needs an explicit setting");
+    }
+    async fn flag(&mut self, _uid: u32) -> Result<(), MailError> {
+        self.flagged += 1;
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "needs Chrome; run scripts/browser-tests.sh"]
+fn a_link_mail_starts_the_recipe_and_is_cleaned_up_once_its_invoice_is_stored() {
+    let world = World::new(LOGIN_RECIPE);
+    let index_path = world.paths().index;
+    let dirs = AppDirs::from_base(&world.dir.path().join("c"), &world.dir.path().join("d"));
+    let today = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+    let index = Index::open(&index_path).unwrap();
+    let rules = RuleSet::new(&world.config);
+    let context = PlanContext {
+        config: &world.config,
+        rules: &rules,
+        index: Some(&index),
+        account_id: "main",
+        today,
+    };
+    let mut mailbox = OneLinkMail::default();
+    let mut handler = PersonConfirming {
+        portal: world.portal.clone(),
+        reasons: Vec::new(),
+    };
+    let mut fetcher = BrowserFetcher {
+        config: &world.config,
+        secrets: &world.secrets,
+        dirs: &dirs,
+        index: &index_path,
+        window: WindowMode::Hidden,
+        handler: &mut handler,
+    };
+    let mut mails = Vec::new();
+
+    let fetches = block_on(async {
+        scan_and_execute(&context, &index, &mut mailbox, &mut mails)
+            .await
+            .unwrap();
+        let fetches =
+            fetch_for_link_mails(&world.config, &index, today, mails.iter(), &mut fetcher).await;
+        let steps = decide_link_mails(&world.config, &index, "main", &mut mails, &fetches);
+        apply_link_steps(&index, "main", &mut mailbox, &mut mails, steps).await;
+        fetches
+    });
+
+    assert!(!fetches[0].has_failures(), "{:?}", fetches[0]);
+    assert!(stored_count(&fetches[0]) > 0);
+    assert!(!world.files().is_empty());
+    assert!(matches!(mails[0].outcome, Outcome::LinkResolved { .. }));
+    assert_eq!(mailbox.trashed, 1);
+    assert_eq!(mailbox.flagged, 0);
+    assert!(
+        index.invoices_of("fictional").unwrap()[0]
+            .resolved_at
+            .is_some()
+    );
 }
 
 #[test]

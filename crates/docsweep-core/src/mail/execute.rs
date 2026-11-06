@@ -3,22 +3,30 @@
 //! The order is the safety rule of the project: store and verify the file, add
 //! it to the index, and only then touch the mail. Any failure leaves the mail in
 //! place with a flag, and later mails are still processed.
+//!
+//! A link mail starts its company's recipe after all accounts have been read,
+//! because a fetch can wait minutes for a person and no IMAP connection should
+//! stay open that long. Only then is the mail looked at again: it is cleaned up
+//! if the fetch had no failures and the index holds its invoice, it is flagged
+//! if the fetch failed, and otherwise it stays noted and is checked again later.
 
 use std::collections::HashSet;
 use std::fs;
 
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
 use serde::Serialize;
 
-use super::imap::{ImapMailbox, TransportSecurity};
+use super::imap::{ImapMailbox, ImapWriter, TransportSecurity};
 use super::plan::{
-    DisposalAction, Disposition, MailAction, MailDecision, MailPlan, PlanContext, PlanError,
-    plan_mail,
+    DisposalAction, Disposition, MailAction, MailDecision, MailKind, MailPlan, PlanContext,
+    PlanError, disposal_for, plan_mail,
 };
 use super::rules::RuleSet;
 use super::{IncomingMail, MailError, MailReader, MailWriter};
 use crate::config::{Config, MailAccount};
 use crate::index::{Index, IndexError, NewInvoice, Source, Status};
+use crate::portal::driver::PortalFetcher;
+use crate::portal::engine::{FetchReport, summarize_fetches};
 use crate::secrets::{SecretError, SecretStore};
 use crate::storage::{self, StorageError};
 
@@ -34,6 +42,11 @@ pub enum Outcome {
     KeptForReview { reason: String },
     /// Something went wrong. The mail stays, flagged if that was possible.
     Failed { message: String },
+    /// A link mail whose invoice is stored; the mail was cleaned up.
+    LinkResolved { disposal: DisposalAction },
+    /// A link mail whose invoice is not stored yet. It stays in place, and is
+    /// checked again later.
+    AwaitingInvoice,
 }
 
 /// One mail in a report.
@@ -52,6 +65,33 @@ pub struct AccountReport {
     pub error: Option<String>,
 }
 
+/// The result of a real scan.
+#[derive(Debug, Default, Serialize)]
+pub struct ScanReport {
+    pub accounts: Vec<AccountReport>,
+    /// The portal downloads started because of link mails.
+    pub fetches: Vec<FetchReport>,
+}
+
+impl ScanReport {
+    /// Whether anything went wrong.
+    pub fn has_failures(&self) -> bool {
+        self.summary().failed > 0
+    }
+
+    /// Counts of mails and portal downloads together.
+    pub fn summary(&self) -> ScanSummary {
+        let fetched = summarize_fetches(&self.fetches);
+        let mut summary = summarize(&self.accounts);
+        summary.saved += fetched.saved;
+        summary.for_review += fetched.for_review;
+        summary.already_stored += fetched.already_known;
+        summary.missing += fetched.missing;
+        summary.failed += fetched.failed;
+        summary
+    }
+}
+
 /// Counts of a scan, for headlines and the run history.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ScanSummary {
@@ -64,7 +104,9 @@ pub struct ScanSummary {
     pub disposed: u32,
     pub portal_fetches: u32,
     pub unknown_invoices: u32,
-    /// Mails and accounts that failed.
+    /// Entries a portal lists without offering a document yet.
+    pub missing: u32,
+    /// Mails, accounts and portal entries that failed.
     pub failed: u32,
 }
 
@@ -95,7 +137,13 @@ pub fn summarize(reports: &[AccountReport]) -> ScanSummary {
                     }
                     summary.disposed += u32::from(matches!(decision, MailDecision::Dispose(_)));
                 }
-                MailAction::PortalFetchRequired { .. } => summary.portal_fetches += 1,
+                MailAction::PortalFetchRequired { .. } => {
+                    if matches!(mail.outcome, Outcome::LinkResolved { .. }) {
+                        summary.disposed += 1;
+                    } else {
+                        summary.portal_fetches += 1;
+                    }
+                }
                 MailAction::UnknownInvoice { .. } => summary.unknown_invoices += 1,
                 MailAction::NoDocument { .. } => {}
             }
@@ -143,36 +191,27 @@ pub enum ScanError {
     InvalidAccount(String),
 }
 
-/// Scans all accounts. Problems with one account do not stop the others. A dry
-/// run opens the index read-only and does not create it.
-pub async fn run_mail_scan(
+/// A dry run over all accounts. It opens the index read-only and does not create
+/// it, and it gets no [`PortalFetcher`], so it cannot start a browser.
+pub async fn preview_mail_scan(
     config: &Config,
     secrets: &dyn SecretStore,
     index_path: &std::path::Path,
-    dry_run: bool,
+    today: NaiveDate,
 ) -> Result<Vec<AccountReport>, ScanError> {
     let rules = RuleSet::new(config);
-    let index = if dry_run {
-        Index::open_read_only(index_path)?
-    } else {
-        Some(Index::open(index_path)?)
-    };
-    let today = Local::now().date_naive();
-
+    let index = Index::open_read_only(index_path)?;
     let mut reports = Vec::with_capacity(config.mail.accounts.len());
     for account in &config.mail.accounts {
-        let mut mails = Vec::new();
-        let result = scan_account(
+        let context = PlanContext {
             config,
-            &rules,
-            index.as_ref(),
-            account,
-            secrets,
+            rules: &rules,
+            index: index.as_ref(),
+            account_id: &account.id,
             today,
-            dry_run,
-            &mut mails,
-        )
-        .await;
+        };
+        let mut mails = Vec::new();
+        let result = preview_account(&context, account, secrets, &mut mails).await;
         reports.push(AccountReport {
             account_id: account.id.clone(),
             mails,
@@ -182,60 +221,290 @@ pub async fn run_mail_scan(
     Ok(reports)
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a private step of `run_mail_scan`"
-)]
-async fn scan_account(
+/// A real scan over all accounts, followed by the portal downloads its link mails
+/// call for. Problems with one account or company do not stop the others.
+pub async fn run_mail_scan<F: PortalFetcher>(
     config: &Config,
-    rules: &RuleSet<'_>,
-    index: Option<&Index>,
-    account: &MailAccount,
     secrets: &dyn SecretStore,
+    index_path: &std::path::Path,
     today: NaiveDate,
-    dry_run: bool,
-    mails: &mut Vec<MailReport>,
-) -> Result<(), ScanError> {
+    fetcher: &mut F,
+) -> Result<ScanReport, ScanError> {
+    let rules = RuleSet::new(config);
+    let index = Index::open(index_path)?;
+    let mut accounts = Vec::with_capacity(config.mail.accounts.len());
+    for account in &config.mail.accounts {
+        let context = PlanContext {
+            config,
+            rules: &rules,
+            index: Some(&index),
+            account_id: &account.id,
+            today,
+        };
+        let mut mails = Vec::new();
+        let result = execute_account(&context, &index, account, secrets, &mut mails).await;
+        accounts.push(AccountReport {
+            account_id: account.id.clone(),
+            mails,
+            error: result.err().map(|error| error.to_string()),
+        });
+    }
+
+    let seen = accounts.iter().flat_map(|account| &account.mails);
+    let fetches = fetch_for_link_mails(config, &index, today, seen, fetcher).await;
+    for (report, account) in accounts.iter_mut().zip(&config.mail.accounts) {
+        settle_account(config, &index, account, secrets, &fetches, report).await;
+    }
+    Ok(ScanReport { accounts, fetches })
+}
+
+/// How to reach a mailbox.
+struct Connection<'a> {
+    host: &'a str,
+    port: u16,
+    security: TransportSecurity,
+    password: crate::secrets::SecretString,
+}
+
+fn connection_of<'a>(
+    account: &'a MailAccount,
+    secrets: &dyn SecretStore,
+) -> Result<Connection<'a>, ScanError> {
     let invalid = || ScanError::InvalidAccount(account.id.clone());
     let (host, port) = account.endpoint().ok_or_else(invalid)?;
     let secret_id = account.password.id().ok_or_else(invalid)?;
-    let password = secrets.get(secret_id)?;
-    let security = TransportSecurity::for_port(port);
-    let context = PlanContext {
-        config,
-        rules,
-        index,
-        account_id: &account.id,
-        today,
-    };
+    Ok(Connection {
+        host,
+        port,
+        security: TransportSecurity::for_port(port),
+        password: secrets.get(secret_id)?,
+    })
+}
 
-    if dry_run {
-        let mut reader = ImapMailbox::connect_read_only(
-            host,
-            port,
-            security,
-            &account.user,
-            &password,
-            &account.watch,
-        )
-        .await?;
-        let result = scan_read_only(&context, &mut reader, mails).await;
-        reader.logout().await;
-        result
-    } else {
-        let index = index.expect("a real run always has an index");
-        let mut writer = ImapMailbox::connect_writable(
-            host,
-            port,
-            security,
-            &account.user,
-            &password,
-            &account.watch,
-        )
-        .await?;
-        let result = scan_and_execute(&context, index, &mut writer, mails).await;
-        writer.logout().await;
-        result
+async fn preview_account(
+    context: &PlanContext<'_>,
+    account: &MailAccount,
+    secrets: &dyn SecretStore,
+    mails: &mut Vec<MailReport>,
+) -> Result<(), ScanError> {
+    let connection = connection_of(account, secrets)?;
+    let mut reader = ImapMailbox::connect_read_only(
+        connection.host,
+        connection.port,
+        connection.security,
+        &account.user,
+        &connection.password,
+        &account.watch,
+    )
+    .await?;
+    let result = scan_read_only(context, &mut reader, mails).await;
+    reader.logout().await;
+    result
+}
+
+async fn open_writer(
+    account: &MailAccount,
+    secrets: &dyn SecretStore,
+) -> Result<ImapWriter, ScanError> {
+    let connection = connection_of(account, secrets)?;
+    Ok(ImapMailbox::connect_writable(
+        connection.host,
+        connection.port,
+        connection.security,
+        &account.user,
+        &connection.password,
+        &account.watch,
+    )
+    .await?)
+}
+
+async fn execute_account(
+    context: &PlanContext<'_>,
+    index: &Index,
+    account: &MailAccount,
+    secrets: &dyn SecretStore,
+    mails: &mut Vec<MailReport>,
+) -> Result<(), ScanError> {
+    let mut writer = open_writer(account, secrets).await?;
+    let result = scan_and_execute(context, index, &mut writer, mails).await;
+    writer.logout().await;
+    result
+}
+
+async fn settle_account(
+    config: &Config,
+    index: &Index,
+    account: &MailAccount,
+    secrets: &dyn SecretStore,
+    fetches: &[FetchReport],
+    report: &mut AccountReport,
+) {
+    let steps = decide_link_mails(config, index, &account.id, &mut report.mails, fetches);
+    if steps.is_empty() {
+        return;
+    }
+    match open_writer(account, secrets).await {
+        Ok(mut writer) => {
+            apply_link_steps(index, &account.id, &mut writer, &mut report.mails, steps).await;
+            writer.logout().await;
+        }
+        Err(error) => {
+            for step in steps {
+                report.mails[step.position].outcome = Outcome::Failed {
+                    message: format!("the mailbox could not be opened again: {error}"),
+                };
+            }
+        }
+    }
+}
+
+/// Starts the recipes that link mails call for, once per company however many
+/// mails it has, and remembers the attempt. A mail that could not even be noted
+/// has failed already and starts nothing.
+pub async fn fetch_for_link_mails<'m, F: PortalFetcher>(
+    config: &Config,
+    index: &Index,
+    today: NaiveDate,
+    mails: impl Iterator<Item = &'m MailReport>,
+    fetcher: &mut F,
+) -> Vec<FetchReport> {
+    let mut due = HashSet::new();
+    for mail in mails {
+        if let MailAction::PortalFetchRequired {
+            company_id,
+            fetch_due: true,
+            ..
+        } = &mail.plan.action
+            && mail.outcome == Outcome::Completed
+        {
+            due.insert(company_id.as_str());
+        }
+    }
+    let mut reports = Vec::with_capacity(due.len());
+    for company in &config.companies {
+        if due.contains(company.id.as_str()) {
+            reports.push(match index.note_link_fetch(&company.id, today) {
+                Ok(()) => fetcher.fetch(company).await,
+                Err(error) => FetchReport::failed(company, error.to_string()),
+            });
+        }
+    }
+    reports
+}
+
+/// What is left to do in the mailbox for one link mail.
+#[derive(Debug)]
+pub struct LinkStep {
+    position: usize,
+    company_id: String,
+    action: LinkAction,
+}
+
+#[derive(Debug)]
+enum LinkAction {
+    Dispose(DisposalAction),
+    Flag(String),
+}
+
+/// The safety rule for link mails: a mail is only cleaned up if a fetch ran now
+/// and had no failures, and the index holds a stored invoice that matches this
+/// mail. A successful fetch alone is not enough, because the invoice may not be
+/// in the portal yet. Mails that simply stay are settled here; the returned steps
+/// need the mailbox.
+pub fn decide_link_mails(
+    config: &Config,
+    index: &Index,
+    account_id: &str,
+    mails: &mut [MailReport],
+    fetches: &[FetchReport],
+) -> Vec<LinkStep> {
+    let mut steps = Vec::new();
+    for (position, mail) in mails.iter_mut().enumerate() {
+        let MailAction::PortalFetchRequired { company_id, .. } = &mail.plan.action else {
+            continue;
+        };
+        if mail.outcome != Outcome::Completed {
+            continue;
+        }
+        let company = config.companies.iter().find(|c| &c.id == company_id);
+        let fetch = fetches.iter().find(|f| &f.company_id == company_id);
+        let (Some(company), Some(fetch)) = (company, fetch) else {
+            mail.outcome = Outcome::AwaitingInvoice;
+            continue;
+        };
+        let action = if fetch.has_failures() {
+            let reason = fetch
+                .error
+                .as_deref()
+                .unwrap_or("some documents could not be stored");
+            Some(LinkAction::Flag(format!(
+                "the portal download failed: {reason}"
+            )))
+        } else {
+            match index.has_invoice_for_link_mail(company_id, account_id, &mail.plan.message_id) {
+                Ok(true) => Some(LinkAction::Dispose(disposal_for(
+                    config,
+                    company,
+                    MailKind::Link,
+                ))),
+                Ok(false) => None,
+                Err(error) => Some(LinkAction::Flag(error.to_string())),
+            }
+        };
+        match action {
+            Some(action) => steps.push(LinkStep {
+                position,
+                company_id: company_id.clone(),
+                action,
+            }),
+            None => mail.outcome = Outcome::AwaitingInvoice,
+        }
+    }
+    steps
+}
+
+/// Carries out the steps on a fresh connection. A mail is only touched if it is
+/// still the one that was read, since a person may have dealt with it meanwhile.
+pub async fn apply_link_steps<W: MailWriter>(
+    index: &Index,
+    account_id: &str,
+    writer: &mut W,
+    mails: &mut [MailReport],
+    steps: Vec<LinkStep>,
+) {
+    for step in steps {
+        let mail = &mut mails[step.position];
+        let uid = mail.plan.uid;
+        let message_id = &mail.plan.message_id;
+        let unchanged = writer
+            .fetch_raw(uid)
+            .await
+            .is_ok_and(|raw| &IncomingMail::parse(uid, &raw).message_id == message_id);
+        mail.outcome = if !unchanged {
+            Outcome::Failed {
+                message: "this mail changed or is gone, so it was left alone".to_owned(),
+            }
+        } else {
+            match step.action {
+                LinkAction::Flag(message) => fail(writer, uid, message).await,
+                LinkAction::Dispose(disposal) => match dispose(writer, uid, &disposal).await {
+                    Err(error) => fail(writer, uid, error.to_string()).await,
+                    Ok(()) => {
+                        let noted =
+                            index.resolve_link_mail(&step.company_id, account_id, message_id);
+                        match noted {
+                            Ok(()) => Outcome::LinkResolved { disposal },
+                            // The mail has been handled, so flagging would be wrong.
+                            Err(error) => Outcome::Failed {
+                                message: format!(
+                                    "mail cleaned up, but not noted in the index: {error}"
+                                ),
+                            },
+                        }
+                    }
+                },
+            }
+        };
     }
 }
 
@@ -423,6 +692,7 @@ async fn fail<W: MailWriter>(writer: &mut W, uid: u32, message: String) -> Outco
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Company;
     use crate::document::test_pdf;
     use crate::mail::test_mail;
     use std::collections::BTreeMap;
@@ -734,6 +1004,471 @@ companies:
         let rows = index.invoices_of("acme").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, Status::PortalFetchRequired);
+    }
+
+    const WITH_PORTAL: &str = "portal: { credentials: \"keyring:c\", recipe: r.yaml }";
+
+    fn link_mail(id: &str) -> Vec<u8> {
+        test_mail::raw("b@acme.example", "Rechnung online", id, &[])
+    }
+
+    fn day(number: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2030, 1, number).unwrap()
+    }
+
+    /// Stands in for the browser and says what each fetch comes to.
+    struct FakeFetcher<A> {
+        started: Vec<String>,
+        act: A,
+    }
+
+    fn fetcher<A: FnMut(&Company) -> FetchReport>(act: A) -> FakeFetcher<A> {
+        FakeFetcher {
+            started: Vec::new(),
+            act,
+        }
+    }
+
+    impl<A: FnMut(&Company) -> FetchReport> PortalFetcher for FakeFetcher<A> {
+        async fn fetch(&mut self, company: &Company) -> FetchReport {
+            self.started.push(company.id.clone());
+            (self.act)(company)
+        }
+    }
+
+    fn fine(company: &Company) -> FetchReport {
+        FetchReport {
+            company_id: company.id.clone(),
+            company_name: company.name.clone(),
+            entries: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// As if a fetch stored a new invoice.
+    fn store_portal_invoice(setup: &Setup, index: &Index, number: &str) {
+        let file = setup.dir.path().join(format!("{number}.pdf"));
+        fs::write(&file, b"x").unwrap();
+        index
+            .insert(&NewInvoice {
+                company_id: "acme".into(),
+                invoice_date: Some(day(1)),
+                invoice_no: Some(number.into()),
+                amount: None,
+                currency: None,
+                file_path: file,
+                file_hash: number.into(),
+                source: Source::Portal,
+                mail_account: None,
+                mail_id: None,
+                portal_key: Some(number.into()),
+                status: Status::Stored,
+            })
+            .unwrap();
+    }
+
+    /// A real run for one mailbox on the given day, with all three stages.
+    fn scan_with<A: FnMut(&Company) -> FetchReport>(
+        setup: &Setup,
+        index: &Index,
+        mailbox: &mut FakeMailbox,
+        fetcher: &mut FakeFetcher<A>,
+        today: NaiveDate,
+    ) -> Vec<MailReport> {
+        let rules = RuleSet::new(&setup.config);
+        let context = PlanContext {
+            config: &setup.config,
+            rules: &rules,
+            index: Some(index),
+            account_id: "main",
+            today,
+        };
+        let mut mails = Vec::new();
+        block_on(async {
+            scan_and_execute(&context, index, mailbox, &mut mails)
+                .await
+                .unwrap();
+            let fetches =
+                fetch_for_link_mails(&setup.config, index, today, mails.iter(), fetcher).await;
+            let steps = decide_link_mails(&setup.config, index, "main", &mut mails, &fetches);
+            apply_link_steps(index, "main", mailbox, &mut mails, steps).await;
+        });
+        mails
+    }
+
+    #[test]
+    fn a_link_mail_stays_unflagged_when_the_fetch_succeeded_but_stored_nothing_matching() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(portal.started, ["acme"]);
+        assert_eq!(mails[0].outcome, Outcome::AwaitingInvoice);
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
+        let row = index.invoices_of("acme").unwrap().remove(0);
+        assert_eq!(row.status, Status::PortalFetchRequired);
+        assert_eq!(row.resolved_at, None);
+    }
+
+    #[test]
+    fn a_link_mail_is_disposed_when_a_matching_invoice_was_stored() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            fine(company)
+        });
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(mailbox.trashed, [1], "the default for link mails");
+        assert!(mailbox.flagged.is_empty());
+        assert_eq!(
+            mails[0].outcome,
+            Outcome::LinkResolved {
+                disposal: DisposalAction::Trash
+            }
+        );
+        let row = index.invoices_of("acme").unwrap().remove(0);
+        assert!(row.resolved_at.is_some());
+        assert!(row.disposed_at.is_some());
+    }
+
+    #[test]
+    fn a_link_mail_follows_the_normal_disposal_rules() {
+        let setup = setup(
+            "{ mode: all_move, move_to: Done }",
+            &format!("{WITH_PORTAL}\n    disposal: {{ move_to: Acme }}"),
+        );
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            fine(company)
+        });
+
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(mailbox.moved, [(1, "Acme".to_owned())]);
+    }
+
+    #[test]
+    fn a_failed_fetch_flags_and_keeps_the_mail_even_with_a_matching_invoice() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            FetchReport::failed(company, "the login page did not load".into())
+        });
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert!(mailbox.untouched());
+        assert_eq!(mailbox.flagged, [1]);
+        let Outcome::Failed { message } = &mails[0].outcome else {
+            panic!("expected a failure: {:?}", mails[0].outcome);
+        };
+        assert!(message.contains("the login page did not load"), "{message}");
+        assert_eq!(index.invoices_of("acme").unwrap()[0].resolved_at, None);
+    }
+
+    #[test]
+    fn one_failed_document_counts_as_a_failed_fetch() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            let mut report = fine(company);
+            report.entries.push(crate::portal::engine::EntryReport {
+                key: "R-2".into(),
+                date: None,
+                invoice_no: None,
+                amount: None,
+                outcome: crate::portal::engine::EntryOutcome::Failed {
+                    message: "no PDF".into(),
+                },
+            });
+            report
+        });
+
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert!(mailbox.untouched());
+        assert_eq!(mailbox.flagged, [1]);
+    }
+
+    #[test]
+    fn several_link_mails_of_a_company_give_one_fetch() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox =
+            FakeMailbox::with(vec![link_mail("1@x"), link_mail("2@x"), link_mail("3@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            fine(company)
+        });
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(portal.started, ["acme"]);
+        assert_eq!(mailbox.trashed, [1, 2, 3]);
+        assert_eq!(mails.len(), 3);
+    }
+
+    #[test]
+    fn a_waiting_company_is_retried_at_most_once_per_day() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        let later = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        assert_eq!(portal.started.len(), 1, "same day");
+        assert_eq!(later[0].outcome, Outcome::AwaitingInvoice);
+
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(2));
+        assert_eq!(portal.started.len(), 2, "next day");
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(2));
+        assert_eq!(portal.started.len(), 2);
+
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
+        assert_eq!(index.invoices_of("acme").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_new_link_mail_does_not_wait_for_the_next_day() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        mailbox.mails.insert(2, link_mail("2@x"));
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(portal.started.len(), 2);
+    }
+
+    #[test]
+    fn a_later_retry_cleans_up_once_the_invoice_is_there() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        assert!(mailbox.untouched());
+
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            fine(company)
+        });
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(2));
+
+        assert_eq!(mailbox.trashed, [1]);
+    }
+
+    #[test]
+    fn a_failed_disposal_flags_the_link_mail_and_leaves_its_row_open() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        mailbox.fail_disposal = true;
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            fine(company)
+        });
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert!(matches!(mails[0].outcome, Outcome::Failed { .. }));
+        assert_eq!(mailbox.flagged, [1]);
+        assert_eq!(index.invoices_of("acme").unwrap()[0].resolved_at, None);
+    }
+
+    #[test]
+    fn a_mail_that_changed_during_the_fetch_is_left_alone() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let rules = RuleSet::new(&setup.config);
+        let context = PlanContext {
+            config: &setup.config,
+            rules: &rules,
+            index: Some(&index),
+            account_id: "main",
+            today: day(1),
+        };
+        let mut mails = Vec::new();
+        block_on(scan_and_execute(&context, &index, &mut mailbox, &mut mails)).unwrap();
+        store_portal_invoice(&setup, &index, "R-1");
+        let fetches = [fine(&setup.config.companies[0])];
+
+        // The server now has another mail under this number.
+        mailbox.mails.insert(1, link_mail("other@x"));
+        let steps = decide_link_mails(&setup.config, &index, "main", &mut mails, &fetches);
+        block_on(apply_link_steps(
+            &index,
+            "main",
+            &mut mailbox,
+            &mut mails,
+            steps,
+        ));
+
+        assert!(matches!(mails[0].outcome, Outcome::Failed { .. }));
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
+    }
+
+    #[test]
+    fn a_link_mail_that_could_not_be_noted_starts_no_fetch() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mails = vec![MailReport {
+            plan: MailPlan {
+                uid: 1,
+                message_id: "1@x".into(),
+                from: "b@acme.example".into(),
+                subject: "Rechnung".into(),
+                action: MailAction::PortalFetchRequired {
+                    company_id: "acme".into(),
+                    company_name: "Acme".into(),
+                    already_recorded: false,
+                    fetch_due: true,
+                },
+            },
+            outcome: Outcome::Failed {
+                message: "index broken".into(),
+            },
+        }];
+        let mut portal = fetcher(fine);
+
+        let fetches = block_on(fetch_for_link_mails(
+            &setup.config,
+            &index,
+            day(1),
+            mails.iter(),
+            &mut portal,
+        ));
+        let steps = decide_link_mails(&setup.config, &index, "main", &mut mails, &fetches);
+
+        assert!(portal.started.is_empty());
+        assert!(steps.is_empty());
+        assert!(matches!(mails[0].outcome, Outcome::Failed { .. }));
+    }
+
+    #[test]
+    fn a_dry_run_only_shows_that_a_download_would_start_and_changes_nothing() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let rules = RuleSet::new(&setup.config);
+        let context = PlanContext {
+            config: &setup.config,
+            rules: &rules,
+            index: None,
+            account_id: "main",
+            today: day(1),
+        };
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut mails = Vec::new();
+
+        // `scan_read_only` takes no fetcher, so it cannot start a browser.
+        block_on(scan_read_only(&context, &mut mailbox, &mut mails)).unwrap();
+
+        assert_eq!(mails[0].outcome, Outcome::Planned);
+        assert!(matches!(
+            mails[0].plan.action,
+            MailAction::PortalFetchRequired {
+                fetch_due: true,
+                already_recorded: false,
+                ..
+            }
+        ));
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_of_a_mail_checked_today_shows_that_no_download_would_start() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        scan_with(&setup, &index, &mut mailbox, &mut fetcher(fine), day(1));
+
+        let rules = RuleSet::new(&setup.config);
+        let context = PlanContext {
+            config: &setup.config,
+            rules: &rules,
+            index: Some(&index),
+            account_id: "main",
+            today: day(1),
+        };
+        let mut mails = Vec::new();
+        block_on(scan_read_only(&context, &mut mailbox, &mut mails)).unwrap();
+
+        assert!(matches!(
+            mails[0].plan.action,
+            MailAction::PortalFetchRequired {
+                fetch_due: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_summary_counts_mails_and_portal_downloads_together() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            let mut report = fine(company);
+            report.entries.push(crate::portal::engine::EntryReport {
+                key: "R-1".into(),
+                date: None,
+                invoice_no: None,
+                amount: None,
+                outcome: crate::portal::engine::EntryOutcome::Stored {
+                    path: "/x/R-1.pdf".into(),
+                },
+            });
+            report
+        });
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        let report = ScanReport {
+            accounts: vec![AccountReport {
+                account_id: "main".into(),
+                mails,
+                error: None,
+            }],
+            fetches: vec![{
+                let mut report = fine(&setup.config.companies[0]);
+                report.entries.push(crate::portal::engine::EntryReport {
+                    key: "R-1".into(),
+                    date: None,
+                    invoice_no: None,
+                    amount: None,
+                    outcome: crate::portal::engine::EntryOutcome::Stored {
+                        path: "/x/R-1.pdf".into(),
+                    },
+                });
+                report
+            }],
+        };
+
+        let summary = report.summary();
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.disposed, 1);
+        assert_eq!(summary.portal_fetches, 0);
+        assert!(!report.has_failures());
     }
 
     #[test]

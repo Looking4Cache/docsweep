@@ -124,11 +124,14 @@ pub enum MailAction {
         documents: Vec<PlannedDocument>,
         decision: MailDecision,
     },
-    /// A link mail. It stays in place, because no invoice is stored yet.
+    /// A link mail. It stays in place until its invoice is stored.
     PortalFetchRequired {
         company_id: String,
         company_name: String,
         already_recorded: bool,
+        /// Whether a real run would start the portal download: a new mail always
+        /// does, one that is still waiting at most once per day.
+        fetch_due: bool,
     },
     /// Rule matches, but there is no PDF and no portal, so nothing can be done.
     NoDocument {
@@ -209,18 +212,22 @@ fn plan_for_company(
     let positions = context.rules.documents_of(company, mail);
     if positions.is_empty() {
         return if company.portal.is_some() {
-            let already_recorded = match context.index {
-                Some(index) => index.is_portal_fetch_recorded(
-                    &company.id,
-                    context.account_id,
-                    &mail.message_id,
-                )?,
-                None => false,
+            let (already_recorded, fetched_today) = match context.index {
+                Some(index) => (
+                    index.is_portal_fetch_recorded(
+                        &company.id,
+                        context.account_id,
+                        &mail.message_id,
+                    )?,
+                    index.last_link_fetch_on(&company.id)? == Some(context.today),
+                ),
+                None => (false, false),
             };
             Ok(MailAction::PortalFetchRequired {
                 company_id: company.id.clone(),
                 company_name: company.name.clone(),
                 already_recorded,
+                fetch_due: !already_recorded || !fetched_today,
             })
         } else {
             Ok(MailAction::NoDocument {
@@ -717,9 +724,42 @@ companies:
             plan.action,
             MailAction::PortalFetchRequired {
                 already_recorded: false,
+                fetch_due: true,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_waiting_link_mail_is_due_once_per_day_and_a_new_one_always() {
+        let config = config_with(
+            MOVE_DEFAULT,
+            "portal: { credentials: \"keyring:c\", recipe: r.yaml }",
+            "/x",
+        );
+        let index = Index::open_in_memory().unwrap();
+        // The date `plan` uses as today.
+        let today = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        index
+            .record_portal_fetch_required("acme", "main", "old@x", None)
+            .unwrap();
+        let plan_for = |id: &str| {
+            let raw = test_mail::raw("b@acme.example", "Rechnung online", id, &[]);
+            plan(&config, Some(&index), &raw).unwrap().action
+        };
+        let due = |action: MailAction| match action {
+            MailAction::PortalFetchRequired { fetch_due, .. } => fetch_due,
+            other => panic!("unexpected action {other:?}"),
+        };
+
+        assert!(due(plan_for("old@x")), "not tried yet");
+        index
+            .note_link_fetch("acme", today.pred_opt().unwrap())
+            .unwrap();
+        assert!(due(plan_for("old@x")), "tried yesterday");
+        index.note_link_fetch("acme", today).unwrap();
+        assert!(!due(plan_for("old@x")), "tried today");
+        assert!(due(plan_for("new@x")), "a new mail does not wait");
     }
 
     #[test]

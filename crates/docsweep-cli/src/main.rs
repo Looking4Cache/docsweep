@@ -7,10 +7,13 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use chrono::Local;
 use clap::{Parser, Subcommand};
-use docsweep_browser::{FetchOptions, FetchPaths, WindowMode, fetch_company};
+use docsweep_browser::{BrowserFetcher, FetchOptions, FetchPaths, WindowMode, fetch_company};
 use docsweep_core::config::{Company, Config};
-use docsweep_core::mail::execute::{AccountReport, Outcome, run_mail_scan};
+use docsweep_core::mail::execute::{
+    AccountReport, ScanReport, preview_mail_scan, run_mail_scan, summarize,
+};
 use docsweep_core::names;
 use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
@@ -201,20 +204,41 @@ fn mail_scan(config_path: Option<PathBuf>, dry_run: bool) -> Result<ExitCode, Cl
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let reports = runtime.block_on(run_mail_scan(&config, &KeyringStore, &index_path, dry_run))?;
+    let today = Local::now().date_naive();
+    if dry_run {
+        let reports: Vec<AccountReport> = runtime.block_on(preview_mail_scan(
+            &config,
+            &KeyringStore,
+            &index_path,
+            today,
+        ))?;
+        print!("{}", report::render(&reports, true));
+        return Ok(exit_code(summarize(&reports).failed > 0));
+    }
 
-    print!("{}", report::render(&reports, dry_run));
-    Ok(exit_code(&reports))
+    let mut fetcher = BrowserFetcher {
+        config: &config,
+        secrets: &KeyringStore,
+        dirs: &dirs,
+        index: &index_path,
+        window: WindowMode::OnDemand,
+        handler: &mut confirm::TerminalConfirmation,
+    };
+    let scan: ScanReport = runtime.block_on(run_mail_scan(
+        &config,
+        &KeyringStore,
+        &index_path,
+        today,
+        &mut fetcher,
+    ))?;
+    print!("{}", report::render(&scan.accounts, false));
+    for fetch in &scan.fetches {
+        print!("{}", report::render_fetch(fetch, false));
+    }
+    Ok(exit_code(scan.has_failures()))
 }
 
-fn exit_code(reports: &[AccountReport]) -> ExitCode {
-    let failed = reports.iter().any(|account| {
-        account.error.is_some()
-            || account
-                .mails
-                .iter()
-                .any(|mail| matches!(mail.outcome, Outcome::Failed { .. }))
-    });
+fn exit_code(failed: bool) -> ExitCode {
     if failed {
         ExitCode::FAILURE
     } else {

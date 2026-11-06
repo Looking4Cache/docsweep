@@ -8,13 +8,13 @@
 
 mod chrome;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Local;
 use docsweep_core::config::{Company, Config};
 use docsweep_core::index::Index;
 use docsweep_core::paths::AppDirs;
-use docsweep_core::portal::driver::ConfirmationHandler;
+use docsweep_core::portal::driver::{ConfirmationHandler, PortalFetcher};
 use docsweep_core::portal::engine::{FetchError, FetchJob, FetchReport, run_recipe};
 use docsweep_core::portal::recipe::Recipe;
 use docsweep_core::portal::recipe_path;
@@ -73,9 +73,6 @@ fn load_recipe(
 
 /// Fetches the invoices of one company from its portal. Every problem ends up in
 /// the report, so that it also reaches the run history.
-///
-/// Step 6 (link mails starting recipes) hooks in after this returns: a company's
-/// `portal_fetch_required` rows can be resolved once a report has no failures.
 pub async fn fetch_company<H: ConfirmationHandler>(
     config: &Config,
     company: &Company,
@@ -122,4 +119,38 @@ pub async fn fetch_company<H: ConfirmationHandler>(
     let report = run_recipe(&job, &mut driver, handler).await;
     driver.close().await;
     report
+}
+
+/// Real portal downloads with the standard locations, for link mails and the
+/// schedule.
+pub struct BrowserFetcher<'a, H> {
+    pub config: &'a Config,
+    pub secrets: &'a dyn SecretStore,
+    pub dirs: &'a AppDirs,
+    pub index: &'a Path,
+    pub window: WindowMode,
+    pub handler: &'a mut H,
+}
+
+impl<H: ConfirmationHandler> PortalFetcher for BrowserFetcher<'_, H> {
+    async fn fetch(&mut self, company: &Company) -> FetchReport {
+        let paths = FetchPaths {
+            index: self.index.to_path_buf(),
+            ..FetchPaths::of(self.dirs, &company.id)
+        };
+        let options = FetchOptions {
+            dry_run: false,
+            window: self.window,
+            recipe_file: None,
+        };
+        fetch_company(
+            self.config,
+            company,
+            self.secrets,
+            &paths,
+            &options,
+            self.handler,
+        )
+        .await
+    }
 }

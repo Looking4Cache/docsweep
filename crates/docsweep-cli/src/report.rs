@@ -104,21 +104,11 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
         }
         MailAction::PortalFetchRequired {
             company_name,
-            already_recorded,
+            fetch_due,
             ..
         } => {
             let _ = writeln!(out, "    Company: {company_name}");
-            let note = if *already_recorded {
-                "already noted as needing a portal download"
-            } else {
-                match tense {
-                    Tense::Planned => "would be noted as needing a portal download",
-                    Tense::Done => "noted as needing a portal download",
-                    Tense::Failed => "could not be noted as needing a portal download",
-                }
-            };
-            let _ = writeln!(out, "    Invoice: {note}");
-            out.push_str("    Mail: stays in place until the invoice is stored\n");
+            render_link_mail(out, &report.outcome, *fetch_due);
         }
         MailAction::NoDocument { company_name, .. } => {
             let _ = writeln!(out, "    Company: {company_name}");
@@ -135,7 +125,10 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
     }
 
     match &report.outcome {
-        Outcome::Planned | Outcome::Completed => {}
+        Outcome::Planned
+        | Outcome::Completed
+        | Outcome::LinkResolved { .. }
+        | Outcome::AwaitingInvoice => {}
         Outcome::KeptForReview { reason } => {
             let _ = writeln!(out, "    Review needed: {reason}");
         }
@@ -143,6 +136,30 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
             let _ = writeln!(out, "    FAILED: {message}");
         }
     }
+}
+
+fn render_link_mail(out: &mut String, outcome: &Outcome, fetch_due: bool) {
+    let (invoice, mail) = match outcome {
+        Outcome::LinkResolved { disposal } => (
+            "stored from the portal".to_owned(),
+            format!("{} (done)", describe_disposal(disposal)),
+        ),
+        Outcome::Failed { .. } => ("not stored".to_owned(), "stays in place".to_owned()),
+        Outcome::AwaitingInvoice => (
+            "not in the portal yet; checked again later, at most once a day".to_owned(),
+            "stays in place until the invoice is stored".to_owned(),
+        ),
+        _ if fetch_due => (
+            "would start a portal download".to_owned(),
+            "stays in place until the invoice is stored".to_owned(),
+        ),
+        _ => (
+            "the portal was already checked today; checked again tomorrow".to_owned(),
+            "stays in place until the invoice is stored".to_owned(),
+        ),
+    };
+    let _ = writeln!(out, "    Invoice: {invoice}");
+    let _ = writeln!(out, "    Mail: {mail}");
 }
 
 fn render_document(out: &mut String, document: &PlannedDocument, tense: Tense) {
@@ -182,17 +199,21 @@ fn describe_decision(decision: &MailDecision, tense: Tense) -> String {
         MailDecision::KeepAndFlag { .. } if dry_run => "would stay in place and be flagged".into(),
         MailDecision::KeepAndFlag { .. } => "stays in place, flagged".into(),
         MailDecision::Dispose(action) => {
-            let description = match action {
-                DisposalAction::MoveTo(folder) => format!("move to {folder}"),
-                DisposalAction::Trash => "move to trash".to_owned(),
-                DisposalAction::DeletePermanently => "delete permanently".to_owned(),
-            };
+            let description = describe_disposal(action);
             if dry_run {
                 format!("would {description}")
             } else {
                 format!("{description} (done)")
             }
         }
+    }
+}
+
+fn describe_disposal(action: &DisposalAction) -> String {
+    match action {
+        DisposalAction::MoveTo(folder) => format!("move to {folder}"),
+        DisposalAction::Trash => "move to trash".to_owned(),
+        DisposalAction::DeletePermanently => "delete permanently".to_owned(),
     }
 }
 
@@ -325,6 +346,60 @@ mod tests {
         let text = render(&[report], false);
         assert!(text.contains("Saved: /invoices"), "{text}");
         assert!(text.contains("move to Done (done)"), "{text}");
+    }
+
+    fn link_report(outcome: Outcome, fetch_due: bool) -> AccountReport {
+        AccountReport {
+            account_id: "main".into(),
+            error: None,
+            mails: vec![MailReport {
+                outcome,
+                plan: MailPlan {
+                    uid: 1,
+                    message_id: "<1>".into(),
+                    from: "billing@acme.example".into(),
+                    subject: "Ihre Rechnung ist online".into(),
+                    action: MailAction::PortalFetchRequired {
+                        company_id: "acme".into(),
+                        company_name: "Acme".into(),
+                        already_recorded: false,
+                        fetch_due,
+                    },
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn link_mails_say_what_became_of_them() {
+        let planned = render(&[link_report(Outcome::Planned, true)], true);
+        assert!(
+            planned.contains("would start a portal download"),
+            "{planned}"
+        );
+
+        let checked = render(&[link_report(Outcome::Planned, false)], true);
+        assert!(checked.contains("already checked today"), "{checked}");
+
+        let waiting = render(&[link_report(Outcome::AwaitingInvoice, true)], false);
+        assert!(waiting.contains("not in the portal yet"), "{waiting}");
+        assert!(waiting.contains("stays in place"), "{waiting}");
+
+        let resolved = Outcome::LinkResolved {
+            disposal: DisposalAction::Trash,
+        };
+        let resolved = render(&[link_report(resolved, true)], false);
+        assert!(resolved.contains("move to trash (done)"), "{resolved}");
+
+        let failed = Outcome::Failed {
+            message: "the portal download failed: boom".into(),
+        };
+        let failed = render(&[link_report(failed, true)], false);
+        assert!(
+            failed.contains("FAILED: the portal download failed"),
+            "{failed}"
+        );
+        assert!(!failed.contains("(done)"), "{failed}");
     }
 
     #[test]

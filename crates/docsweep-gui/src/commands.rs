@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use chrono::NaiveDate;
-use docsweep_browser::{FetchOptions, FetchPaths, WindowMode, fetch_company};
+use chrono::{Local, NaiveDate};
+use docsweep_browser::{BrowserFetcher, FetchOptions, FetchPaths, WindowMode, fetch_company};
 use docsweep_core::config::{Config, ConfigError, Issue, MailAccount, SecretRef};
 use docsweep_core::index::{Index, IndexError, InvoiceRecord};
-use docsweep_core::mail::execute::{self, AccountReport, ScanSummary, summarize};
+use docsweep_core::mail::execute::{self, AccountReport, ScanReport, ScanSummary, summarize};
 use docsweep_core::names;
 use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
@@ -241,6 +241,8 @@ pub async fn test_mailbox(account: MailAccount) -> Result<u32, UiError> {
 #[derive(Debug, Serialize)]
 pub struct ScanResult {
     reports: Vec<AccountReport>,
+    /// The portal downloads that link mails started.
+    fetches: Vec<FetchReport>,
     summary: ScanSummary,
     /// The scan worked, but something around it did not.
     warning: Option<String>,
@@ -256,13 +258,28 @@ impl Drop for ScanGuard<'_> {
 }
 
 #[tauri::command]
-pub async fn run_scan(state: State<'_, AppState>, dry_run: bool) -> Result<ScanResult, UiError> {
+pub async fn run_scan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dry_run: bool,
+) -> Result<ScanResult, UiError> {
     if state.scanning.swap(true, Ordering::SeqCst) {
         return Err(UiError::new(ALREADY_RUNNING));
     }
     let _guard = ScanGuard(&state.scanning);
     let paths = state.paths.clone();
-    blocking(move || scan(&paths, &KeyringStore, dry_run)).await
+    let mut handler = GuiConfirmation {
+        slot: Arc::clone(&state.confirmation),
+        app,
+    };
+    blocking(move || {
+        if dry_run {
+            preview(&paths, &KeyringStore)
+        } else {
+            scan(&paths, &KeyringStore, &mut handler)
+        }
+    })
+    .await
 }
 
 /// The result of a preview or a real portal fetch. A list, like a scan's
@@ -346,7 +363,7 @@ fn fetch<H: ConfirmationHandler>(
     let warning = if dry_run {
         None
     } else {
-        record_run(paths, &reports, &summary).err()
+        record_run(paths, &reports, &summary, false).err()
     };
     Ok(FetchResult {
         reports,
@@ -409,39 +426,84 @@ pub fn answer_confirmation(state: State<'_, AppState>, done: bool) {
     state.confirmation.answer(done);
 }
 
-fn scan(paths: &Paths, secrets: &dyn SecretStore, dry_run: bool) -> Result<ScanResult, UiError> {
+fn preview(paths: &Paths, secrets: &dyn SecretStore) -> Result<ScanResult, UiError> {
     let config = Config::load(&paths.config)?;
     let runtime = current_thread_runtime()?;
     let reports = runtime
+        .block_on(execute::preview_mail_scan(
+            &config,
+            secrets,
+            &paths.index,
+            Local::now().date_naive(),
+        ))
+        .map_err(UiError::new)?;
+    let summary = summarize(&reports);
+    Ok(ScanResult {
+        reports,
+        fetches: Vec::new(),
+        summary,
+        warning: None,
+    })
+}
+
+fn scan<H: ConfirmationHandler>(
+    paths: &Paths,
+    secrets: &dyn SecretStore,
+    handler: &mut H,
+) -> Result<ScanResult, UiError> {
+    let config = Config::load(&paths.config)?;
+    let runtime = current_thread_runtime()?;
+    let mut fetcher = BrowserFetcher {
+        config: &config,
+        secrets,
+        dirs: &paths.dirs,
+        index: &paths.index,
+        window: WindowMode::OnDemand,
+        handler,
+    };
+    let report = runtime
         .block_on(execute::run_mail_scan(
             &config,
             secrets,
             &paths.index,
-            dry_run,
+            Local::now().date_naive(),
+            &mut fetcher,
         ))
         .map_err(UiError::new)?;
-    let summary = summarize(&reports);
-    let warning = if dry_run {
-        None
-    } else {
-        record_run(paths, &reports, &summary).err()
-    };
+    let summary = report.summary();
+    let warning = record_scan(paths, &report, false).err();
+    let ScanReport { accounts, fetches } = report;
     Ok(ScanResult {
-        reports,
+        reports: accounts,
+        fetches,
         summary,
         warning,
     })
+}
+
+/// Adds a scan to the history: mailboxes and portal downloads in one list, which
+/// the interface tells apart by their fields.
+fn record_scan(paths: &Paths, report: &ScanReport, automatic: bool) -> Result<(), String> {
+    let values = report
+        .accounts
+        .iter()
+        .map(serde_json::to_value)
+        .chain(report.fetches.iter().map(serde_json::to_value))
+        .collect::<Result<Vec<Value>, _>>()
+        .map_err(|e| e.to_string())?;
+    record_run(paths, &values, &report.summary(), automatic)
 }
 
 fn record_run<R: Serialize, S: Serialize>(
     paths: &Paths,
     reports: &[R],
     summary: &S,
+    automatic: bool,
 ) -> Result<(), String> {
     let summary = serde_json::to_string(summary).map_err(|e| e.to_string())?;
     let report = serde_json::to_string(reports).map_err(|e| e.to_string())?;
     Index::open(&paths.index)
-        .and_then(|index| index.record_run(&summary, &report, false))
+        .and_then(|index| index.record_run(&summary, &report, automatic))
         .map_err(|e| format!("the run could not be added to the history: {e}"))
 }
 
@@ -637,7 +699,7 @@ mail:
         let paths = paths(dir.path());
         std::fs::write(&paths.config, VALID).unwrap();
 
-        let result = scan(&paths, &MemoryStore::default(), true).unwrap();
+        let result = preview(&paths, &MemoryStore::default()).unwrap();
 
         assert_eq!(result.summary.failed, 1, "no password is stored");
         assert!(!paths.index.exists());
@@ -651,7 +713,7 @@ mail:
         let paths = paths(dir.path());
         std::fs::write(&paths.config, VALID).unwrap();
 
-        let result = scan(&paths, &MemoryStore::default(), false).unwrap();
+        let result = scan(&paths, &MemoryStore::default(), &mut NobodyAsked).unwrap();
 
         assert!(result.warning.is_none());
         let history = runs(&paths.index).unwrap();
@@ -663,7 +725,7 @@ mail:
     #[test]
     fn scan_without_configuration_is_an_understandable_error() {
         let dir = tempfile::tempdir().unwrap();
-        let error = scan(&paths(dir.path()), &MemoryStore::default(), true).unwrap_err();
+        let error = preview(&paths(dir.path()), &MemoryStore::default()).unwrap_err();
         assert!(error.message.contains("docsweep.yaml"), "{}", error.message);
     }
 
