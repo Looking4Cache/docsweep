@@ -7,6 +7,7 @@ use docsweep_core::mail::execute::{AccountReport, MailReport, Outcome};
 use docsweep_core::mail::plan::{
     DisposalAction, Disposition, MailAction, MailDecision, PlannedDocument, ReviewReason,
 };
+use docsweep_core::portal::engine::{EntryOutcome, FetchReport};
 
 /// Renders all accounts.
 pub fn render(reports: &[AccountReport], dry_run: bool) -> String {
@@ -27,6 +28,46 @@ pub fn render(reports: &[AccountReport], dry_run: bool) -> String {
         }
     }
     out
+}
+
+/// Renders a portal fetch: one line per list entry.
+pub fn render_fetch(report: &FetchReport, dry_run: bool) -> String {
+    let mut out = String::new();
+    if dry_run {
+        out.push_str("Dry run: nothing was downloaded.\n");
+    }
+    let _ = writeln!(out, "\nCompany {}", report.company_name);
+    if report.entries.is_empty() && report.error.is_none() {
+        out.push_str("  The portal lists nothing.\n");
+    }
+    for entry in &report.entries {
+        let _ = writeln!(out, "  {}: {}", entry.key, describe_entry(&entry.outcome));
+    }
+    if let Some(error) = &report.error {
+        let _ = writeln!(out, "  ERROR: {error}");
+    }
+    out
+}
+
+fn describe_entry(outcome: &EntryOutcome) -> String {
+    match outcome {
+        EntryOutcome::WouldDownload {
+            file_name: Some(name),
+        } => format!("would save as {name}"),
+        EntryOutcome::WouldDownload { file_name: None } => "would download".to_owned(),
+        EntryOutcome::AlreadyKnown => "already known".to_owned(),
+        EntryOutcome::Stored { path } => format!("saved: {}", path.display()),
+        EntryOutcome::StoredForReview { path, reason } => {
+            let why = match reason {
+                ReviewReason::NumberNotFound => "no invoice number found",
+                ReviewReason::NumberConflict { .. } => "number known with a different file",
+            };
+            format!("saved for review ({why}): {}", path.display())
+        }
+        EntryOutcome::Unresolved { reason } => format!("not saved again: {reason}"),
+        EntryOutcome::Missing => "missing: the portal offers no document for this yet".to_owned(),
+        EntryOutcome::Failed { message } => format!("FAILED: {message}"),
+    }
 }
 
 /// How to word planned steps: they did not all happen unless the run succeeded.
@@ -161,6 +202,7 @@ mod tests {
     use chrono::NaiveDate;
     use docsweep_core::document::InvoiceFacts;
     use docsweep_core::mail::plan::MailPlan;
+    use docsweep_core::portal::engine::EntryReport;
     use std::path::PathBuf;
 
     fn invoice_report(decision: MailDecision, disposition: Disposition) -> AccountReport {
@@ -293,5 +335,46 @@ mod tests {
             mails: Vec::new(),
         };
         assert!(render(&[report], true).contains("No relevant mails"));
+    }
+
+    #[test]
+    fn fetch_reports_say_what_happened_to_each_entry() {
+        let entry = |key: &str, outcome| EntryReport {
+            key: key.to_owned(),
+            date: None,
+            invoice_no: None,
+            amount: None,
+            outcome,
+        };
+        let report = FetchReport {
+            company_id: "acme".into(),
+            company_name: "Acme".into(),
+            entries: vec![
+                entry(
+                    "R-1",
+                    EntryOutcome::WouldDownload {
+                        file_name: Some("a.pdf".into()),
+                    },
+                ),
+                entry("R-2", EntryOutcome::AlreadyKnown),
+                entry("O-3", EntryOutcome::Missing),
+                entry(
+                    "R-4",
+                    EntryOutcome::Failed {
+                        message: "boom".into(),
+                    },
+                ),
+            ],
+            error: Some("gave up".into()),
+        };
+
+        let text = render_fetch(&report, true);
+
+        assert!(text.contains("Dry run: nothing was downloaded."), "{text}");
+        assert!(text.contains("R-1: would save as a.pdf"), "{text}");
+        assert!(text.contains("R-2: already known"), "{text}");
+        assert!(text.contains("O-3: missing"), "{text}");
+        assert!(text.contains("R-4: FAILED: boom"), "{text}");
+        assert!(text.contains("ERROR: gave up"), "{text}");
     }
 }

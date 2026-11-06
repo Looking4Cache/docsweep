@@ -12,10 +12,11 @@ name = "docsweep"
 path = "src/main.rs"
 
 [dependencies]
+docsweep-browser.workspace = true
 docsweep-core.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false }

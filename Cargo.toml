@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Looking4Cache/docsweep"
 
 [workspace.dependencies]
+docsweep-browser = { path = "crates/docsweep-browser" }
 docsweep-core = { path = "crates/docsweep-core" }
 directories = "6"
 tempfile = "3"
