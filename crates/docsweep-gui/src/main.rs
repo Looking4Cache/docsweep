@@ -5,6 +5,7 @@
 mod automation;
 mod commands;
 mod i18n;
+mod pickup;
 mod tray;
 
 use std::path::PathBuf;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub confirmation: Arc<commands::ConfirmationSlot>,
     /// A recipe draft that is waiting for a person's decision.
     pub recipe_work: std::sync::Mutex<commands::RecipeWork>,
+    /// The assisted pick-up that is going on, if any.
+    pub pickup: std::sync::Mutex<pickup::PickupSlot>,
 }
 
 fn resolve_paths() -> Option<commands::Paths> {
@@ -65,6 +68,7 @@ fn main() {
             automatic_run: AtomicBool::new(false),
             confirmation: Arc::default(),
             recipe_work: std::sync::Mutex::default(),
+            pickup: std::sync::Mutex::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
@@ -91,6 +95,12 @@ fn main() {
             commands::describe_schedule,
             commands::autostart_enabled,
             commands::set_autostart,
+            pickup::list_pickups,
+            pickup::pickup_status,
+            pickup::start_pickup,
+            pickup::confirm_pickup,
+            pickup::ignore_pickup,
+            pickup::end_pickup,
         ])
         .setup(|app| {
             // Without a tray there would be no way back to a hidden window, so

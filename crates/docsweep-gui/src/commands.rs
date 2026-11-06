@@ -13,7 +13,9 @@ use docsweep_browser::{
 use docsweep_core::ai::generate::{generation_prompt, known_hosts, request_draft};
 use docsweep_core::ai::provider::{self, ANTHROPIC_DEFAULT_MODEL};
 use docsweep_core::ai::sanitize::{RawPage, SanitizedPrompt};
-use docsweep_core::config::{Company, Config, ConfigError, Issue, MailAccount, SecretRef};
+use docsweep_core::config::{
+    Company, Config, ConfigError, Issue, MailAccount, SecretRef, system_downloads_dir,
+};
 use docsweep_core::index::{Index, IndexError, InvoiceRecord};
 use docsweep_core::mail::execute::{self, AccountReport, ScanReport, ScanSummary, summarize};
 use docsweep_core::names;
@@ -61,7 +63,7 @@ pub struct UiError {
 }
 
 impl UiError {
-    fn new(message: impl ToString) -> Self {
+    pub fn new(message: impl ToString) -> Self {
         Self {
             message: message.to_string(),
             issues: Vec::new(),
@@ -109,6 +111,8 @@ pub struct AppSnapshot {
     /// Whether the API key of the AI provider is in the keychain; never its value.
     llm_key_stored: bool,
     anthropic_default_model: &'static str,
+    /// Where pick-ups look unless Settings say otherwise.
+    system_downloads_dir: Option<PathBuf>,
 }
 
 /// Whether the secrets of a portal exist; never their values.
@@ -176,6 +180,7 @@ fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
         stored_portal_secrets,
         llm_key_stored,
         anthropic_default_model: ANTHROPIC_DEFAULT_MODEL,
+        system_downloads_dir: system_downloads_dir(),
     }
 }
 
@@ -945,7 +950,7 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), UiError> {
 
 /// Runs blocking work off the main thread. SQLite connections and parsers are
 /// not `Sync`, so the scan keeps to one thread with its own small runtime.
-async fn blocking<T, F>(work: F) -> Result<T, UiError>
+pub async fn blocking<T, F>(work: F) -> Result<T, UiError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, UiError> + Send + 'static,
@@ -1186,6 +1191,44 @@ companies:
         );
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("super-secret-value"), "{json}");
+    }
+
+    #[test]
+    fn an_assisted_company_has_no_portal_secrets_and_cannot_be_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(
+            &paths.config,
+            WITH_PORTAL.replace(
+                r#"portal: { credentials: "keyring:acme", totp: "keyring:acme-totp", recipe: acme.yaml }"#,
+                r#"portal: { mode: assisted, url: "https://portal.example/", recipe: acme.yaml }"#,
+            ),
+        )
+        .unwrap();
+
+        let secrets = MemoryStore::with("acme", "left-over");
+        assert_eq!(
+            snapshot(&paths, &secrets).stored_portal_secrets,
+            [(
+                "acme".to_owned(),
+                PortalSecrets {
+                    credentials: false,
+                    totp: false
+                }
+            )]
+        );
+
+        let result = fetch(
+            &paths,
+            &MemoryStore::default(),
+            "acme",
+            false,
+            WindowMode::Hidden,
+            &mut NobodyAsked,
+        )
+        .unwrap();
+        let error = result.reports[0].error.as_deref().unwrap();
+        assert!(error.contains("assisted"), "{error}");
     }
 
     #[test]
