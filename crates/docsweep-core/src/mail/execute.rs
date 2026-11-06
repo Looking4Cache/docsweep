@@ -386,6 +386,7 @@ fn store_document(
         source: Source::Mail,
         mail_account: Some(account_id.to_owned()),
         mail_id: Some(mail.message_id.clone()),
+        portal_key: None,
         status,
     });
     if let Err(error) = inserted {

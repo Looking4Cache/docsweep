@@ -153,6 +153,7 @@ companies:
                 source: Source::Mail,
                 mail_account: None,
                 mail_id: None,
+                portal_key: None,
                 status,
             })
             .unwrap()

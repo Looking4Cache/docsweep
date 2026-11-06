@@ -282,26 +282,20 @@ fn plan_document(
     };
     seen_hashes.insert(hash.clone());
 
-    let template = FilenameTemplate::parse(&company.output.filename).map_err(|problem| {
-        PlanError::Template {
-            company: company.id.clone(),
-            problem,
-        }
-    })?;
-    let number = facts
-        .invoice_no
-        .clone()
-        .unwrap_or_else(|| format!("unbekannt-{}", &hash[..UNKNOWN_NUMBER_HASH_CHARS]));
-    let file_name = template.render(date, &number);
-    let target_dir = context.config.output_dir_of(company);
-    let target_path = storage::free_path(&target_dir, &file_name)?;
+    let target = target_of(
+        context.config,
+        company,
+        date,
+        facts.invoice_no.as_deref(),
+        &hash,
+    )?;
 
     Ok(PlannedDocument {
         attachment_index: position,
         attachment_name: attachment.name.clone(),
-        target_dir,
-        file_name,
-        target_path,
+        target_dir: target.dir,
+        file_name: target.file_name,
+        target_path: target.path,
         hash,
         date,
         facts,
@@ -309,7 +303,44 @@ fn plan_document(
     })
 }
 
-fn disposition_of(check: DuplicateCheck, has_number: bool) -> Disposition {
+/// Where a document goes.
+pub(crate) struct Target {
+    pub(crate) dir: PathBuf,
+    pub(crate) file_name: String,
+    /// Includes a suffix if the name is taken.
+    pub(crate) path: PathBuf,
+}
+
+/// Names a document after the company's template. Without a number, part of the
+/// hash keeps the name unique.
+pub(crate) fn target_of(
+    config: &Config,
+    company: &Company,
+    date: NaiveDate,
+    invoice_no: Option<&str>,
+    hash: &str,
+) -> Result<Target, PlanError> {
+    let template = FilenameTemplate::parse(&company.output.filename).map_err(|problem| {
+        PlanError::Template {
+            company: company.id.clone(),
+            problem,
+        }
+    })?;
+    let number = invoice_no.map_or_else(
+        || format!("unbekannt-{}", &hash[..UNKNOWN_NUMBER_HASH_CHARS]),
+        str::to_owned,
+    );
+    let file_name = template.render(date, &number);
+    let dir = config.output_dir_of(company);
+    let path = storage::free_path(&dir, &file_name)?;
+    Ok(Target {
+        dir,
+        file_name,
+        path,
+    })
+}
+
+pub(crate) fn disposition_of(check: DuplicateCheck, has_number: bool) -> Disposition {
     match check {
         DuplicateCheck::New if has_number => Disposition::Store,
         DuplicateCheck::New => Disposition::StoreForReview(ReviewReason::NumberNotFound),
@@ -516,6 +547,7 @@ companies:
                 source: Source::Mail,
                 mail_account: None,
                 mail_id: None,
+                portal_key: None,
                 status,
             })
             .unwrap();

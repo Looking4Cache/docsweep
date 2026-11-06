@@ -43,7 +43,16 @@ const MIGRATIONS: &[&str] = &[
         report       TEXT NOT NULL
     );
 "#,
+    r#"
+    ALTER TABLE invoices ADD COLUMN portal_key TEXT;
+    CREATE UNIQUE INDEX invoices_portal_key ON invoices (company_id, portal_key)
+        WHERE portal_key IS NOT NULL;
+"#,
 ];
+
+/// The first schema version with the column `portal_key`. A dry run reads an
+/// index without migrating it, so it can meet older ones.
+const PORTAL_KEY_VERSION: usize = 3;
 
 /// Where an invoice came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -118,6 +127,8 @@ pub struct NewInvoice {
     pub source: Source,
     pub mail_account: Option<String>,
     pub mail_id: Option<String>,
+    /// What identifies this document in the portal's list across runs.
+    pub portal_key: Option<String>,
     pub status: Status,
 }
 
@@ -284,8 +295,9 @@ impl Index {
     pub fn insert(&self, invoice: &NewInvoice) -> Result<i64, IndexError> {
         self.conn.execute(
             "INSERT INTO invoices (company_id, invoice_date, invoice_no, amount, currency,
-                                   file_path, file_hash, source, mail_account, mail_id, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                   file_path, file_hash, source, mail_account, mail_id,
+                                   portal_key, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 invoice.company_id,
                 invoice.invoice_date.map(|d| d.to_string()),
@@ -297,6 +309,7 @@ impl Index {
                 invoice.source.as_str(),
                 invoice.mail_account,
                 invoice.mail_id,
+                invoice.portal_key,
                 invoice.status.as_str(),
             ],
         )?;
@@ -344,6 +357,32 @@ impl Index {
             )
             .optional()?
             .is_some())
+    }
+
+    /// Whether an entry of a portal's list is already known: it was fetched from
+    /// the portal before, or its key is the number of a stored invoice.
+    pub fn is_portal_entry_known(&self, company_id: &str, key: &str) -> Result<bool, IndexError> {
+        let query = if schema_version(&self.conn)? >= PORTAL_KEY_VERSION {
+            "SELECT 1 FROM invoices
+             WHERE company_id = ?1 AND (portal_key = ?2 OR invoice_no = ?2) LIMIT 1"
+        } else {
+            "SELECT 1 FROM invoices WHERE company_id = ?1 AND invoice_no = ?2 LIMIT 1"
+        };
+        Ok(self
+            .conn
+            .query_row(query, params![company_id, key], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Notes a portal key for a row that was first stored another way, so its
+    /// list entry is not downloaded again. A row keeps the key it has.
+    pub fn note_portal_key(&self, id: i64, key: &str) -> Result<(), IndexError> {
+        self.conn.execute(
+            "UPDATE OR IGNORE invoices SET portal_key = ?2 WHERE id = ?1 AND portal_key IS NULL",
+            params![id, key],
+        )?;
+        Ok(())
     }
 
     /// Records that the mail of these rows was cleaned up.
@@ -473,6 +512,7 @@ mod tests {
             source: Source::Mail,
             mail_account: Some("main".into()),
             mail_id: Some("<1@example.test>".into()),
+            portal_key: None,
             status: Status::Stored,
         }
     }
@@ -686,6 +726,58 @@ mod tests {
         let index = Index::open(&path).unwrap();
         index.record_run("{}", "[]").unwrap();
         assert_eq!(index.recent_runs(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn portal_entries_are_known_by_key_or_number() {
+        let index = Index::open_in_memory().unwrap();
+        let mut new = invoice(Some("R-1"), "h1");
+        new.portal_key = Some("K-1".into());
+        let id = index.insert(&new).unwrap();
+        assert!(index.is_portal_entry_known("acme", "K-1").unwrap());
+        assert!(index.is_portal_entry_known("acme", "R-1").unwrap());
+        assert!(!index.is_portal_entry_known("acme", "K-2").unwrap());
+        assert!(!index.is_portal_entry_known("other", "K-1").unwrap());
+
+        index.note_portal_key(id, "K-2").unwrap();
+        assert!(
+            !index.is_portal_entry_known("acme", "K-2").unwrap(),
+            "a row keeps its key"
+        );
+        let mail = index.insert(&invoice(Some("R-2"), "h2")).unwrap();
+        index.note_portal_key(mail, "K-2").unwrap();
+        assert!(index.is_portal_entry_known("acme", "K-2").unwrap());
+    }
+
+    #[test]
+    fn a_taken_portal_key_does_not_fail_the_note() {
+        let index = Index::open_in_memory().unwrap();
+        let mut new = invoice(Some("R-1"), "h1");
+        new.portal_key = Some("K-1".into());
+        index.insert(&new).unwrap();
+        let other = index.insert(&invoice(Some("R-2"), "h2")).unwrap();
+        index.note_portal_key(other, "K-1").unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_can_read_an_index_from_before_portal_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute(
+            "INSERT INTO invoices (company_id, invoice_no, source, status)
+             VALUES ('acme', 'R-1', 'mail', 'stored')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let index = Index::open_read_only(&path).unwrap().unwrap();
+        assert!(index.is_portal_entry_known("acme", "R-1").unwrap());
+        assert!(!index.is_portal_entry_known("acme", "R-2").unwrap());
     }
 
     #[test]

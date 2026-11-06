@@ -5,6 +5,8 @@
 //! way round.
 
 pub mod credentials;
+pub mod driver;
+pub mod engine;
 pub mod recipe;
 
 use std::path::{Component, Path, PathBuf};

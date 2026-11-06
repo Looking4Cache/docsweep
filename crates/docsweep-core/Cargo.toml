@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Dummy PDFs for the tests of other crates.
+test-support = []
+
 [dependencies]
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

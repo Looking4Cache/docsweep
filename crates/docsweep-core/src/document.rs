@@ -198,7 +198,7 @@ fn parse_invoice_text(text: &str) -> InvoiceFacts {
     }
 }
 
-fn parse_date(value: &str) -> Option<NaiveDate> {
+pub(crate) fn parse_date(value: &str) -> Option<NaiveDate> {
     let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
     // The plausibility check matters: `%Y` also reads the `26` of `03.11.26` as
     // the year 26, and only then does the two-digit format get its turn.
@@ -216,8 +216,8 @@ pub fn looks_like_pdf(bytes: &[u8]) -> bool {
         .any(|window| window == b"%PDF-")
 }
 
-#[cfg(test)]
-pub(crate) mod test_pdf {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_pdf {
     //! Builds dummy PDFs at test time, so no invoice files are stored in the repo.
 
     use lopdf::content::{Content, Operation};
