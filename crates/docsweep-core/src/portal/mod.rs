@@ -4,6 +4,7 @@
 //! lives in `docsweep-browser`, which depends on this crate and never the other
 //! way round.
 
+pub mod credentials;
 pub mod recipe;
 
 use std::path::{Component, Path, PathBuf};
