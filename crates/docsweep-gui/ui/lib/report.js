@@ -11,6 +11,7 @@ function groupOf(mail) {
   if (mail.outcome.kind === "failed") return "failed";
   if (mail.outcome.kind === "link_resolved") return "save";
   const action = mail.plan.action;
+  if (mail.outcome.kind === "planned" && action.cleanup) return "save";
   switch (action.kind) {
     case "invoices":
       return action.decision.kind === "keep_and_flag" ? "review" : "save";
@@ -35,22 +36,26 @@ export function groupReports(reports) {
 
 // What a real run would do, for the confirmation dialog.
 export function plannedEffects(reports) {
-  const effects = { saves: 0, reviews: 0, moves: 0, trash: 0, permanent: 0, fetches: 0 };
+  const effects = { saves: 0, reviews: 0, moves: 0, trash: 0, permanent: 0, fetches: 0, pickups: 0 };
+  const countDisposal = (disposal) => {
+    if (disposal === "move_to") effects.moves += 1;
+    if (disposal === "trash") effects.trash += 1;
+    if (disposal === "delete_permanently") effects.permanent += 1;
+  };
   const fetching = new Set();
   for (const account of reports) {
     for (const mail of account.mails) {
       const action = mail.plan.action;
       if (action.kind === "portal_fetch_required" && action.fetch_due) fetching.add(action.company_id);
+      if (action.kind === "portal_fetch_required" && action.cleanup) countDisposal(action.cleanup.kind);
+      else if (action.kind === "portal_fetch_required" && action.assisted && !action.already_recorded) effects.pickups += 1;
       if (action.kind !== "invoices") continue;
       for (const document of action.documents) {
         if (document.disposition.kind === "store") effects.saves += 1;
         if (document.disposition.kind === "store_for_review") effects.reviews += 1;
       }
       if (action.decision.kind !== "dispose") continue;
-      const disposal = action.decision.value.kind;
-      if (disposal === "move_to") effects.moves += 1;
-      if (disposal === "trash") effects.trash += 1;
-      if (disposal === "delete_permanently") effects.permanent += 1;
+      countDisposal(action.decision.value.kind);
     }
   }
   effects.fetches = fetching.size;
@@ -91,6 +96,7 @@ function disposalBadge(disposal, done) {
 function destination(mail, done) {
   const action = mail.plan.action;
   if (mail.outcome.kind === "link_resolved") return disposalBadge(mail.outcome.disposal, true);
+  if (mail.outcome.kind === "planned" && action.cleanup) return disposalBadge(action.cleanup, false);
   if (action.kind !== "invoices") return badge("neutral", t("row.dest_stays"));
   if (action.decision.kind === "keep_and_flag") return badge("warning", t("row.dest_keep"), "flag");
   return disposalBadge(action.decision.value, done);
@@ -98,6 +104,11 @@ function destination(mail, done) {
 
 // What is happening to the invoice behind a link mail.
 function linkMailNote(mail) {
+  const { assisted, cleanup, already_recorded: noted } = mail.plan.action;
+  if (assisted && mail.outcome.kind === "planned" && cleanup) return t("row.pickup_done");
+  if (assisted && mail.outcome.kind === "planned" && !noted) return t("row.pickup_new");
+  if (assisted && mail.outcome.kind === "planned") return t("row.pickup_waiting");
+  if (assisted && mail.outcome.kind === "awaiting_invoice") return t("row.pickup_waiting");
   switch (mail.outcome.kind) {
     case "planned":
       return t(mail.plan.action.fetch_due ? "row.portal_due" : "row.portal_checked_today");

@@ -27,6 +27,12 @@ export const api = {
   describeSchedule: (expression) => invoke("describe_schedule", { expression }),
   autostartEnabled: () => invoke("autostart_enabled"),
   setAutostart: (enabled) => invoke("set_autostart", { enabled }),
+  listPickups: () => invoke("list_pickups"),
+  pickupStatus: () => invoke("pickup_status"),
+  startPickup: (companyId) => invoke("start_pickup", { companyId }),
+  confirmPickup: (fileName) => invoke("confirm_pickup", { fileName }),
+  ignorePickup: (fileName) => invoke("ignore_pickup", { fileName }),
+  endPickup: () => invoke("end_pickup"),
 };
 
 export function onTrayPreview(handler) {
@@ -47,6 +53,10 @@ export function onPortalConfirmationEnded(handler) {
 
 export function onAutomationStatus(handler) {
   window.__TAURI__.event.listen("automation-status", (event) => handler(event.payload));
+}
+
+export function onPickupStatus(handler) {
+  window.__TAURI__.event.listen("pickup-status", (event) => handler(event.payload));
 }
 
 export function errorText(error) {

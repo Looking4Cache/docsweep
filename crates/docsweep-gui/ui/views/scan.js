@@ -1,6 +1,7 @@
 import { api, errorText } from "../lib/api.js";
 import { h, icon, replace } from "../lib/dom.js";
-import { t, tn } from "../lib/i18n.js";
+import { formatDate, formatDateTime, t, tn } from "../lib/i18n.js";
+import { endPickup, startPickup } from "../lib/pickup.js";
 import { plannedEffects, reportList, summaryStats } from "../lib/report.js";
 import { confirmDialog, emptyState, notice, pageHeader } from "../lib/ui.js";
 
@@ -25,6 +26,7 @@ function effectItems(effects) {
   add(effects.trash, "scan.confirm_trash", "trash");
   add(effects.permanent, "scan.confirm_permanent", "trash", true);
   add(effects.fetches, "scan.confirm_fetches", "link");
+  add(effects.pickups, "scan.confirm_pickups", "link");
   return items;
 }
 
@@ -118,6 +120,42 @@ export function renderScan(app) {
     );
   }
 
+  // Invoices waiting for a person, whatever a scan is up to. Showing them is all
+  // that automatic runs ever do about them.
+  function pickupPanel() {
+    const items = app.pickups;
+    const session = app.pickupSession?.watching ? app.pickupSession : null;
+    if (items.length === 0 && !session && !app.pickupError) return null;
+    return h("section", { class: "pickups" },
+      h("div", { class: "notices" },
+        app.pickupError && notice("danger", app.pickupError),
+        session && h("div", { class: "notice notice-info notice-with-action", role: "status" },
+          icon("history"),
+          h("span", {}, t("pickup.watching", {
+            name: session.company_name,
+            folder: session.folder,
+            time: formatDateTime(session.ends_at),
+          })),
+          h("button", { class: "button button-small", onclick: () => endPickup(app) }, t("pickup.end"))),
+      ),
+      items.length > 0 && h("h2", { class: "report-heading" }, t("pickup.title")),
+      items.length > 0 && h("p", { class: "pickup-lead" }, t("pickup.lead")),
+      items.length > 0 && h("ul", { class: "mail-list" }, items.map((item) =>
+        h("li", { class: "mail-row" },
+          h("div", { class: "mail-main" },
+            h("div", { class: "mail-head" }, h("span", { class: "mail-subject" }, item.company_name)),
+            h("div", { class: "mail-from" }, item.mail_date
+              ? t("pickup.mail_date", { date: formatDate(item.mail_date) })
+              : t("pickup.mail_no_date"))),
+          h("div", { class: "mail-side" },
+            h("button", {
+              class: "button button-small button-primary",
+              disabled: Boolean(app.pickupSession),
+              onclick: () => startPickup(app, item.company_id),
+            }, t("pickup.start")))))),
+    );
+  }
+
   function paint() {
     const noCompanies = app.config.companies.length === 0;
     let body;
@@ -151,7 +189,7 @@ export function renderScan(app) {
             : h("button", { class: "button button-primary button-large", onclick: () => start(true) }, t("scan.preview")),
         );
     }
-    replace(root, headerFor(current.phase), automationNotices(), body);
+    replace(root, headerFor(current.phase), automationNotices(), pickupPanel(), body);
   }
 
   paintVisible = paint;

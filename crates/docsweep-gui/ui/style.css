@@ -586,6 +586,10 @@ input[type="text"].mono { padding: 7px 9px; font-family: var(--mono); font-size:
   box-shadow: var(--shadow);
 }
 
+.pickups { margin-bottom: 18px; }
+.pickups .report-heading { margin-top: 0; }
+.pickup-lead { max-width: 64ch; margin-bottom: 10px; color: var(--ink-2); font-size: 13px; }
+
 .mail-row {
   display: flex;
   align-items: flex-start;

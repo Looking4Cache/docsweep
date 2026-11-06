@@ -1,6 +1,7 @@
 import { api, errorText, onAutomationStatus, onTrayPreview } from "./lib/api.js";
 import { h, icon, mark, replace } from "./lib/dom.js";
 import { loadTranslations, t } from "./lib/i18n.js";
+import { watchPickups } from "./lib/pickup.js";
 import { notice, watchPortalConfirmations } from "./lib/ui.js";
 import { renderCompanies } from "./views/companies.js";
 import { renderHistory } from "./views/history.js";
@@ -23,7 +24,8 @@ const root = document.getElementById("app");
 const content = h("main", { class: "content" });
 const reviewBadge = h("span", { class: "nav-badge", hidden: true });
 const problemBadge = h("span", { class: "nav-badge nav-badge-danger", hidden: true });
-const NAV_BADGES = { invoices: reviewBadge, history: problemBadge };
+const pickupBadge = h("span", { class: "nav-badge", hidden: true });
+const NAV_BADGES = { scan: pickupBadge, invoices: reviewBadge, history: problemBadge };
 // The newest run someone has seen in the history. Only a convenience: without
 // storage, old problems simply show again.
 const HISTORY_SEEN_KEY = "docsweep.history-seen";
@@ -46,6 +48,7 @@ const app = {
     const firstConfig = !app.config;
     app.config = config;
     if (firstConfig) showShell();
+    else app.refreshBadges();
     paintNav();
   },
   isPasswordStored: (id) => app.passwords.get(id) === true,
@@ -58,7 +61,20 @@ const app = {
   automationRunning: false,
   automaticProblems: [],
   repaintScan: null,
+  // Invoices to pick up by hand, and the pick-up going on right now.
+  pickups: [],
+  pickupSession: null,
+  pickupError: null,
+  setPickupSession(session) {
+    app.pickupSession = session;
+    if (activeView === "scan") app.repaintScan?.();
+  },
   async refreshBadges() {
+    try {
+      showPickups(await api.listPickups());
+    } catch {
+      showPickups([]);
+    }
     try {
       const invoices = await api.listInvoices();
       const count = invoices.filter((row) => row.status === "needs_review").length;
@@ -84,6 +100,13 @@ const app = {
     showProblems([]);
   },
 };
+
+function showPickups(items) {
+  app.pickups = items;
+  pickupBadge.hidden = items.length === 0;
+  pickupBadge.textContent = items.length;
+  if (activeView === "scan") app.repaintScan?.();
+}
 
 function showProblems(runs) {
   app.automaticProblems = runs;
@@ -142,6 +165,7 @@ async function start() {
   app.anthropicDefaultModel = state.anthropic_default_model;
   app.systemDownloadsDir = state.system_downloads_dir;
   watchPortalConfirmations();
+  watchPickups(app);
   onAutomationStatus(({ running }) => {
     app.automationRunning = running;
     if (activeView === "scan") app.repaintScan?.();
