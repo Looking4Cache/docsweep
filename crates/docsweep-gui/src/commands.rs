@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use docsweep_browser::{BrowserFetcher, FetchOptions, FetchPaths, WindowMode, fetch_company};
 use docsweep_core::config::{Config, ConfigError, Issue, MailAccount, SecretRef};
 use docsweep_core::index::{Index, IndexError, InvoiceRecord};
@@ -16,13 +16,16 @@ use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
 use docsweep_core::portal::driver::{ConfirmationAnswer, ConfirmationHandler, ConfirmationRequest};
 use docsweep_core::portal::engine::{FetchReport, FetchSummary, summarize_fetches};
 use docsweep_core::review;
+use docsweep_core::schedule::Schedule;
 use docsweep_core::secrets::{KeyringStore, SecretStore, SecretString};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 use tokio::sync::oneshot;
 
+use crate::automation::AutomationStatus;
 use crate::{AppState, BUNDLE_ID};
 
 const MAX_INVOICES: u32 = 1000;
@@ -248,30 +251,17 @@ pub struct ScanResult {
     warning: Option<String>,
 }
 
-/// Clears the running flag even if the scan ends early.
-struct ScanGuard<'a>(&'a std::sync::atomic::AtomicBool);
-
-impl Drop for ScanGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
 #[tauri::command]
 pub async fn run_scan(
     app: AppHandle,
     state: State<'_, AppState>,
     dry_run: bool,
 ) -> Result<ScanResult, UiError> {
-    if state.scanning.swap(true, Ordering::SeqCst) {
+    let Some(_permit) = state.scanning.try_start() else {
         return Err(UiError::new(ALREADY_RUNNING));
-    }
-    let _guard = ScanGuard(&state.scanning);
-    let paths = state.paths.clone();
-    let mut handler = GuiConfirmation {
-        slot: Arc::clone(&state.confirmation),
-        app,
     };
+    let paths = state.paths.clone();
+    let mut handler = GuiConfirmation::new(app, &state.confirmation);
     blocking(move || {
         if dry_run {
             preview(&paths, &KeyringStore)
@@ -299,15 +289,11 @@ pub async fn run_fetch(
     dry_run: bool,
     visible: bool,
 ) -> Result<FetchResult, UiError> {
-    if state.scanning.swap(true, Ordering::SeqCst) {
+    let Some(_permit) = state.scanning.try_start() else {
         return Err(UiError::new(ALREADY_RUNNING));
-    }
-    let _guard = ScanGuard(&state.scanning);
-    let paths = state.paths.clone();
-    let mut handler = GuiConfirmation {
-        slot: Arc::clone(&state.confirmation),
-        app,
     };
+    let paths = state.paths.clone();
+    let mut handler = GuiConfirmation::new(app, &state.confirmation);
     let window = if visible {
         WindowMode::Visible
     } else {
@@ -396,9 +382,18 @@ impl ConfirmationSlot {
 
 /// Asks through a dialog in the window: an event opens it, and the command
 /// [`answer_confirmation`] brings the answer back.
-struct GuiConfirmation {
+pub struct GuiConfirmation {
     slot: Arc<ConfirmationSlot>,
     app: AppHandle,
+}
+
+impl GuiConfirmation {
+    pub fn new(app: AppHandle, slot: &Arc<ConfirmationSlot>) -> Self {
+        Self {
+            slot: Arc::clone(slot),
+            app,
+        }
+    }
 }
 
 impl ConfirmationHandler for GuiConfirmation {
@@ -483,7 +478,7 @@ fn scan<H: ConfirmationHandler>(
 
 /// Adds a scan to the history: mailboxes and portal downloads in one list, which
 /// the interface tells apart by their fields.
-fn record_scan(paths: &Paths, report: &ScanReport, automatic: bool) -> Result<(), String> {
+pub fn record_scan(paths: &Paths, report: &ScanReport, automatic: bool) -> Result<(), String> {
     let values = report
         .accounts
         .iter()
@@ -525,6 +520,7 @@ fn invoices(path: &Path) -> Result<Vec<InvoiceRecord>, UiError> {
 pub struct RunView {
     id: i64,
     finished_at: String,
+    automatic: bool,
     summary: Value,
     reports: Value,
 }
@@ -545,6 +541,7 @@ fn runs(path: &Path) -> Result<Vec<RunView>, UiError> {
         .map(|run| RunView {
             id: run.id,
             finished_at: run.finished_at,
+            automatic: run.automatic,
             summary: serde_json::from_str(&run.summary).unwrap_or(Value::Null),
             reports: serde_json::from_str(&run.report).unwrap_or(Value::Null),
         })
@@ -598,6 +595,55 @@ pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, UiError> {
     .await
 }
 
+/// Whether an automatic run is active right now.
+#[tauri::command]
+pub fn automation_status(state: State<'_, AppState>) -> AutomationStatus {
+    AutomationStatus {
+        running: state.automatic_run.load(Ordering::SeqCst),
+    }
+}
+
+/// When a schedule next comes up, or what is wrong with it.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ScheduleView {
+    next_run: Option<String>,
+    error: Option<String>,
+}
+
+fn schedule_view<Tz: TimeZone>(expression: &str, now: &DateTime<Tz>) -> ScheduleView {
+    match Schedule::parse(expression) {
+        Ok(schedule) => ScheduleView {
+            next_run: schedule.next_after(now).map(|next| next.to_rfc3339()),
+            error: None,
+        },
+        Err(error) => ScheduleView {
+            next_run: None,
+            error: Some(error),
+        },
+    }
+}
+
+#[tauri::command]
+pub fn describe_schedule(expression: String) -> ScheduleView {
+    schedule_view(&expression, &Local::now())
+}
+
+/// Whether Docsweep starts at login. The system knows that, not the configuration.
+#[tauri::command]
+pub fn autostart_enabled(app: AppHandle) -> Result<bool, UiError> {
+    app.autolaunch().is_enabled().map_err(UiError::new)
+}
+
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), UiError> {
+    let autostart = app.autolaunch();
+    if enabled {
+        autostart.enable().map_err(UiError::new)
+    } else {
+        autostart.disable().map_err(UiError::new)
+    }
+}
+
 /// Runs blocking work off the main thread. SQLite connections and parsers are
 /// not `Sync`, so the scan keeps to one thread with its own small runtime.
 async fn blocking<T, F>(work: F) -> Result<T, UiError>
@@ -610,7 +656,7 @@ where
         .map_err(UiError::new)?
 }
 
-fn current_thread_runtime() -> Result<tokio::runtime::Runtime, UiError> {
+pub fn current_thread_runtime() -> Result<tokio::runtime::Runtime, UiError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -727,6 +773,48 @@ mail:
         let dir = tempfile::tempdir().unwrap();
         let error = preview(&paths(dir.path()), &MemoryStore::default()).unwrap_err();
         assert!(error.message.contains("docsweep.yaml"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_schedule_is_described_by_its_next_run_or_its_problem() {
+        let now = DateTime::parse_from_rfc3339("2026-11-06T12:00:00+01:00").unwrap();
+
+        let valid = schedule_view("0 9 10 * *", &now);
+        assert_eq!(valid.next_run.as_deref(), Some("2026-11-10T09:00:00+01:00"));
+        assert_eq!(valid.error, None);
+
+        let invalid = schedule_view("every day", &now);
+        assert_eq!(invalid.next_run, None);
+        assert!(invalid.error.unwrap().contains("five fields"));
+    }
+
+    #[test]
+    fn an_automatic_scan_is_marked_in_the_history_with_its_portal_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, WITH_PORTAL).unwrap();
+        let config = Config::load(&paths.config).unwrap();
+        let report = ScanReport {
+            accounts: vec![AccountReport {
+                account_id: "main".into(),
+                mails: Vec::new(),
+                error: None,
+            }],
+            fetches: vec![FetchReport::failed(
+                &config.companies[0],
+                "nobody answered in time".into(),
+            )],
+        };
+
+        record_scan(&paths, &report, true).unwrap();
+        record_scan(&paths, &ScanReport::default(), false).unwrap();
+
+        let history = runs(&paths.index).unwrap();
+        assert!(!history[0].automatic);
+        assert!(history[1].automatic);
+        assert_eq!(history[1].summary["failed"], 1);
+        assert_eq!(history[1].reports[0]["account_id"], "main");
+        assert_eq!(history[1].reports[1]["company_id"], "acme");
     }
 
     #[test]

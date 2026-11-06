@@ -72,6 +72,19 @@ mod tests {
     }
 
     #[test]
+    fn the_keys_of_the_tray_exist() {
+        for key in [
+            "tray.status_none",
+            "tray.status_running",
+            "tray.status_error",
+            "tray.status_last_ok",
+            "tray.status_last_failed",
+        ] {
+            assert!(ENGLISH.contains_key(key), "{key}");
+        }
+    }
+
+    #[test]
     fn unknown_keys_fall_back_to_the_key() {
         assert_eq!(text("does.not.exist"), "does.not.exist");
         assert_eq!(text("tray.open"), "Open Docsweep");

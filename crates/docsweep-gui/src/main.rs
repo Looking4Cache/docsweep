@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod automation;
 mod commands;
 mod i18n;
 mod tray;
@@ -10,18 +11,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use docsweep_core::automation::RunGate;
 use docsweep_core::names;
 use docsweep_core::paths::AppDirs;
 use tauri::{Manager, WindowEvent};
+use tauri_plugin_autostart::MacosLauncher;
 
 /// Bundle ID, read from `tauri.conf.json` by the build script.
 const BUNDLE_ID: &str = env!("DOCSWEEP_BUNDLE_ID");
 
+/// With this argument the app starts in the tray; a start at login passes it.
+const START_HIDDEN: &str = "--hidden";
+
 /// What all commands share.
 pub struct AppState {
     pub paths: commands::Paths,
-    /// Set while a scan runs, so that two scans never touch a mailbox at once.
-    pub scanning: AtomicBool,
+    /// Held by whatever runs, so that two runs never touch a mailbox or a portal
+    /// at once: scans, previews, fetches by hand and automatic runs.
+    pub scanning: RunGate,
+    /// Set while the run holding the gate is an automatic one.
+    pub automatic_run: AtomicBool,
     /// The question to a person that a portal fetch is waiting on.
     pub confirmation: Arc<commands::ConfirmationSlot>,
 }
@@ -42,9 +51,16 @@ fn main() {
     let paths = resolve_paths().expect("Docsweep needs a home directory");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // Only ever driven by the app's own commands, so the web view gets no
+        // permission for it.
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![START_HIDDEN]),
+        ))
         .manage(AppState {
             paths,
-            scanning: AtomicBool::new(false),
+            scanning: RunGate::default(),
+            automatic_run: AtomicBool::new(false),
             confirmation: Arc::default(),
         })
         .invoke_handler(tauri::generate_handler![
@@ -62,6 +78,10 @@ fn main() {
             commands::complete_review,
             commands::reveal_invoice,
             commands::pick_folder,
+            commands::automation_status,
+            commands::describe_schedule,
+            commands::autostart_enabled,
+            commands::set_autostart,
         ])
         .setup(|app| {
             // Without a tray there would be no way back to a hidden window, so
@@ -78,10 +98,14 @@ fn main() {
                                 }
                             }
                         });
+                        if std::env::args().any(|argument| argument == START_HIDDEN) {
+                            let _ = window.hide();
+                        }
                     }
                 }
                 Err(error) => eprintln!("no tray available: {error}"),
             }
+            automation::start(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!())
