@@ -324,7 +324,10 @@ impl ImapWriter {
             .try_collect()
             .await
             .map_err(|cause| error("cannot list folders", cause))?;
-        if existing.is_empty() {
+        if !existing
+            .iter()
+            .any(|name| can_hold_mails(name.attributes()))
+        {
             self.connection
                 .session
                 .create(encoded)
@@ -441,6 +444,17 @@ impl MailWriter for ImapWriter {
     }
 }
 
+/// Whether a listed folder really exists as a folder. Servers also list mere
+/// parents of nested folders, marked `\\Noselect` or `\\NonExistent`; a mail cannot
+/// be moved there until the folder is created.
+fn can_hold_mails(attributes: &[NameAttribute<'_>]) -> bool {
+    !attributes.iter().any(|attribute| match attribute {
+        NameAttribute::NoSelect => true,
+        NameAttribute::Extension(name) => name.eq_ignore_ascii_case("\\NonExistent"),
+        _ => false,
+    })
+}
+
 /// Converts a configured folder (levels separated by `/`) for the wire: the
 /// server's separator and modified UTF-7 for non-ASCII names.
 fn encode_folder(folder: &str, delimiter: &str) -> String {
@@ -473,6 +487,16 @@ mod tests {
                 TransportSecurity::PlainForTests
             );
         }
+    }
+
+    #[test]
+    fn mere_parent_folders_do_not_count_as_existing() {
+        assert!(can_hold_mails(&[]));
+        assert!(can_hold_mails(&[NameAttribute::Trash]));
+        assert!(!can_hold_mails(&[NameAttribute::NoSelect]));
+        assert!(!can_hold_mails(&[NameAttribute::Extension(
+            "\\NonExistent".into()
+        )]));
     }
 
     #[test]

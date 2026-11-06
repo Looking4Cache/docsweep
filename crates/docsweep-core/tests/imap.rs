@@ -318,6 +318,25 @@ async fn move_creates_nested_folders_on_any_separator() {
 
 #[tokio::test]
 #[ignore = "needs GreenMail, see scripts/imap-tests.sh"]
+async fn move_works_into_a_folder_that_so_far_is_only_a_parent() {
+    let mut inspector = Inspector::reset().await;
+    inspector.add(&plain_mail("1@x")).await;
+    inspector.add(&plain_mail("2@x")).await;
+
+    let mut writable = writer("INBOX").await;
+    let headers = writable.list_headers().await.unwrap();
+    writable
+        .move_to(headers[0].0, "Parent/Child")
+        .await
+        .unwrap();
+    writable.move_to(headers[1].0, "Parent").await.unwrap();
+    writable.logout().await;
+
+    assert_eq!(inspector.count("INBOX").await, 0);
+}
+
+#[tokio::test]
+#[ignore = "needs GreenMail, see scripts/imap-tests.sh"]
 async fn flagging_affects_only_the_given_mail() {
     let mut inspector = Inspector::reset().await;
     inspector.add(&plain_mail("1@x")).await;
