@@ -109,6 +109,11 @@ impl ChromeDriver {
         })
     }
 
+    /// The open page, for the recorder.
+    pub(crate) fn page(&self) -> &Page {
+        &self.page
+    }
+
     /// Ends the browser so that its profile is saved and free again.
     pub async fn close(mut self) {
         self.shut_down().await;

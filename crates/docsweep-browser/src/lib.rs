@@ -7,6 +7,7 @@
 //! well, because portal pages are untrusted, and invalid certificates are refused.
 
 mod chrome;
+mod recorder;
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,9 @@ use docsweep_core::ai::provider;
 use docsweep_core::config::{Company, Config};
 use docsweep_core::index::Index;
 use docsweep_core::paths::AppDirs;
-use docsweep_core::portal::driver::{ConfirmationHandler, PortalFetcher};
+use docsweep_core::portal::driver::{
+    BrowserDriver, ConfirmationHandler, DriverError, PortalFetcher,
+};
 use docsweep_core::portal::engine::{
     FetchError, FetchJob, FetchReport, RecipeNotice, RepairSetup, run_recipe,
 };
@@ -24,6 +27,7 @@ use docsweep_core::portal::recipe_path;
 use docsweep_core::secrets::SecretStore;
 
 pub use chrome::{ChromeDriver, ChromeOptions, WindowMode};
+pub use recorder::Recorder;
 
 /// The files a fetch works with.
 #[derive(Debug, Clone)]
@@ -142,6 +146,39 @@ pub async fn fetch_company<H: ConfirmationHandler>(
         });
     }
     report
+}
+
+/// A page as a browser with this profile sees it, without typing anything. The
+/// `html` is untrusted and must go through `ai::sanitize`.
+#[derive(Debug, Clone)]
+pub struct PageSnapshot {
+    pub address: String,
+    pub html: String,
+}
+
+/// How long a page gets to build itself after it has loaded.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Opens one address without a window and reads what it shows. This logs nobody
+/// in, so a page behind a login shows its login form. A saved session may open the
+/// page itself.
+pub async fn read_page(profile_dir: &Path, address: &str) -> Result<PageSnapshot, DriverError> {
+    let mut driver = ChromeDriver::launch(ChromeOptions {
+        profile_dir: profile_dir.to_path_buf(),
+        window: WindowMode::Hidden,
+    })
+    .await?;
+    let read = async {
+        driver.goto(address).await?;
+        tokio::time::sleep(SETTLE).await;
+        Ok(PageSnapshot {
+            address: driver.current_url().await?,
+            html: driver.page_html().await?,
+        })
+    }
+    .await;
+    driver.close().await;
+    read
 }
 
 /// Real portal downloads with the standard locations, for link mails and the

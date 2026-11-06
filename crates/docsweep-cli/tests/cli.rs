@@ -207,3 +207,79 @@ fn help_lists_the_commands() {
     assert!(stdout.contains("fetch"), "{stdout}");
     assert!(stdout.contains("test-recipe"), "{stdout}");
 }
+
+const WITH_COMPANY: &str = r#"
+mail:
+  accounts:
+    - { id: a, imap: "i.example:993", user: u, password: "keyring:a", watch: INBOX }
+  disposal: { mode: all_delete }
+companies:
+  - id: acme
+    name: Acme
+    mail: { from_domain: acme.example }
+    output: { dir: invoices, filename: "{invoice_no}.pdf" }
+"#;
+
+#[test]
+fn generating_a_recipe_without_a_provider_is_explained_and_sends_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("docsweep.yaml");
+    fs::write(&path, WITH_COMPANY).unwrap();
+    let config = path.to_str().unwrap();
+
+    let output = docsweep(
+        home.path(),
+        &[
+            "recipe",
+            "generate",
+            "acme",
+            "--url",
+            "https://portal.test/",
+            "--config",
+            config,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("no AI provider is configured"), "{stderr}");
+}
+
+#[test]
+fn recipe_commands_refuse_other_addresses_and_unknown_companies() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("docsweep.yaml");
+    fs::write(&path, WITH_COMPANY).unwrap();
+    let config = path.to_str().unwrap();
+
+    for command in ["generate", "record"] {
+        let output = docsweep(
+            home.path(),
+            &[
+                "recipe",
+                command,
+                "acme",
+                "--url",
+                "file:///etc/passwd",
+                "--config",
+                config,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("`http` or `https`"), "{stderr}");
+
+        let output = docsweep(
+            home.path(),
+            &[
+                "recipe",
+                command,
+                "nobody",
+                "--url",
+                "https://portal.test/",
+                "--config",
+                config,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("no company `nobody`"), "{stderr}");
+    }
+}

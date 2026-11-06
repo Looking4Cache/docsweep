@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use docsweep_browser::{
-    BrowserFetcher, ChromeDriver, ChromeOptions, FetchOptions, FetchPaths, WindowMode,
-    fetch_company,
+    BrowserFetcher, ChromeDriver, ChromeOptions, FetchOptions, FetchPaths, Recorder, WindowMode,
+    fetch_company, read_page,
 };
 use docsweep_core::ai::provider::{Ai, Anthropic};
 use docsweep_core::ai::test_support::FakeProviderServer;
@@ -30,6 +30,7 @@ use docsweep_core::mail::plan::PlanContext;
 use docsweep_core::mail::rules::RuleSet;
 use docsweep_core::mail::{MailError, MailReader, MailWriter};
 use docsweep_core::paths::AppDirs;
+use docsweep_core::portal::draft::draft_text;
 use docsweep_core::portal::driver::{
     AiSendRequest, BrowserDriver, ConfirmationAnswer, ConfirmationHandler, ConfirmationReason,
     ConfirmationRequest,
@@ -37,7 +38,8 @@ use docsweep_core::portal::driver::{
 use docsweep_core::portal::engine::{
     EntryOutcome, FetchJob, FetchReport, RecipeNotice, RepairSetup, run_recipe, summarize_fetches,
 };
-use docsweep_core::portal::recipe::Recipe;
+use docsweep_core::portal::recipe::{Recipe, Step};
+use docsweep_core::portal::recording::build_draft;
 use docsweep_core::secrets::{MemoryStore, SecretStore, SecretString};
 
 const USER: &str = "fictional-user@portal.test";
@@ -947,6 +949,135 @@ fn a_stale_login_is_repaired_by_a_fake_provider_and_the_real_browser_replays_it(
     let again = world.fetch(false, &mut NobodyThere);
     assert_eq!(again.error, None, "{again:?}");
     assert_eq!(server.requests().len(), 1);
+}
+
+/// Waits for a page of the fictional portal, as a person would.
+async fn wait_for(driver: &mut ChromeDriver, selector: &str) {
+    for _ in 0..50 {
+        if driver.is_visible(selector).await.unwrap_or(false) {
+            // Gives the events of what happened before this time to arrive.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{selector} did not appear");
+}
+
+#[test]
+#[ignore = "needs Chrome; run scripts/browser-tests.sh"]
+fn the_recorder_turns_a_session_into_a_draft_without_any_typed_value() {
+    let world = World::new(LOGIN_RECIPE);
+    let start = format!(
+        "{}/login?session=fictional-session-value#top",
+        world.portal.base
+    );
+    let code = totp_rs::Builder::new()
+        .with_secret(totp_rs::Secret::try_from_base32(TOTP_KEY).unwrap())
+        .build_noncompliant()
+        .generate_current()
+        .to_string();
+
+    let events = block_on(async {
+        let mut recorder = Recorder::start(
+            ChromeOptions {
+                profile_dir: world.paths().profile_dir,
+                window: WindowMode::Hidden,
+            },
+            &start,
+        )
+        .await
+        .unwrap();
+        // The test plays the person: it types and clicks in the same page.
+        let driver = recorder.driver();
+        wait_for(driver, "#username").await;
+        driver
+            .fill("#username", &SecretString::from(USER))
+            .await
+            .unwrap();
+        driver
+            .fill("#password", &SecretString::from(PASSWORD))
+            .await
+            .unwrap();
+        driver.click("button[type=submit]").await.unwrap();
+        wait_for(driver, "#otp").await;
+        driver
+            .fill("#otp", &SecretString::from(code.clone()))
+            .await
+            .unwrap();
+        driver.click("button[type=submit]").await.unwrap();
+        wait_for(driver, "a.download").await;
+        driver.click("a.download").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        recorder.finish().await
+    });
+
+    let draft = build_draft(&start, &events).unwrap();
+    let text = draft_text("recorded in the browser", &draft.notes, &draft.recipe).unwrap();
+
+    // Nothing that was typed, in the events or the file. The events' debug form
+    // counts all their fields.
+    let raw_events = format!("{events:?}");
+    for typed in [
+        USER,
+        PASSWORD,
+        code.as_str(),
+        "fictional-session-value",
+        "session=valid",
+    ] {
+        assert!(!text.contains(typed), "{typed} in the draft:\n{text}");
+        if typed != "fictional-session-value" {
+            assert!(!raw_events.contains(typed), "{typed} in {raw_events}");
+        }
+    }
+
+    let login = draft.recipe.login().unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(login.user, "#username", "{text}");
+    assert_eq!(login.password, "#password", "{text}");
+    assert_eq!(login.totp.as_deref(), Some("#otp"), "{text}");
+    assert!(login.submit.contains("submit"), "{text}");
+    let list = draft
+        .recipe
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            Step::ExtractList(list) => Some(list),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(list.rows, "table.invoices tbody tr", "{text}");
+    assert_eq!(list.fields["url"], "a.download@href", "{text}");
+    assert_eq!(list.fields["date"], "td:nth-child(1)", "{text}");
+    assert_eq!(list.fields["invoice_no"], "td:nth-child(2)", "{text}");
+    assert_eq!(list.fields["amount"], "td:nth-child(3)", "{text}");
+    Recipe::from_yaml(&text).unwrap_or_else(|error| panic!("{error}\n{text}"));
+
+    // The draft runs after the one edit its notes ask for: with the session from
+    // recording, it finds the invoices.
+    assert!(text.contains("add `logged_in`"), "{text}");
+    let edited = text.replace(
+        "totp: \"#otp\"",
+        "totp: \"#otp\"\n    logged_in: \"#logout\"",
+    );
+    let with_param = format!("params: {{ base: unused }}\n{edited}");
+    fs::write(world.dir.path().join("recipe.yaml"), with_param).unwrap();
+    let report = world.fetch(true, &mut NobodyThere);
+    assert_eq!(report.error, None, "{report:?}\n{text}");
+    assert_eq!(report.entries.len(), 3, "{report:?}");
+}
+
+#[test]
+#[ignore = "needs Chrome; run scripts/browser-tests.sh"]
+fn read_page_shows_the_login_form_and_types_nothing() {
+    let world = World::new(LOGIN_RECIPE);
+    let page = block_on(read_page(
+        &world.paths().profile_dir,
+        &format!("{}/login", world.portal.base),
+    ))
+    .unwrap();
+    assert!(page.html.contains("username"));
+    assert!(page.address.ends_with("/login"));
+    assert_eq!(world.portal.count("POST /login"), 0);
 }
 
 /// Opens a window, so it only runs with `scripts/browser-tests.sh --visible`.

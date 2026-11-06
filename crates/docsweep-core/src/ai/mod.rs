@@ -4,6 +4,7 @@
 //! What leaves the computer is built by [`sanitize`], and what comes back is
 //! untrusted: it is only parsed into the typed recipe model and validated.
 
+pub mod generate;
 pub mod output;
 pub mod prompts;
 pub mod provider;

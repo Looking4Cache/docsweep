@@ -10,6 +10,7 @@ pub mod driver;
 pub mod engine;
 pub mod hosts;
 pub mod recipe;
+pub mod recording;
 
 use std::path::{Component, Path, PathBuf};
 
