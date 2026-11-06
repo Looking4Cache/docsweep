@@ -7,6 +7,7 @@ import { renderHistory } from "./views/history.js";
 import { renderInvoices } from "./views/invoices.js";
 import { renderMailboxes } from "./views/mailboxes.js";
 import { renderScan } from "./views/scan.js";
+import { renderSettings } from "./views/settings.js";
 import { renderBrokenConfig, renderSetup } from "./views/setup.js";
 
 const VIEWS = {
@@ -15,6 +16,7 @@ const VIEWS = {
   companies: renderCompanies,
   mailboxes: renderMailboxes,
   history: renderHistory,
+  settings: renderSettings,
 };
 
 const root = document.getElementById("app");
@@ -90,6 +92,8 @@ async function start() {
     return;
   }
   info = state.info;
+  app.info = state.info;
+  app.configPath = state.config_path;
   app.passwords = new Map(state.stored_passwords);
 
   onTrayPreview(() => {

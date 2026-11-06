@@ -3,7 +3,7 @@
 import { api, errorText } from "../lib/api.js";
 import { h, mark, replace } from "../lib/dom.js";
 import { t } from "../lib/i18n.js";
-import { notice, showIssues, withBusy } from "../lib/ui.js";
+import { field, folderInput, notice, showIssues, withBusy } from "../lib/ui.js";
 import { cleanupForm, mailboxForm } from "./mailboxes.js";
 
 function idFor(user) {
@@ -14,8 +14,17 @@ export function renderSetup(app) {
   const form = mailboxForm({ account: { imap: "", user: "", watch: "INBOX" }, passwordStored: false, pathPrefix: "mail.accounts[0]." });
   const disposal = { mode: "pdf_move_link_delete", move_to: "Invoices/Done", delete_to_trash: true };
   const cleanup = cleanupForm(disposal);
+  let outputDir = "~/Invoices";
   const message = h("div", {});
   const container = h("div", {}, form.element, h("hr", { class: "divider" }),
+    h("h2", { class: "setup-subtitle" }, t("settings.folder.title")),
+    field({
+      label: t("settings.folder.label"),
+      hint: t("settings.folder.hint"),
+      path: "defaults.output_dir",
+      input: folderInput({ value: outputDir, onChange: (value) => { outputDir = value; } }),
+    }),
+    h("hr", { class: "divider" }),
     h("h2", { class: "setup-subtitle" }, t("cleanup.title")), cleanup);
 
   const submit = h("button", {
@@ -33,6 +42,7 @@ export function renderSetup(app) {
       const next = { ...disposal };
       if (next.mode === "all_delete" || !next.move_to) delete next.move_to;
       const config = {
+        defaults: { output_dir: outputDir.trim() },
         mail: { accounts: [{ id, ...values, password: `keyring:${secretId}` }], disposal: next },
         companies: [],
       };

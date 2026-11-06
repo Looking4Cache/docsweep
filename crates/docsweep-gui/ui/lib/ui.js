@@ -1,5 +1,6 @@
 // Shared building blocks: fields, dialogs, messages.
 
+import { api } from "./api.js";
 import { h, icon, replace } from "./dom.js";
 import { t } from "./i18n.js";
 
@@ -33,6 +34,29 @@ export function field({ label, hint, path, input, optional }) {
     error,
   );
   return wrapper;
+}
+
+// A path field with the system's folder dialog next to it.
+export function folderInput({ value, placeholder, onChange }) {
+  const input = textInput({
+    value: value ?? "",
+    placeholder,
+    class: "mono",
+    oninput: () => onChange?.(input.value),
+  });
+  return h("div", { class: "input-with-button" }, input,
+    h("button", {
+      class: "button",
+      onclick: async (event) => {
+        // The surrounding <label> must not refocus the text field.
+        event.preventDefault();
+        const picked = await api.pickFolder();
+        if (picked) {
+          input.value = picked;
+          onChange?.(picked);
+        }
+      },
+    }, icon("folder"), t("common.browse")));
 }
 
 export function textInput(props) {

@@ -243,44 +243,12 @@ export function renderMailboxes(app) {
     );
   }
 
-  function cleanupCard() {
-    const disposal = { ...app.config.mail.disposal };
-    const message = h("div", {});
-    const form = cleanupForm(disposal);
-    const saveButton = h("button", {
-      class: "button button-primary",
-      onclick: () => withBusy(saveButton, null, async () => {
-        const next = { ...disposal };
-        if (!next.move_to) delete next.move_to;
-        try {
-          await persist({ ...app.config.mail, disposal: next });
-          replace(message);
-          showIssues(form, []);
-          toast(t("common.saved"));
-        } catch (error) {
-          const unplaced = showIssues(form, error?.issues ?? []);
-          const rest = error?.issues?.length ? unplaced.join(" ") : errorText(error);
-          replace(message, rest && notice("danger", rest));
-        }
-      }),
-    }, t("common.save"));
-    return h("article", { class: "card" },
-      h("header", { class: "card-header card-header-stacked" },
-        h("h2", { class: "card-heading" }, t("cleanup.title")),
-        h("p", { class: "card-lead" }, t("cleanup.lead"))),
-      form,
-      message,
-      h("div", { class: "form-actions" }, h("span", { class: "spacer" }), saveButton),
-    );
-  }
-
   function paint() {
     replace(root,
       pageHeader(t("mailbox.title"), t("mailbox.lead"),
         !adding && h("button", { class: "button", onclick: () => { adding = true; paint(); } }, icon("plus"), t("mailbox.add"))),
       adding && newAccountCard(),
       app.config.mail.accounts.map(accountCard),
-      cleanupCard(),
     );
   }
 

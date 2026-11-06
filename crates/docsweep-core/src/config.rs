@@ -20,12 +20,30 @@ use crate::naming::FilenameTemplate;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Settings that apply unless a company says otherwise.
+    #[serde(default, skip_serializing_if = "Defaults::is_empty")]
+    pub defaults: Defaults,
     pub mail: MailConfig,
     /// Optional AI provider; unused until the AI milestone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmConfig>,
     #[serde(default)]
     pub companies: Vec<Company>,
+}
+
+/// The `defaults` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Defaults {
+    /// Folder for invoices of companies without their own `output.dir`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
+}
+
+impl Defaults {
+    fn is_empty(&self) -> bool {
+        self.output_dir.is_none()
+    }
 }
 
 /// The `mail` section.
@@ -144,16 +162,10 @@ pub struct Portal {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Output {
-    pub dir: String,
+    /// Folder of this company; without it, `defaults.output_dir` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub filename: String,
-}
-
-impl Output {
-    /// The target directory with a leading `~` expanded.
-    pub fn resolved_dir(&self) -> PathBuf {
-        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
-        expand_home(&self.dir, home.as_deref())
-    }
 }
 
 fn expand_home(dir: &str, home: Option<&Path>) -> PathBuf {
@@ -276,6 +288,18 @@ impl Config {
         Self::parse(input, "the configuration")
     }
 
+    /// The folder for a company's invoices with a leading `~` expanded.
+    pub fn output_dir_of(&self, company: &Company) -> PathBuf {
+        let dir = company
+            .output
+            .dir
+            .as_deref()
+            .or(self.defaults.output_dir.as_deref())
+            .expect("validation requires a folder or a default folder");
+        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+        expand_home(dir, home.as_deref())
+    }
+
     /// Validates and writes the configuration atomically.
     ///
     /// Writing does not preserve YAML comments. The first time an existing file
@@ -332,6 +356,9 @@ impl Config {
     /// All validation problems of this configuration.
     pub fn validate(&self) -> Vec<Issue> {
         let mut report = Report::default();
+        if let Some(dir) = &self.defaults.output_dir {
+            report.not_blank("defaults.output_dir", dir);
+        }
         self.mail.validate(&mut report);
         if let Some(llm) = &self.llm {
             report.secret("llm.api_key", &llm.api_key);
@@ -341,7 +368,14 @@ impl Config {
             self.companies.iter().map(|company| company.id.as_str()),
         );
         for (i, company) in self.companies.iter().enumerate() {
-            company.validate(&format!("companies[{i}]"), &mut report);
+            let path = format!("companies[{i}]");
+            company.validate(&path, &mut report);
+            if company.output.dir.is_none() && self.defaults.output_dir.is_none() {
+                report.add(
+                    &format!("{path}.output.dir"),
+                    "needs a folder, because there is no default folder (`defaults.output_dir`)",
+                );
+            }
         }
         report.issues
     }
@@ -398,7 +432,9 @@ impl Company {
         if let Some(portal) = &self.portal {
             portal.validate(&format!("{path}.portal"), report);
         }
-        report.not_blank(&format!("{path}.output.dir"), &self.output.dir);
+        if let Some(dir) = &self.output.dir {
+            report.not_blank(&format!("{path}.output.dir"), dir);
+        }
         if let Err(problem) = FilenameTemplate::parse(&self.output.filename) {
             report.add(&format!("{path}.output.filename"), &problem);
         }
@@ -725,7 +761,10 @@ mail:
             ))
         };
         let config = Config::from_yaml(&company(r"'C:\Users\me\Invoices'")).unwrap();
-        assert_eq!(config.companies[0].output.dir, r"C:\Users\me\Invoices");
+        assert_eq!(
+            config.companies[0].output.dir.as_deref(),
+            Some(r"C:\Users\me\Invoices")
+        );
 
         let error = Config::from_yaml(&company(r#""C:\Users\me""#))
             .unwrap_err()
@@ -738,7 +777,7 @@ mail:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("docsweep.yaml");
         let mut config = Config::from_yaml(CONCEPT_EXAMPLE).unwrap();
-        config.companies[1].output.dir = r"C:\Users\me\Rechnungen".to_owned();
+        config.companies[1].output.dir = Some(r"C:\Users\me\Rechnungen".to_owned());
 
         config.save(&path).unwrap();
         let reloaded = Config::load(&path).unwrap();
@@ -748,7 +787,10 @@ mail:
             serde_saphyr::to_string(&config).unwrap()
         );
         let hetzner = &reloaded.companies[1];
-        assert_eq!(hetzner.output.dir, r"C:\Users\me\Rechnungen");
+        assert_eq!(
+            hetzner.output.dir.as_deref(),
+            Some(r"C:\Users\me\Rechnungen")
+        );
         assert_eq!(
             hetzner.mail.as_ref().unwrap().attachment.as_deref(),
             Some("(?i).*\\.pdf")
@@ -794,6 +836,65 @@ mail:
     #[test]
     fn secret_refs_can_be_built_from_an_id() {
         assert_eq!(SecretRef::from_id("mail").id(), Some("mail"));
+    }
+
+    fn company_without_folder() -> String {
+        company_yaml(
+            r#"{ id: x, name: X, mail: { from_domain: x.de }, output: { filename: "{invoice_no}.pdf" } }"#,
+        )
+    }
+
+    #[test]
+    fn a_company_without_folder_uses_the_default_folder() {
+        let yaml = format!(
+            "defaults: {{ output_dir: /all/invoices }}\n{}",
+            company_without_folder()
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            config.output_dir_of(&config.companies[0]),
+            Path::new("/all/invoices")
+        );
+    }
+
+    #[test]
+    fn a_company_folder_wins_over_the_default_folder() {
+        let yaml = format!(
+            "defaults: {{ output_dir: /all/invoices }}\n{}",
+            company_yaml(&format!(
+                "{{ id: x, name: X, mail: {{ from_domain: x.de }}, {VALID_OUTPUT} }}"
+            ))
+        );
+        let config = Config::from_yaml(&yaml).unwrap();
+        assert_eq!(
+            config.output_dir_of(&config.companies[0]),
+            Path::new("/tmp/x")
+        );
+    }
+
+    #[test]
+    fn without_any_folder_the_company_is_invalid() {
+        let issues = issues_of(&company_without_folder());
+        assert_eq!(issues[0].path, "companies[0].output.dir");
+        assert!(issues[0].message.contains("defaults.output_dir"));
+    }
+
+    #[test]
+    fn the_default_folder_survives_saving_and_is_left_out_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.yaml");
+        let plain = Config::from_yaml(MINIMAL_MAIL).unwrap();
+        plain.save(&path).unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("defaults"));
+
+        let yaml = format!(
+            "defaults: {{ output_dir: \"~/Invoices\" }}\n{}",
+            company_without_folder()
+        );
+        Config::from_yaml(&yaml).unwrap().save(&path).unwrap();
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.defaults.output_dir.as_deref(), Some("~/Invoices"));
+        assert_eq!(reloaded.companies[0].output.dir, None);
     }
 
     #[test]

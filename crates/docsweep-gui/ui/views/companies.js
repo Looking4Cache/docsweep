@@ -1,9 +1,32 @@
 import { api, errorText } from "../lib/api.js";
 import { h, icon, replace } from "../lib/dom.js";
 import { t } from "../lib/i18n.js";
-import { confirmDialog, emptyState, field, notice, pageHeader, showIssues, textInput, toast } from "../lib/ui.js";
+import { confirmDialog, emptyState, field, folderInput, notice, pageHeader, showIssues, textInput, toast } from "../lib/ui.js";
+
+const DRAFTS_KEY = "docsweep.company-drafts";
 
 const defaultFilename = (name) => `{date:%Y-%m-%d} - ${name || "Company"} - {invoice_no}.pdf`;
+
+// Unsaved work survives leaving the page, switching companies and restarts.
+// Drafts only hold what the form shows; secrets never pass through this form.
+function loadDrafts() {
+  try {
+    return JSON.parse(localStorage.getItem(DRAFTS_KEY)) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+const drafts = loadDrafts();
+let selectedKey = null;
+
+function saveDrafts() {
+  try {
+    localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
+  } catch {
+    // Without storage, drafts still last until the app quits.
+  }
+}
 
 function slug(name, taken) {
   const base = name
@@ -25,12 +48,14 @@ function previewName(template) {
 }
 
 function blankDraft(domain = "") {
+  const name = domain ? domain.split(".")[0].replace(/^./, (c) => c.toUpperCase()) : "";
   return {
+    key: `new:${Date.now()}`,
     isNew: true,
     id: "",
-    name: domain ? domain.split(".")[0].replace(/^./, (c) => c.toUpperCase()) : "",
+    name,
     mail: { from_domain: domain, subject: "", attachment: "" },
-    output: { dir: "~/Invoices", filename: "" },
+    output: { dir: "", filename: defaultFilename(name) },
     disposalChoice: "default",
     moveTo: "",
     hasPortal: false,
@@ -41,6 +66,7 @@ function blankDraft(domain = "") {
 function draftFrom(company) {
   const disposal = company.disposal;
   return {
+    key: company.id,
     isNew: false,
     id: company.id,
     name: company.name,
@@ -49,7 +75,7 @@ function draftFrom(company) {
       subject: company.mail?.subject ?? "",
       attachment: company.mail?.attachment ?? "",
     },
-    output: { ...company.output },
+    output: { dir: company.output.dir ?? "", filename: company.output.filename },
     disposalChoice: disposal === "delete" ? "delete" : disposal?.move_to ? "move" : "default",
     moveTo: disposal?.move_to ?? "",
     hasPortal: Boolean(company.portal),
@@ -59,11 +85,8 @@ function draftFrom(company) {
 }
 
 function companyFrom(draft, id) {
-  const company = {
-    id,
-    name: draft.name.trim(),
-    output: { dir: draft.output.dir.trim(), filename: draft.output.filename },
-  };
+  const company = { id, name: draft.name.trim(), output: { filename: draft.output.filename } };
+  if (draft.output.dir.trim()) company.output.dir = draft.output.dir.trim();
   if (draft.mail.from_domain.trim()) {
     company.mail = { from_domain: draft.mail.from_domain.trim() };
     if (draft.mail.subject) company.mail.subject = draft.mail.subject;
@@ -84,24 +107,63 @@ function companyFrom(draft, id) {
   return company;
 }
 
+// A new company counts as a draft once something was typed into it; an existing
+// one once it differs from what is saved.
+function hasContent(draft) {
+  if (draft.isNew) {
+    return Boolean(draft.name.trim() || draft.mail.from_domain.trim() || draft.mail.subject
+      || draft.mail.attachment || draft.output.dir.trim());
+  }
+  const saved = companyFrom(draftFrom(draft.original), draft.id);
+  return JSON.stringify(companyFrom(draft, draft.id)) !== JSON.stringify(saved);
+}
+
 export function renderCompanies(app, options = {}) {
   const root = h("div", { class: "page page-wide" });
-  let selectedId = null;
+  const listHost = h("aside", { class: "master" });
+  // The form being edited. A blank new company lives only here, not in `drafts`.
   let draft = null;
 
   const companies = () => app.config.companies;
 
-  function select(id) {
-    selectedId = id;
-    draft = draftFrom(companies().find((company) => company.id === id));
+  // Drafts of companies that no longer exist, or whose base changed on disk.
+  for (const [key, stored] of Object.entries(drafts)) {
+    if (stored.isNew) continue;
+    const company = companies().find((candidate) => candidate.id === stored.id);
+    if (company) stored.original = company;
+    else delete drafts[key];
+  }
+  saveDrafts();
+
+  function open(key) {
+    selectedKey = key;
+    draft = drafts[key] ?? null;
+    if (!draft) {
+      const company = companies().find((candidate) => candidate.id === key);
+      draft = company ? draftFrom(company) : null;
+    }
     paint();
   }
 
   function startNew(domain) {
-    selectedId = null;
     draft = blankDraft(domain);
-    draft.output.filename = defaultFilename(draft.name);
+    selectedKey = draft.key;
+    remember();
     paint();
+  }
+
+  // Called after every change in the form.
+  function remember() {
+    if (hasContent(draft)) drafts[draft.key] = draft;
+    else delete drafts[draft.key];
+    saveDrafts();
+    paintList();
+    discardButton.hidden = !drafts[draft.key];
+  }
+
+  function forget(key) {
+    delete drafts[key];
+    saveDrafts();
   }
 
   async function persist(nextCompanies) {
@@ -110,22 +172,62 @@ export function renderCompanies(app, options = {}) {
     app.setConfig(config);
   }
 
-  function listView() {
-    return h("aside", { class: "master" },
+  function paintList() {
+    const newDrafts = Object.values(drafts).filter((entry) => entry.isNew);
+    const showBlank = draft?.isNew && !drafts[draft.key];
+    const item = (key, name, meta, isDraft) => h("li", {},
+      h("button", {
+        class: `master-item${key === selectedKey ? " is-active" : ""}`,
+        onclick: () => open(key),
+      },
+        h("span", { class: "master-name" }, name),
+        meta && h("span", { class: `master-meta${isDraft ? " is-draft" : ""}` }, meta),
+      ));
+    replace(listHost,
       h("button", { class: "button button-block", onclick: () => startNew("") }, icon("plus"), t("companies.add")),
       h("ul", { class: "master-list" },
-        draft?.isNew && h("li", {}, h("button", { class: "master-item is-active" },
-          h("span", { class: "master-name" }, draft.name || t("companies.new")))),
-        companies().map((company) => h("li", {},
-          h("button", {
-            class: `master-item${company.id === selectedId ? " is-active" : ""}`,
-            onclick: () => select(company.id),
-          },
-            h("span", { class: "master-name" }, company.name),
-            h("span", { class: "master-meta" }, company.mail?.from_domain ?? t("companies.section.portal")),
-          ))),
-      ),
-    );
+        showBlank && item(draft.key, t("companies.new")),
+        newDrafts.map((entry) => item(entry.key, entry.name.trim() || t("companies.new"), t("companies.draft"), true)),
+        companies().map((company) => {
+          const changed = drafts[company.id];
+          return item(
+            company.id,
+            changed ? changed.name.trim() || company.name : company.name,
+            changed ? t("companies.unsaved") : company.mail?.from_domain ?? t("companies.section.portal"),
+            Boolean(changed),
+          );
+        }),
+      ));
+  }
+
+  // Lives outside the form, because `remember` toggles it while typing.
+  const discardButton = h("button", {
+    class: "button button-quiet",
+    onclick: async () => {
+      const confirmed = await confirmDialog({
+        title: t(draft.isNew ? "companies.discard_title" : "companies.discard_changes_title"),
+        text: t("companies.discard_text"),
+        confirmLabel: t(draft.isNew ? "companies.discard_draft" : "companies.discard_changes"),
+        danger: true,
+      });
+      if (!confirmed) return;
+      forget(draft.key);
+      if (draft.isNew) {
+        draft = null;
+        openFirst();
+      } else {
+        open(draft.key);
+      }
+    },
+  });
+
+  function openFirst() {
+    const first = Object.values(drafts).find((entry) => entry.isNew)?.key ?? companies()[0]?.id;
+    if (first) open(first);
+    else {
+      selectedKey = null;
+      paint();
+    }
   }
 
   function editorView() {
@@ -146,13 +248,13 @@ export function renderCompanies(app, options = {}) {
       const start = filename.selectionStart ?? filename.value.length;
       const end = filename.selectionEnd ?? start;
       filename.setRangeText(token, start, end, "end");
-      filename.dispatchEvent(new Event("input"));
+      filename.dispatchEvent(new Event("input", { bubbles: true }));
       filename.focus();
     };
 
     const nameInput = textInput({
       value: draft.name,
-      autofocus: draft.isNew,
+      autofocus: draft.isNew && !draft.name,
       oninput: (event) => {
         draft.name = event.target.value;
         if (draft.isNew && !draft.filenameEdited) {
@@ -163,10 +265,22 @@ export function renderCompanies(app, options = {}) {
       },
     });
 
-    const dirInput = textInput({
-      value: draft.output.dir,
-      class: "mono",
-      oninput: (event) => { draft.output.dir = event.target.value; },
+    const defaultFolder = app.config.defaults?.output_dir;
+    const dirField = field({
+      label: t("companies.field.dir"),
+      path: "output.dir",
+      optional: Boolean(defaultFolder),
+      hint: defaultFolder
+        ? t("companies.field.dir_default", { folder: defaultFolder })
+        : t("companies.field.dir_no_default"),
+      input: folderInput({
+        value: draft.output.dir,
+        placeholder: defaultFolder,
+        onChange: (value) => {
+          draft.output.dir = value;
+          remember();
+        },
+      }),
     });
 
     const moveField = field({
@@ -178,7 +292,6 @@ export function renderCompanies(app, options = {}) {
         oninput: (event) => { draft.moveTo = event.target.value; },
       }),
     });
-    moveField.hidden = draft.disposalChoice !== "move";
 
     const permanent = !app.config.mail.disposal.delete_to_trash;
     const disposalHint = h("p", { class: "field-hint" });
@@ -206,25 +319,29 @@ export function renderCompanies(app, options = {}) {
           event.currentTarget.classList.add("is-active");
           event.currentTarget.setAttribute("aria-checked", "true");
           refreshDisposal();
+          remember();
         },
       }, t(`companies.disposal.${choice}`))));
 
-    const scheduleRow = h("div", { hidden: !draft.hasPortal },
-      h("p", { class: "field-hint" }, t("companies.portal.note")));
+    const portalNote = h("p", { class: "field-hint", hidden: !draft.hasPortal }, t("companies.portal.note"));
     const portalToggle = h("label", { class: "check" },
       h("input", {
         type: "checkbox",
         checked: draft.hasPortal,
         onchange: (event) => {
           draft.hasPortal = event.target.checked;
-          scheduleRow.hidden = !draft.hasPortal;
+          portalNote.hidden = !draft.hasPortal;
         },
       }),
       h("span", {}, t("companies.portal.toggle")));
 
     const form = h("div", { class: "form" });
+    // Every field updates the draft first; this runs as the event bubbles up.
+    form.addEventListener("input", remember);
+    form.addEventListener("change", remember);
 
     async function save(button) {
+      const key = draft.key;
       const id = draft.isNew ? slug(draft.name, companies().map((c) => c.id)) : draft.id;
       const company = companyFrom(draft, id);
       const next = draft.isNew
@@ -234,8 +351,9 @@ export function renderCompanies(app, options = {}) {
       button.disabled = true;
       try {
         await persist(next);
+        forget(key);
         toast(t("common.saved"));
-        select(id);
+        open(id);
       } catch (error) {
         const prefix = `companies[${position}].`;
         const unplaced = showIssues(form, error?.issues ?? [], (path) =>
@@ -255,10 +373,11 @@ export function renderCompanies(app, options = {}) {
       });
       if (!confirmed) return;
       try {
+        const key = draft.key;
         await persist(companies().filter((company) => company.id !== draft.id));
-        selectedId = null;
+        forget(key);
         draft = null;
-        paint();
+        openFirst();
       } catch (error) {
         replace(message, notice("danger", errorText(error)));
       }
@@ -266,12 +385,14 @@ export function renderCompanies(app, options = {}) {
 
     const saveButton = h("button", { class: "button button-primary", onclick: () => save(saveButton) }, t("common.save"));
 
-    const mailInput = (key, extra) => textInput({
+    const mailInput = (key) => textInput({
       value: draft.mail[key],
       class: "mono",
       oninput: (event) => { draft.mail[key] = event.target.value; },
-      ...extra,
     });
+
+    discardButton.textContent = t(draft.isNew ? "companies.discard_draft" : "companies.discard_changes");
+    discardButton.hidden = !drafts[draft.key];
 
     replace(form,
       field({ label: t("companies.field.name"), path: "name", input: nameInput }),
@@ -288,22 +409,7 @@ export function renderCompanies(app, options = {}) {
 
       h("section", { class: "form-section" },
         h("h3", {}, t("companies.section.filing")),
-        field({
-          label: t("companies.field.dir"),
-          path: "output.dir",
-          input: h("div", { class: "input-with-button" }, dirInput,
-            h("button", {
-              class: "button",
-              onclick: async (event) => {
-                event.preventDefault();
-                const picked = await api.pickFolder();
-                if (picked) {
-                  dirInput.value = picked;
-                  draft.output.dir = picked;
-                }
-              },
-            }, icon("folder"), t("common.browse"))),
-        }),
+        dirField,
         h("div", { class: "field", "data-path": "output.filename" },
           h("span", { class: "field-label" }, t("companies.field.filename")),
           filename,
@@ -326,20 +432,14 @@ export function renderCompanies(app, options = {}) {
       h("section", { class: "form-section" },
         h("h3", {}, t("companies.section.portal")),
         portalToggle,
-        scheduleRow,
+        portalNote,
       ),
 
       message,
       h("div", { class: "form-actions" },
         !draft.isNew && h("button", { class: "button button-quiet-danger", onclick: remove }, t("common.delete")),
         h("span", { class: "spacer" }),
-        draft.isNew && h("button", {
-          class: "button",
-          onclick: () => {
-            draft = null;
-            paint();
-          },
-        }, t("common.cancel")),
+        discardButton,
         saveButton,
       ),
     );
@@ -347,22 +447,24 @@ export function renderCompanies(app, options = {}) {
   }
 
   function paint() {
-    if (companies().length === 0 && !draft) {
+    const hasDrafts = Object.keys(drafts).length > 0;
+    if (companies().length === 0 && !draft && !hasDrafts) {
       replace(root, pageHeader(t("companies.title"), t("companies.lead")),
         emptyState("companies", t("companies.empty_title"), t("companies.empty_lead"),
           h("button", { class: "button button-primary", onclick: () => startNew("") }, icon("plus"), t("companies.add"))));
       return;
     }
+    paintList();
     replace(root, pageHeader(t("companies.title"), t("companies.lead")),
       h("div", { class: "master-detail" },
-        listView(),
+        listHost,
         draft ? editorView() : h("section", { class: "detail detail-empty" }, h("p", {}, t("companies.select"))),
       ));
   }
 
   if (options.draftDomain !== undefined) startNew(options.draftDomain);
   else if (options.create) startNew("");
-  else if (companies().length > 0) select(companies()[0].id);
-  else paint();
+  else if (selectedKey && (drafts[selectedKey] || companies().some((c) => c.id === selectedKey))) open(selectedKey);
+  else openFirst();
   return root;
 }

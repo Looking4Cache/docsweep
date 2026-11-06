@@ -56,6 +56,8 @@ cargo install tauri-cli --locked      # once, for bundling
 - A `needs_review` document is completed in the GUI (`review::complete_review`). The next scan then recognises the file as stored and cleans up its mail.
 - The interface never receives a secret: commands only accept them and report whether one exists. Text from mails and PDFs is untrusted, so `ui/lib/dom.js` only creates text nodes; never assign HTML strings.
 - The web view has only `core:default`. File, mail and keychain access goes through the app's own commands, and those take index ids rather than paths.
+- `defaults.output_dir` is the folder for companies without their own `output.dir`; settings that apply to everything belong on the Settings page.
+- Unsaved company forms are kept as drafts in the web view's `localStorage`. Never put secrets into anything stored there.
 - Core error messages are English for now; they need keys before the German translation.
 - Pin GitHub Actions to commit SHAs.
 

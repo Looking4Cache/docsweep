@@ -293,7 +293,7 @@ fn plan_document(
         .clone()
         .unwrap_or_else(|| format!("unbekannt-{}", &hash[..UNKNOWN_NUMBER_HASH_CHARS]));
     let file_name = template.render(date, &number);
-    let target_dir = company.output.resolved_dir();
+    let target_dir = context.config.output_dir_of(company);
     let target_path = storage::free_path(&target_dir, &file_name)?;
 
     Ok(PlannedDocument {

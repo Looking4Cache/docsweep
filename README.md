@@ -40,6 +40,9 @@ Create the configuration file, or point `DOCSWEEP_CONFIG` or `--config` at it:
 | Linux | `~/.config/docsweep/docsweep.yaml` |
 
 ```yaml
+defaults:
+  output_dir: ~/Invoices/Inbox   # for companies without their own folder
+
 mail:
   accounts:
     - id: invoices
@@ -57,7 +60,6 @@ companies:
     name: Hetzner
     mail: { from_domain: hetzner.com, attachment: "(?i).*\\.pdf" }
     output:
-      dir: ~/Invoices/Inbox
       filename: "{date:%Y-%m-%d} - Hetzner - {invoice_no}.pdf"
     disposal: { move_to: Invoices/Hetzner }
 ```

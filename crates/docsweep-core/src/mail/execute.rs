@@ -586,7 +586,7 @@ companies:
         let blocked = setup.dir.path().join("blocked");
         fs::write(&blocked, b"x").unwrap();
         let mut config = setup.config.clone();
-        config.companies[0].output.dir = blocked.display().to_string();
+        config.companies[0].output.dir = Some(blocked.display().to_string());
         let setup = Setup { config, ..setup };
         let index = Index::open_in_memory().unwrap();
         let mut mailbox = FakeMailbox::with(vec![pdf_mail("1@x", "R-1")]);

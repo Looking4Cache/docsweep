@@ -743,6 +743,7 @@ input[type="text"].mono { padding: 7px 9px; font-family: var(--mono); font-size:
 .master-item.is-active { background: var(--active); }
 .master-name { font-weight: 540; overflow-wrap: anywhere; }
 .master-meta { color: var(--ink-3); font-size: 12.5px; overflow-wrap: anywhere; }
+.master-meta.is-draft { color: var(--amber-text); font-weight: 520; }
 
 .detail {
   padding: 20px 22px;
@@ -772,6 +773,10 @@ input[type="text"].mono { padding: 7px 9px; font-family: var(--mono); font-size:
 .card-title .icon { color: var(--ink-3); }
 .card-heading { font-size: 14.5px; font-weight: 640; }
 .card-lead { margin-top: 2px; color: var(--ink-2); font-size: 13px; }
+
+.about { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 18px; }
+.about dt { color: var(--ink-2); }
+.about dd { overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
 
 /* ---------- History ---------- */
 
