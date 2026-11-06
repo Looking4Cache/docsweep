@@ -29,7 +29,8 @@ pub struct RunGate(AtomicBool);
 impl RunGate {
     /// The permit to run, or `None` while another run is active.
     pub fn try_start(&self) -> Option<RunPermit<'_>> {
-        (!self.0.swap(true, Ordering::SeqCst)).then_some(RunPermit(&self.0))
+        // A permit opens the gate when dropped, so none may exist on the way to `None`.
+        (!self.0.swap(true, Ordering::SeqCst)).then(|| RunPermit(&self.0))
     }
 }
 
@@ -438,6 +439,7 @@ companies:
         let gate = Arc::clone(&world.gate);
         let permit = gate.try_start().unwrap();
         assert!(matches!(world.tick(&config, now), Tick::Busy));
+        assert!(matches!(world.tick(&config, now), Tick::Busy));
         assert!(world.fetcher.started.is_empty());
         assert_eq!(
             world.index().last_scheduled_run("a").unwrap(),
@@ -491,20 +493,32 @@ companies:
     }
 
     #[test]
+    fn a_refused_permit_leaves_the_gate_closed() {
+        let gate = RunGate::default();
+        let permit = gate.try_start().unwrap();
+        assert!(gate.try_start().is_none());
+        assert!(gate.try_start().is_none());
+        drop(permit);
+        assert!(gate.try_start().is_some());
+    }
+
+    #[test]
     fn only_one_of_two_simultaneous_triggers_gets_to_run() {
         let gate = RunGate::default();
-        let barrier = std::sync::Barrier::new(8);
+        let start = std::sync::Barrier::new(8);
+        let everyone_tried = std::sync::Barrier::new(8);
         let won = std::sync::atomic::AtomicU32::new(0);
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
-                    barrier.wait();
-                    if let Some(permit) = gate.try_start() {
+                    start.wait();
+                    let permit = gate.try_start();
+                    if permit.is_some() {
                         won.fetch_add(1, Ordering::SeqCst);
-                        // Hold it until every thread has tried.
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        drop(permit);
                     }
+                    // The winner holds its permit until every thread has tried.
+                    everyone_tried.wait();
+                    drop(permit);
                 });
             }
         });
