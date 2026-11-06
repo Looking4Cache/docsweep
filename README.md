@@ -1,8 +1,8 @@
 # Docsweep
 
-Docsweep is a free desktop app for macOS, Windows and Linux that collects incoming invoices for you. It saves PDF attachments from your mailbox under a consistent file name, keeps an index to catch duplicates, and tidies up the mails afterwards.
+Docsweep is a free desktop app for macOS, Windows and Linux that collects incoming invoices for you. It saves PDF attachments from your mailbox under a consistent file name, fetches invoices from customer portals with recipes, keeps an index to catch duplicates, and tidies up the mails afterwards.
 
-> **Status: early development.** The mail pipeline, the `docsweep` command line tool and a first version of the desktop app work. Portal downloads are not implemented yet, and there are no signed builds so far.
+> **Status: early development.** The mail pipeline, portal downloads started by hand, the `docsweep` command line tool and a first version of the desktop app work. There is no schedule yet, link mails do not start a download yet, and there are no signed builds so far.
 
 ## How it works
 
@@ -10,7 +10,7 @@ Docsweep is a free desktop app for macOS, Windows and Linux that collects incomi
 2. `docsweep mail-scan --dry-run` shows what would happen, without changing anything.
 3. `docsweep mail-scan` saves the invoices and cleans up the mails.
 
-A mail is only moved or deleted after its invoice is stored and indexed. By default, "delete" means moving it to the trash. Mails that only link to a portal stay in your inbox until portal downloads are available.
+A mail is only moved or deleted after its invoice is stored and indexed. By default, "delete" means moving it to the trash. Mails that only link to a portal stay in your inbox and are noted for now.
 
 Only IMAP with a password or app password is supported. Mailboxes that require OAuth2, such as Microsoft 365, will not work.
 
@@ -70,13 +70,94 @@ Then try it:
 docsweep mail-scan --dry-run
 ```
 
+## Portal downloads
+
+A company with a `portal` gets its invoices from a customer portal: Docsweep logs in, reads the list of invoices, compares it with the index and downloads only what is new. This needs Chrome or Edge to be installed, and runs without any AI. Each company has its own browser profile, so sessions persist.
+
+```yaml
+companies:
+  - id: example
+    name: Example
+    portal:
+      credentials: keyring:example        # user name and password
+      totp: keyring:example-totp          # optional: setup key of the authenticator app
+      recipe: example.yaml                # relative to the recipes folder of the data directory
+      params: { domain: portal.example.com }  # optional: values for the recipe's parameters
+    output:
+      filename: "{date:%Y-%m-%d} - Example - {invoice_no}.pdf"
+```
+
+```sh
+docsweep secret set-portal example        # asks for the user name, and for the password without echoing it
+docsweep secret set-totp example-totp     # asks for the setup key without echoing it
+docsweep test-recipe recipe.yaml          # checks a recipe file
+docsweep test-recipe recipe.yaml --company example   # also tries it as a dry run
+docsweep fetch example --dry-run          # lists what is new; downloads nothing
+docsweep fetch example                    # add --visible to watch the browser
+```
+
+The credentials entry in the keychain holds `{"user":"...","password":"..."}`. A dry run does log in, so the browser profile changes, but no invoice is downloaded and neither the folder nor the index is touched.
+
+A recipe describes one portal. Selectors are CSS; in a field, `selector` reads the text and `selector@attribute` an attribute.
+
+```yaml
+params: { domain: portal.example.com }  # optional: `{domain}` in `goto` addresses
+step_timeout_secs: 30                   # optional: how long a step waits for the page
+confirmation:                           # optional
+  detect: "#captcha, .confirm-by-mail"  # shows that a person is needed
+  timeout_secs: 300                     # how long to wait for them
+steps:
+  - goto: https://{domain}/login
+  - dismiss_cookie_banner: true         # or the selector of the button
+  - login:
+      user: "#username"
+      next: "#continue"                 # optional: button if the password is on a second page
+      password: "#password"
+      submit: "button[type=submit]"
+      totp: "#otp"                      # optional
+      totp_submit: "#verify"            # optional: button for the code, otherwise `submit`
+      logged_in: "a.logout"             # recommended: shows that a saved session is still active
+  - goto: https://{domain}/invoices
+  - extract_list:
+      rows: "table.invoices tbody tr"
+      empty: ".no-invoices"             # optional: shows that the list is really empty
+      next_page: "a.next"               # optional: the list has several pages
+      max_pages: 50                     # optional
+      fields:
+        date: "td:nth-child(1)"
+        invoice_no: "td:nth-child(2)"
+        amount: "td:nth-child(3)"
+        url: "a.download@href"
+  - download_new:
+      key: invoice_no                   # the field that identifies a document across runs
+      html_to_pdf: true                 # optional: print documents that are HTML pages
+```
+
+If each row leads to a page with its documents, as with orders, the list gets an `open_detail` section instead of a `url` field. An order without any document is reported as missing, and the run goes on:
+
+```yaml
+  - extract_list:
+      rows: li.order
+      fields: { order: .number, details: a.details@href }
+      open_detail:
+        url: details                    # the field with the link
+        rows: li.document
+        missing: .no-documents          # optional: shows that there is no document
+        fields: { invoice_no: .number, url: a@href }
+  - download_new: { key: invoice_no }
+```
+
+Docsweep never tries to get around a captcha or bot detection. If the `detect` selector appears, or a step waits too long, the browser becomes visible and you are asked in the terminal or in a dialog of the app. If nobody answers in time, the run ends as failed for that company; what was stored until then stays. A login is never submitted twice in one run, and credentials only go to `https` addresses.
+
+Documents are fetched from inside the page, so the browser's rules apply: a document on another host only works if that host allows it. Number and date in the file take priority over those in the list, and a file without any number is stored for review, just as with mails.
+
 ## Development
 
 See [CLAUDE.md](CLAUDE.md) for the workspace layout, commands and rules, and [KONZEPT.md](KONZEPT.md) for the full concept (in German).
 
 ## Kurzfassung auf Deutsch
 
-Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
+Docsweep sammelt Eingangsrechnungen automatisch ein: PDF-Anhänge aus Mails werden einheitlich benannt gespeichert und im Index erfasst, danach werden die Mails nach Regeln aufgeräumt. Aus Kundenportalen lädt Docsweep Rechnungen per Rezept, derzeit von Hand gestartet. Das Projekt steht noch am Anfang. Unterstützt wird nur IMAP mit Passwort, kein OAuth2.
 
 ## License
 

@@ -5,7 +5,7 @@
 //! is not under this code's control.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine;
@@ -70,7 +70,7 @@ impl ChromeDriver {
     }
 
     async fn start(options: ChromeOptions, has_window: bool) -> Result<Self, DriverError> {
-        std::fs::create_dir_all(&options.profile_dir).map_err(|source| {
+        prepare_profile(&options.profile_dir).map_err(|source| {
             DriverError::Failed(format!(
                 "cannot create the browser profile {}: {source}",
                 options.profile_dir.display()
@@ -138,6 +138,18 @@ impl ChromeDriver {
             .into_value()
             .map_err(CdpError::from)
     }
+}
+
+/// The profile holds the sessions of a portal, so it is for this user alone. On
+/// Windows, new folders below the user's data directory already are.
+fn prepare_profile(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// A selector or address as a JavaScript string. Page code never sees secrets:
@@ -336,5 +348,28 @@ impl BrowserDriver for ChromeDriver {
             self.goto(&address).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profiles").join("acme");
+        prepare_profile(&profile).unwrap();
+        let mode = std::fs::metadata(&profile).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn values_become_safe_javascript_strings() {
+        assert_eq!(js_string(r#"a[b="c"]"#), r#""a[b=\"c\"]""#);
+        assert_eq!(js_string("\");alert(1)//"), r#""\");alert(1)//""#);
     }
 }
