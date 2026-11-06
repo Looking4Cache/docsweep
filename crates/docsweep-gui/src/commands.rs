@@ -1,0 +1,459 @@
+//! Commands of the interface. Secrets only ever travel into the keychain: no
+//! command returns one, and errors never contain one.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+
+use chrono::NaiveDate;
+use docsweep_core::config::{Config, ConfigError, Issue, MailAccount, SecretRef};
+use docsweep_core::index::{Index, IndexError, InvoiceRecord};
+use docsweep_core::mail::execute::{self, AccountReport, ScanSummary, summarize};
+use docsweep_core::names;
+use docsweep_core::review;
+use docsweep_core::secrets::{KeyringStore, SecretStore, SecretString};
+use serde::Serialize;
+use serde_json::Value;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
+
+use crate::{AppState, BUNDLE_ID};
+
+const MAX_INVOICES: u32 = 1000;
+const MAX_RUNS: u32 = 100;
+
+/// The files the app works with.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub config: PathBuf,
+    pub index: PathBuf,
+}
+
+/// An error as the interface sees it.
+#[derive(Debug, Serialize)]
+pub struct UiError {
+    message: String,
+    /// Validation problems, which the interface shows next to their fields.
+    issues: Vec<Issue>,
+}
+
+impl UiError {
+    fn new(message: impl ToString) -> Self {
+        Self {
+            message: message.to_string(),
+            issues: Vec::new(),
+        }
+    }
+}
+
+impl From<ConfigError> for UiError {
+    fn from(error: ConfigError) -> Self {
+        let message = error.to_string();
+        let issues = match error {
+            ConfigError::Invalid { issues, .. } => issues,
+            _ => Vec::new(),
+        };
+        Self { message, issues }
+    }
+}
+
+impl From<IndexError> for UiError {
+    fn from(error: IndexError) -> Self {
+        Self::new(error)
+    }
+}
+
+/// Facts about the application.
+#[derive(Debug, Serialize)]
+pub struct AppInfo {
+    name: &'static str,
+    version: &'static str,
+    bundle_id: &'static str,
+}
+
+/// Everything the interface needs at start.
+#[derive(Debug, Serialize)]
+pub struct AppSnapshot {
+    info: AppInfo,
+    config_path: PathBuf,
+    /// `None` on first start, or if the file cannot be used.
+    config: Option<Config>,
+    config_error: Option<UiError>,
+    /// For each mailbox id, whether its password is in the keychain.
+    stored_passwords: Vec<(String, bool)>,
+}
+
+fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
+    let info = AppInfo {
+        name: names::DISPLAY_NAME,
+        version: env!("CARGO_PKG_VERSION"),
+        bundle_id: BUNDLE_ID,
+    };
+    let loaded = paths
+        .config
+        .exists()
+        .then(|| Config::load(&paths.config))
+        .transpose();
+    let (config, config_error) = match loaded {
+        Ok(config) => (config, None),
+        Err(error) => (None, Some(UiError::from(error))),
+    };
+    let stored_passwords = config
+        .iter()
+        .flat_map(|config| &config.mail.accounts)
+        .map(|account| {
+            let stored = account
+                .password
+                .id()
+                .is_some_and(|id| secrets.get(id).is_ok());
+            (account.id.clone(), stored)
+        })
+        .collect();
+    AppSnapshot {
+        info,
+        config_path: paths.config.clone(),
+        config,
+        config_error,
+        stored_passwords,
+    }
+}
+
+#[tauri::command]
+pub async fn get_state(state: State<'_, AppState>) -> Result<AppSnapshot, UiError> {
+    let paths = state.paths.clone();
+    blocking(move || Ok(snapshot(&paths, &KeyringStore))).await
+}
+
+#[tauri::command]
+pub fn save_config(state: State<'_, AppState>, config: Config) -> Result<(), UiError> {
+    config.save(&state.paths.config)?;
+    Ok(())
+}
+
+/// Stores a secret. The value goes in once and cannot be read back.
+#[tauri::command]
+pub async fn set_secret(id: String, value: String) -> Result<(), UiError> {
+    blocking(move || store_secret(&KeyringStore, &id, value)).await
+}
+
+fn store_secret(secrets: &dyn SecretStore, id: &str, value: String) -> Result<(), UiError> {
+    if SecretRef::from_id(id).id().is_none() {
+        return Err(UiError::new("invalid secret id"));
+    }
+    if value.is_empty() {
+        return Err(UiError::new("the password must not be empty"));
+    }
+    secrets
+        .set(id, &SecretString::from(value))
+        .map_err(UiError::new)
+}
+
+/// Tries a mailbox without changing anything; returns how many mails it holds.
+#[tauri::command]
+pub async fn test_mailbox(account: MailAccount) -> Result<u32, UiError> {
+    blocking(move || {
+        let runtime = current_thread_runtime()?;
+        runtime
+            .block_on(execute::test_mailbox(&account, &KeyringStore))
+            .map_err(UiError::new)
+    })
+    .await
+}
+
+/// The result of a preview or a real scan.
+#[derive(Debug, Serialize)]
+pub struct ScanResult {
+    reports: Vec<AccountReport>,
+    summary: ScanSummary,
+    /// The scan worked, but something around it did not.
+    warning: Option<String>,
+}
+
+/// Clears the running flag even if the scan ends early.
+struct ScanGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[tauri::command]
+pub async fn run_scan(state: State<'_, AppState>, dry_run: bool) -> Result<ScanResult, UiError> {
+    if state.scanning.swap(true, Ordering::SeqCst) {
+        return Err(UiError::new("a scan is already running"));
+    }
+    let _guard = ScanGuard(&state.scanning);
+    let paths = state.paths.clone();
+    blocking(move || scan(&paths, &KeyringStore, dry_run)).await
+}
+
+fn scan(paths: &Paths, secrets: &dyn SecretStore, dry_run: bool) -> Result<ScanResult, UiError> {
+    let config = Config::load(&paths.config)?;
+    let runtime = current_thread_runtime()?;
+    let reports = runtime
+        .block_on(execute::run_mail_scan(
+            &config,
+            secrets,
+            &paths.index,
+            dry_run,
+        ))
+        .map_err(UiError::new)?;
+    let summary = summarize(&reports);
+    let warning = if dry_run {
+        None
+    } else {
+        record_run(paths, &reports, &summary).err()
+    };
+    Ok(ScanResult {
+        reports,
+        summary,
+        warning,
+    })
+}
+
+fn record_run(
+    paths: &Paths,
+    reports: &[AccountReport],
+    summary: &ScanSummary,
+) -> Result<(), String> {
+    let summary = serde_json::to_string(summary).map_err(|e| e.to_string())?;
+    let report = serde_json::to_string(reports).map_err(|e| e.to_string())?;
+    Index::open(&paths.index)
+        .and_then(|index| index.record_run(&summary, &report))
+        .map_err(|e| format!("the run could not be added to the history: {e}"))
+}
+
+#[tauri::command]
+pub async fn list_invoices(state: State<'_, AppState>) -> Result<Vec<InvoiceRecord>, UiError> {
+    let path = state.paths.index.clone();
+    blocking(move || invoices(&path)).await
+}
+
+fn invoices(path: &Path) -> Result<Vec<InvoiceRecord>, UiError> {
+    match Index::open_read_only(path)? {
+        Some(index) => Ok(index.recent_invoices(MAX_INVOICES)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// A run of the history, with its stored JSON unpacked.
+#[derive(Debug, Serialize)]
+pub struct RunView {
+    id: i64,
+    finished_at: String,
+    summary: Value,
+    reports: Value,
+}
+
+#[tauri::command]
+pub async fn list_runs(state: State<'_, AppState>) -> Result<Vec<RunView>, UiError> {
+    let path = state.paths.index.clone();
+    blocking(move || runs(&path)).await
+}
+
+fn runs(path: &Path) -> Result<Vec<RunView>, UiError> {
+    let Some(index) = Index::open_read_only(path)? else {
+        return Ok(Vec::new());
+    };
+    Ok(index
+        .recent_runs(MAX_RUNS)?
+        .into_iter()
+        .map(|run| RunView {
+            id: run.id,
+            finished_at: run.finished_at,
+            summary: serde_json::from_str(&run.summary).unwrap_or(Value::Null),
+            reports: serde_json::from_str(&run.report).unwrap_or(Value::Null),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn complete_review(
+    state: State<'_, AppState>,
+    id: i64,
+    invoice_no: String,
+    date: NaiveDate,
+) -> Result<InvoiceRecord, UiError> {
+    let paths = state.paths.clone();
+    blocking(move || {
+        let config = Config::load(&paths.config)?;
+        let index = Index::open(&paths.index)?;
+        review::complete_review(&config, &index, id, &invoice_no, date).map_err(UiError::new)
+    })
+    .await
+}
+
+/// Shows an invoice in the file manager. It takes an index id rather than a
+/// path, so the interface cannot point this at arbitrary files.
+#[tauri::command]
+pub async fn reveal_invoice(state: State<'_, AppState>, id: i64) -> Result<(), UiError> {
+    let path = state.paths.index.clone();
+    blocking(move || {
+        let index =
+            Index::open_read_only(&path)?.ok_or_else(|| UiError::new("the index is empty"))?;
+        let file = index
+            .invoice(id)?
+            .and_then(|record| record.file_path)
+            .ok_or_else(|| UiError::new("this entry has no file"))?;
+        tauri_plugin_opener::reveal_item_in_dir(&file).map_err(UiError::new)
+    })
+    .await
+}
+
+/// Asks for a folder with the system dialog.
+#[tauri::command]
+pub async fn pick_folder(app: AppHandle) -> Result<Option<String>, UiError> {
+    blocking(move || {
+        Ok(app
+            .dialog()
+            .file()
+            .blocking_pick_folder()
+            .and_then(|picked| picked.into_path().ok())
+            .map(|path| path.display().to_string()))
+    })
+    .await
+}
+
+/// Runs blocking work off the main thread. SQLite connections and parsers are
+/// not `Sync`, so the scan keeps to one thread with its own small runtime.
+async fn blocking<T, F>(work: F) -> Result<T, UiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, UiError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(UiError::new)?
+}
+
+fn current_thread_runtime() -> Result<tokio::runtime::Runtime, UiError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(UiError::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use docsweep_core::secrets::{ExposeSecret, MemoryStore};
+
+    const VALID: &str = r#"
+mail:
+  accounts:
+    - { id: main, imap: "127.0.0.1:1", user: u, password: "keyring:mail-main", watch: INBOX }
+  disposal: { mode: all_delete }
+"#;
+
+    fn paths(dir: &Path) -> Paths {
+        Paths {
+            config: dir.join("docsweep.yaml"),
+            index: dir.join("data").join("docsweep.db"),
+        }
+    }
+
+    #[test]
+    fn first_start_has_no_configuration_and_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot(&paths(dir.path()), &MemoryStore::default());
+        assert!(snapshot.config.is_none());
+        assert!(snapshot.config_error.is_none());
+        assert_eq!(snapshot.info.name, "Docsweep");
+        assert!(!snapshot.info.bundle_id.is_empty());
+    }
+
+    #[test]
+    fn snapshot_tells_whether_passwords_exist_but_never_their_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, VALID).unwrap();
+        let secrets = MemoryStore::with("mail-main", "super-secret-value");
+
+        let snapshot = snapshot(&paths, &secrets);
+
+        assert_eq!(snapshot.stored_passwords, [("main".to_owned(), true)]);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("super-secret-value"), "{json}");
+        assert!(json.contains("keyring:mail-main"), "{json}");
+    }
+
+    #[test]
+    fn missing_password_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, VALID).unwrap();
+        let snapshot = snapshot(&paths, &MemoryStore::default());
+        assert_eq!(snapshot.stored_passwords, [("main".to_owned(), false)]);
+    }
+
+    #[test]
+    fn broken_configuration_is_shown_with_its_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, VALID.replace("keyring:mail-main", "plain")).unwrap();
+
+        let snapshot = snapshot(&paths, &MemoryStore::default());
+
+        let error = snapshot.config_error.unwrap();
+        assert_eq!(error.issues[0].path, "mail.accounts[0].password");
+        assert!(snapshot.config.is_none());
+    }
+
+    #[test]
+    fn secrets_are_stored_and_bad_input_is_refused() {
+        let secrets = MemoryStore::default();
+        store_secret(&secrets, "mail-main", "value".into()).unwrap();
+        assert_eq!(secrets.get("mail-main").unwrap().expose_secret(), "value");
+        assert!(store_secret(&secrets, "Bad Id", "value".into()).is_err());
+        assert!(store_secret(&secrets, "mail-main", String::new()).is_err());
+    }
+
+    #[test]
+    fn dry_run_creates_no_index_and_no_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, VALID).unwrap();
+
+        let result = scan(&paths, &MemoryStore::default(), true).unwrap();
+
+        assert_eq!(result.summary.failed, 1, "no password is stored");
+        assert!(!paths.index.exists());
+        assert!(runs(&paths.index).unwrap().is_empty());
+        assert!(invoices(&paths.index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn real_run_is_added_to_the_history_even_if_an_account_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, VALID).unwrap();
+
+        let result = scan(&paths, &MemoryStore::default(), false).unwrap();
+
+        assert!(result.warning.is_none());
+        let history = runs(&paths.index).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].summary["failed"], 1);
+        assert_eq!(history[0].reports[0]["account_id"], "main");
+    }
+
+    #[test]
+    fn scan_without_configuration_is_an_understandable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = scan(&paths(dir.path()), &MemoryStore::default(), true).unwrap_err();
+        assert!(error.message.contains("docsweep.yaml"), "{}", error.message);
+    }
+
+    #[test]
+    fn saved_configuration_issues_reach_the_interface() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        let mut config = Config::from_yaml(VALID).unwrap();
+        config.mail.accounts[0].user = String::new();
+
+        let error = UiError::from(config.save(&paths.config).unwrap_err());
+
+        assert_eq!(error.issues[0].path, "mail.accounts[0].user");
+        assert!(!paths.config.exists());
+    }
+}

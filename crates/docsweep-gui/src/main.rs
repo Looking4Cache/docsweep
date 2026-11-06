@@ -1,48 +1,90 @@
-//! Desktop app of Docsweep. Only a stub until the GUI milestone.
+//! Desktop app of Docsweep: window, tray and the bridge to `docsweep-core`.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Serialize;
+mod commands;
+mod i18n;
+mod tray;
+
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+
+use docsweep_core::names;
+use docsweep_core::paths::AppDirs;
+use tauri::{Manager, RunEvent, WindowEvent};
 
 /// Bundle ID, read from `tauri.conf.json` by the build script.
 const BUNDLE_ID: &str = env!("DOCSWEEP_BUNDLE_ID");
 
-/// Application facts shown by the frontend.
-#[derive(Debug, Serialize)]
-struct AppInfo {
-    name: &'static str,
-    version: &'static str,
-    bundle_id: &'static str,
+/// What all commands share.
+pub struct AppState {
+    pub paths: commands::Paths,
+    /// Set while a scan runs, so that two scans never touch a mailbox at once.
+    pub scanning: AtomicBool,
 }
 
-fn app_info() -> AppInfo {
-    AppInfo {
-        name: docsweep_core::names::DISPLAY_NAME,
-        version: env!("CARGO_PKG_VERSION"),
-        bundle_id: BUNDLE_ID,
-    }
-}
-
-#[tauri::command]
-fn get_app_info() -> AppInfo {
-    app_info()
+fn resolve_paths() -> Option<commands::Paths> {
+    let dirs = AppDirs::discover()?;
+    let config = std::env::var_os(names::ENV_CONFIG)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs.config_file());
+    Some(commands::Paths {
+        config,
+        index: dirs.index_file(),
+    })
 }
 
 fn main() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_app_info])
-        .run(tauri::generate_context!())
+    let paths = resolve_paths().expect("Docsweep needs a home directory");
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState {
+            paths,
+            scanning: AtomicBool::new(false),
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_state,
+            commands::save_config,
+            commands::set_secret,
+            commands::test_mailbox,
+            commands::run_scan,
+            commands::list_invoices,
+            commands::list_runs,
+            commands::complete_review,
+            commands::reveal_invoice,
+            commands::pick_folder,
+        ])
+        .setup(|app| {
+            // Without a tray there would be no way back to a hidden window, so
+            // closing only hides the window if the tray could be created.
+            match tray::create(app.handle()) {
+                Ok(()) => {
+                    let handle = app.handle().clone();
+                    if let Some(window) = app.get_webview_window("main") {
+                        window.on_window_event(move |event| {
+                            if let WindowEvent::CloseRequested { api, .. } = event {
+                                api.prevent_close();
+                                if let Some(window) = handle.get_webview_window("main") {
+                                    let _ = window.hide();
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(error) => eprintln!("no tray available: {error}"),
+            }
+            Ok(())
+        })
+        .build(tauri::generate_context!())
         .expect("failed to start the Docsweep window");
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn app_info_uses_the_binding_names() {
-        let info = app_info();
-        assert_eq!(info.name, "Docsweep");
-        assert!(!info.bundle_id.is_empty());
-    }
+    app.run(|handle, event| {
+        // macOS: clicking the Dock icon brings a hidden window back.
+        #[cfg(target_os = "macos")]
+        if let RunEvent::Reopen { .. } = event {
+            tray::show_window(handle);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (handle, event);
+    });
 }

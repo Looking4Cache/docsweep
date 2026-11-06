@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Only core events and windowing. File access, secrets and mail stay behind the app's own commands.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -2,7 +2,7 @@
 
 Docsweep is a free desktop app for macOS, Windows and Linux that collects incoming invoices for you. It saves PDF attachments from your mailbox under a consistent file name, keeps an index to catch duplicates, and tidies up the mails afterwards.
 
-> **Status: early development.** The mail pipeline and the `docsweep` command line tool are being built first. The desktop app is only a stub so far, and portal downloads are not implemented yet.
+> **Status: early development.** The mail pipeline, the `docsweep` command line tool and a first version of the desktop app work. Portal downloads are not implemented yet, and there are no signed builds so far.
 
 ## How it works
 
@@ -19,8 +19,11 @@ Only IMAP with a password or app password is supported. Mailboxes that require O
 Build from source with [rustup](https://rustup.rs). The pinned Rust version installs automatically.
 
 ```sh
-cargo build --release -p docsweep-cli
+cargo run -p docsweep-gui                # the desktop app, which guides you through the setup
+cargo build --release -p docsweep-cli    # the command line tool
 ```
+
+The rest of this section describes the command line tool.
 
 Store your mail password in the system keychain. Docsweep asks for it without echoing it:
 

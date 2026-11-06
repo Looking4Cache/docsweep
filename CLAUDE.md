@@ -16,6 +16,8 @@ crates/
   docsweep-browser/  Later: CDP connection and recorder (empty for now, depends on core)
   docsweep-cli/      Binary `docsweep`
   docsweep-gui/      Desktop app "Docsweep" (Tauri 2), Cargo binary `docsweep-gui`
+    src/             Commands and tray; business logic stays in core
+    ui/              Interface: plain ES modules, no framework, no npm, no build step
 scripts/             Developer scripts, including the IMAP test runner
 ```
 
@@ -51,6 +53,10 @@ cargo install tauri-cli --locked      # once, for bundling
 - A document without a recognised invoice number, or with a known number but a different file, is stored with status `needs_review`, and its mail stays in place with `\Flagged`.
 - Link mails stay in place and are only noted as `portal_fetch_required` until portal downloads exist, regardless of the configured disposal.
 - The trash folder is found through IMAP `SPECIAL-USE` only. Without it the mail stays flagged; it is never deleted permanently as a fallback.
+- A `needs_review` document is completed in the GUI (`review::complete_review`). The next scan then recognises the file as stored and cleans up its mail.
+- The interface never receives a secret: commands only accept them and report whether one exists. Text from mails and PDFs is untrusted, so `ui/lib/dom.js` only creates text nodes; never assign HTML strings.
+- The web view has only `core:default`. File, mail and keychain access goes through the app's own commands, and those take index ids rather than paths.
+- Core error messages are English for now; they need keys before the German translation.
 - Pin GitHub Actions to commit SHAs.
 
 ## Security rules (not negotiable)

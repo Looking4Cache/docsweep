@@ -1,33 +1,110 @@
-// Translation catalogues live in i18n/<language>.json. To add a language,
-// add its catalogue and list it in SUPPORTED_LANGUAGES.
-const SUPPORTED_LANGUAGES = ["en"];
-const FALLBACK_LANGUAGE = "en";
+import { api, errorText, onTrayPreview } from "./lib/api.js";
+import { h, icon, mark, replace } from "./lib/dom.js";
+import { loadTranslations, t } from "./lib/i18n.js";
+import { notice } from "./lib/ui.js";
+import { renderCompanies } from "./views/companies.js";
+import { renderHistory } from "./views/history.js";
+import { renderInvoices } from "./views/invoices.js";
+import { renderMailboxes } from "./views/mailboxes.js";
+import { renderScan } from "./views/scan.js";
+import { renderBrokenConfig, renderSetup } from "./views/setup.js";
 
-function pickLanguage() {
-  const preferred = navigator.language.split("-")[0];
-  return SUPPORTED_LANGUAGES.includes(preferred) ? preferred : FALLBACK_LANGUAGE;
+const VIEWS = {
+  scan: renderScan,
+  invoices: renderInvoices,
+  companies: renderCompanies,
+  mailboxes: renderMailboxes,
+  history: renderHistory,
+};
+
+const root = document.getElementById("app");
+const content = h("main", { class: "content" });
+const reviewBadge = h("span", { class: "nav-badge", hidden: true });
+let activeView = "scan";
+let info = {};
+
+// Shared with the views.
+const app = {
+  config: null,
+  passwords: new Map(),
+  setConfig(config) {
+    const firstConfig = !app.config;
+    app.config = config;
+    if (firstConfig) showShell();
+    paintNav();
+  },
+  isPasswordStored: (id) => app.passwords.get(id) === true,
+  setPasswordStored: (id, stored) => app.passwords.set(id, stored),
+  navigate,
+  async refreshBadges() {
+    try {
+      const invoices = await api.listInvoices();
+      const count = invoices.filter((row) => row.status === "needs_review").length;
+      reviewBadge.hidden = count === 0;
+      reviewBadge.textContent = count;
+    } catch {
+      reviewBadge.hidden = true;
+    }
+  },
+};
+
+const nav = h("nav", { class: "nav" });
+
+function paintNav() {
+  replace(nav, Object.keys(VIEWS).map((name) =>
+    h("button", {
+      class: `nav-item${name === activeView ? " is-active" : ""}`,
+      "aria-current": name === activeView ? "page" : undefined,
+      onclick: () => navigate(name),
+    }, icon(name), h("span", {}, t(`nav.${name}`)), name === "invoices" && reviewBadge)));
 }
 
-async function loadCatalogue(language) {
-  const response = await fetch(`i18n/${language}.json`);
-  return response.json();
+function navigate(view, options) {
+  activeView = view;
+  paintNav();
+  replace(content, VIEWS[view](app, options));
+  content.scrollTop = 0;
 }
 
-function format(template, values) {
-  return template.replace(/\{(\w+)\}/g, (_, key) => values[key] ?? "");
+function showShell() {
+  replace(root,
+    h("div", { class: "shell" },
+      h("aside", { class: "sidebar" },
+        h("div", { class: "brand" }, mark(), h("span", {}, info.name)),
+        nav,
+        h("div", { class: "sidebar-foot" }, t("nav.version", { version: info.version })),
+      ),
+      content,
+    ));
+  navigate(activeView);
+  app.refreshBadges();
 }
 
 async function start() {
-  const language = pickLanguage();
-  const catalogue = await loadCatalogue(language);
-  document.documentElement.lang = language;
-
-  for (const element of document.querySelectorAll("[data-i18n]")) {
-    element.textContent = catalogue[element.dataset.i18n] ?? element.dataset.i18n;
+  await loadTranslations();
+  let state;
+  try {
+    state = await api.getState();
+  } catch (error) {
+    replace(root, h("div", { class: "setup" }, notice("danger", errorText(error))));
+    return;
   }
+  info = state.info;
+  app.passwords = new Map(state.stored_passwords);
 
-  const info = await window.__TAURI__.core.invoke("get_app_info");
-  document.getElementById("version").textContent = format(catalogue["app.version"], info);
+  onTrayPreview(() => {
+    if (!app.config) return;
+    navigate("scan");
+    app.startPreview?.();
+  });
+
+  if (state.config_error) {
+    replace(root, renderBrokenConfig(state.config_error, state.config_path));
+  } else if (state.config) {
+    app.setConfig(state.config);
+  } else {
+    replace(root, renderSetup(app));
+  }
 }
 
 start();
