@@ -5,12 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories.workspace = true
 keyring = "4"
 regex = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "2"

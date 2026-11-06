@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # Cargo builds `docsweep-gui` so it cannot collide with the `docsweep` CLI, not
 # even on case-insensitive file systems. Bundling renames it to the documented
