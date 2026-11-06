@@ -1,0 +1,22 @@
+# Build output
+/target/
+/target-cli/
+/crates/docsweep-gui/gen/
+
+# Never commit real invoices, mails or local configuration.
+# Test data lives in tests/fixtures directories and is explicitly allowed below.
+*.pdf
+*.eml
+*.mbox
+docsweep.yaml
+docsweep.db
+docsweep.db-*
+.env
+.env.*
+!**/tests/fixtures/**
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+.claude/settings.local.json
