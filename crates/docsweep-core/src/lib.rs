@@ -4,3 +4,4 @@ pub mod config;
 pub mod names;
 pub mod naming;
 pub mod paths;
+pub mod secrets;

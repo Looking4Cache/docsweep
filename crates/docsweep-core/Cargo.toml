@@ -9,7 +9,12 @@ license.workspace = true
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 directories.workspace = true
+keyring = "4"
 regex = "1"
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "2"
 thiserror = "2"
+
+[dev-dependencies]
+tempfile.workspace = true
