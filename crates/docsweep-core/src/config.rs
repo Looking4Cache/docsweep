@@ -4,7 +4,7 @@
 //! value. Error messages never quote values of secret fields, and YAML snippets
 //! are disabled because they could quote a plaintext password.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -145,14 +145,19 @@ pub struct MailRule {
     pub attachment: Option<String>,
 }
 
-/// Portal access; parsed and validated now, used from the recipe milestone on.
+/// Portal access. `credentials` holds user name and password in the format of
+/// `portal::credentials`, `totp` the setup key of the second factor.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Portal {
     pub credentials: SecretRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub totp: Option<SecretRef>,
+    /// Relative paths start in the recipes directory.
     pub recipe: PathBuf,
+    /// Values for the recipe's parameters, such as a domain.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
     /// Cron expression with five fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
@@ -266,7 +271,7 @@ fn explain_syntax_error(message: String) -> String {
     }
 }
 
-fn format_issues(issues: &[Issue]) -> String {
+pub(crate) fn format_issues(issues: &[Issue]) -> String {
     issues
         .iter()
         .map(|issue| format!("\n  - {}: {}", issue.path, issue.message))
@@ -478,19 +483,19 @@ impl Portal {
 }
 
 #[derive(Default)]
-struct Report {
-    issues: Vec<Issue>,
+pub(crate) struct Report {
+    pub(crate) issues: Vec<Issue>,
 }
 
 impl Report {
-    fn add(&mut self, path: &str, message: &str) {
+    pub(crate) fn add(&mut self, path: &str, message: &str) {
         self.issues.push(Issue {
             path: path.to_owned(),
             message: message.to_owned(),
         });
     }
 
-    fn not_blank(&mut self, path: &str, value: &str) {
+    pub(crate) fn not_blank(&mut self, path: &str, value: &str) {
         if value.trim().is_empty() {
             self.add(path, "must not be empty");
         }
