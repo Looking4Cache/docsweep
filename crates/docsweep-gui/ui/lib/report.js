@@ -125,8 +125,77 @@ function mailRow(mail, { onCreateCompany, done }) {
   );
 }
 
+const FETCH_GROUP_OF = {
+  would_download: "save",
+  stored: "save",
+  stored_for_review: "review",
+  missing: "missing",
+  already_known: "known",
+  unresolved: "known",
+  failed: "failed",
+};
+
+function fetchEntryNote(entry) {
+  const outcome = entry.outcome;
+  switch (outcome.kind) {
+    case "would_download":
+      return outcome.file_name ?? t("row.fetch_would_download");
+    case "stored":
+      return fileName(outcome.path);
+    case "stored_for_review":
+      return `${fileName(outcome.path)}: ${t(outcome.reason.kind === "number_not_found" ? "row.review_number" : "row.review_conflict")}`;
+    case "missing":
+      return t("row.fetch_missing");
+    case "already_known":
+      return t("row.already");
+    case "unresolved":
+      return `${t("row.unresolved")}: ${outcome.reason}`;
+    default:
+      return outcome.message;
+  }
+}
+
+function fetchEntryRow(entry, companyName) {
+  const failed = entry.outcome.kind === "failed";
+  const facts = [entry.date, entry.amount].filter(Boolean).join(" · ");
+  return h("li", { class: "mail-row" },
+    h("div", { class: "mail-main" },
+      h("div", { class: "mail-head" },
+        h("span", { class: "mail-subject" }, entry.key),
+        h("span", { class: "mail-company" }, companyName),
+      ),
+      facts && h("div", { class: "mail-from" }, facts),
+      failed
+        ? h("p", { class: "row-failure" }, fetchEntryNote(entry))
+        : h("div", { class: "doc is-muted" }, icon("file"), h("span", { class: "doc-name" }, fetchEntryNote(entry))),
+    ),
+  );
+}
+
+// The reports of portal fetches: one row per list entry, by urgency.
+function fetchReportList(reports) {
+  const order = ["failed", "review", "save", "missing", "known"];
+  const groups = Object.fromEntries(order.map((name) => [name, []]));
+  for (const report of reports) {
+    if (report.error) {
+      groups.failed.push(h("li", { class: "mail-row" },
+        h("div", { class: "mail-main" },
+          h("span", { class: "mail-subject" }, report.company_name),
+          h("p", { class: "row-failure" }, report.error))));
+    }
+    for (const entry of report.entries) {
+      groups[FETCH_GROUP_OF[entry.outcome.kind]].push(fetchEntryRow(entry, report.company_name));
+    }
+  }
+  return order.filter((name) => groups[name].length > 0).map((name) =>
+    h("section", { class: `group group-${name}` },
+      h("h2", { class: "group-title" }, t(`group.${name}`), h("span", { class: "group-count" }, groups[name].length)),
+      h("ul", { class: "mail-list" }, groups[name])));
+}
+
 // Renders groups in order of urgency. Empty groups do not appear.
 export function reportList(reports, { onCreateCompany, done = true } = {}) {
+  if (reports.some((report) => report.entries)) return fetchReportList(reports);
   const { groups, accountErrors } = groupReports(reports);
   const options = { onCreateCompany, done };
   const sections = [];
@@ -158,6 +227,7 @@ export function summaryStats(summary, dryRun) {
     ["dispose", summary.disposed, t(dryRun ? "summary.would_dispose" : "summary.disposed")],
     ["portal", summary.portal_fetches, t("summary.portal")],
     ["unknown", summary.unknown_invoices, t("summary.unknown")],
+    ["unknown", summary.missing, t("summary.missing")],
     ["failed", summary.failed, t("summary.failed")],
   ].filter(([, value]) => value > 0);
   return h("dl", { class: "stats" }, stats.map(([tone, value, label]) =>

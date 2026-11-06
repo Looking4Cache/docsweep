@@ -6,8 +6,12 @@ export const api = {
   getState: () => invoke("get_state"),
   saveConfig: (config) => invoke("save_config", { config }),
   setSecret: (id, value) => invoke("set_secret", { id, value }),
+  setPortalCredentials: (id, user, password) => invoke("set_portal_credentials", { id, user, password }),
+  setTotpKey: (id, key) => invoke("set_totp_key", { id, key }),
   testMailbox: (account) => invoke("test_mailbox", { account }),
   runScan: (dryRun) => invoke("run_scan", { dryRun }),
+  runFetch: (companyId, dryRun, visible) => invoke("run_fetch", { companyId, dryRun, visible }),
+  answerConfirmation: (done) => invoke("answer_confirmation", { done }),
   listInvoices: () => invoke("list_invoices"),
   listRuns: () => invoke("list_runs"),
   completeReview: (id, invoiceNo, date) => invoke("complete_review", { id, invoiceNo, date }),
@@ -17,6 +21,14 @@ export const api = {
 
 export function onTrayPreview(handler) {
   window.__TAURI__.event.listen("tray-preview", handler);
+}
+
+export function onPortalConfirmation(handler) {
+  window.__TAURI__.event.listen("portal-confirmation", (event) => handler(event.payload));
+}
+
+export function onPortalConfirmationEnded(handler) {
+  window.__TAURI__.event.listen("portal-confirmation-ended", handler);
 }
 
 export function errorText(error) {

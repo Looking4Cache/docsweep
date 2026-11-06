@@ -7,6 +7,7 @@ mod i18n;
 mod tray;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use docsweep_core::names;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub paths: commands::Paths,
     /// Set while a scan runs, so that two scans never touch a mailbox at once.
     pub scanning: AtomicBool,
+    /// The question to a person that a portal fetch is waiting on.
+    pub confirmation: Arc<commands::ConfirmationSlot>,
 }
 
 fn resolve_paths() -> Option<commands::Paths> {
@@ -31,6 +34,7 @@ fn resolve_paths() -> Option<commands::Paths> {
     Some(commands::Paths {
         config,
         index: dirs.index_file(),
+        dirs,
     })
 }
 
@@ -41,13 +45,18 @@ fn main() {
         .manage(AppState {
             paths,
             scanning: AtomicBool::new(false),
+            confirmation: Arc::default(),
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::save_config,
             commands::set_secret,
             commands::test_mailbox,
+            commands::set_portal_credentials,
+            commands::set_totp_key,
             commands::run_scan,
+            commands::run_fetch,
+            commands::answer_confirmation,
             commands::list_invoices,
             commands::list_runs,
             commands::complete_review,

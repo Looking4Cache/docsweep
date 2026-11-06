@@ -1,7 +1,7 @@
 import { api, errorText, onTrayPreview } from "./lib/api.js";
 import { h, icon, mark, replace } from "./lib/dom.js";
 import { loadTranslations, t } from "./lib/i18n.js";
-import { notice } from "./lib/ui.js";
+import { notice, watchPortalConfirmations } from "./lib/ui.js";
 import { renderCompanies } from "./views/companies.js";
 import { renderHistory } from "./views/history.js";
 import { renderInvoices } from "./views/invoices.js";
@@ -37,6 +37,9 @@ const app = {
   },
   isPasswordStored: (id) => app.passwords.get(id) === true,
   setPasswordStored: (id, stored) => app.passwords.set(id, stored),
+  portalSecrets: new Map(),
+  portalSecretsOf: (id) => app.portalSecrets.get(id) ?? { credentials: false, totp: false },
+  setPortalSecretStored: (id, kind) => app.portalSecrets.set(id, { ...app.portalSecretsOf(id), [kind]: true }),
   navigate,
   async refreshBadges() {
     try {
@@ -95,6 +98,8 @@ async function start() {
   app.info = state.info;
   app.configPath = state.config_path;
   app.passwords = new Map(state.stored_passwords);
+  app.portalSecrets = new Map(state.stored_portal_secrets);
+  watchPortalConfirmations();
 
   onTrayPreview(() => {
     if (!app.config) return;

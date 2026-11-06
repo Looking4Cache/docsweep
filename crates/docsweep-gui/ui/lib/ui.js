@@ -1,6 +1,6 @@
 // Shared building blocks: fields, dialogs, messages.
 
-import { api } from "./api.js";
+import { api, onPortalConfirmation, onPortalConfirmationEnded } from "./api.js";
 import { h, icon, replace } from "./dom.js";
 import { t } from "./i18n.js";
 
@@ -130,6 +130,35 @@ export function confirmDialog({ title, text, items = [], confirmLabel, danger = 
         }, confirmLabel),
       ),
     )).then(Boolean);
+}
+
+// The question of a running portal fetch. It closes by itself when the fetch
+// stops waiting, and cancelling it ends that fetch.
+export function watchPortalConfirmations() {
+  let closeOpen = null;
+  onPortalConfirmation((request) => {
+    closeOpen?.("replaced");
+    const text = request.reason.kind === "detected"
+      ? t("confirmation.detected")
+      : t("confirmation.timed_out", { step: request.reason.step });
+    showDialog((close) => {
+      closeOpen = close;
+      return h("div", { class: "dialog-body" },
+        h("h2", {}, t("confirmation.title", { name: request.company_name })),
+        h("p", { class: "dialog-text" }, text),
+        h("p", { class: "dialog-text" }, t("confirmation.limit", { seconds: request.timeout_secs })),
+        h("div", { class: "dialog-actions" },
+          h("button", { class: "button", onclick: () => close(false) }, t("common.cancel")),
+          h("button", { class: "button button-primary", onclick: () => close(true) }, t("confirmation.done")),
+        ),
+      );
+    }).then((answer) => {
+      if (answer === "replaced") return;
+      closeOpen = null;
+      if (answer !== "ended") api.answerConfirmation(answer === true);
+    });
+  });
+  onPortalConfirmationEnded(() => closeOpen?.("ended"));
 }
 
 let toastTimer;

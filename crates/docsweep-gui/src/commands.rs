@@ -3,29 +3,39 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use chrono::NaiveDate;
+use docsweep_browser::{FetchOptions, FetchPaths, WindowMode, fetch_company};
 use docsweep_core::config::{Config, ConfigError, Issue, MailAccount, SecretRef};
 use docsweep_core::index::{Index, IndexError, InvoiceRecord};
 use docsweep_core::mail::execute::{self, AccountReport, ScanSummary, summarize};
 use docsweep_core::names;
+use docsweep_core::paths::AppDirs;
+use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
+use docsweep_core::portal::driver::{ConfirmationAnswer, ConfirmationHandler, ConfirmationRequest};
+use docsweep_core::portal::engine::{FetchReport, FetchSummary, summarize_fetches};
 use docsweep_core::review;
 use docsweep_core::secrets::{KeyringStore, SecretStore, SecretString};
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::oneshot;
 
 use crate::{AppState, BUNDLE_ID};
 
 const MAX_INVOICES: u32 = 1000;
 const MAX_RUNS: u32 = 100;
+const ALREADY_RUNNING: &str = "a scan or portal fetch is already running";
 
 /// The files the app works with.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config: PathBuf,
     pub index: PathBuf,
+    /// Recipes and browser profiles.
+    pub dirs: AppDirs,
 }
 
 /// An error as the interface sees it.
@@ -80,6 +90,15 @@ pub struct AppSnapshot {
     config_error: Option<UiError>,
     /// For each mailbox id, whether its password is in the keychain.
     stored_passwords: Vec<(String, bool)>,
+    /// For each company with a portal, which of its secrets are in the keychain.
+    stored_portal_secrets: Vec<(String, PortalSecrets)>,
+}
+
+/// Whether the secrets of a portal exist; never their values.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PortalSecrets {
+    credentials: bool,
+    totp: bool,
 }
 
 fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
@@ -108,12 +127,30 @@ fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
             (account.id.clone(), stored)
         })
         .collect();
+    let is_stored = |reference: Option<&SecretRef>| {
+        reference
+            .and_then(SecretRef::id)
+            .is_some_and(|id| secrets.get(id).is_ok())
+    };
+    let stored_portal_secrets = config
+        .iter()
+        .flat_map(|config| &config.companies)
+        .filter_map(|company| {
+            let portal = company.portal.as_ref()?;
+            let stored = PortalSecrets {
+                credentials: is_stored(Some(&portal.credentials)),
+                totp: is_stored(portal.totp.as_ref()),
+            };
+            Some((company.id.clone(), stored))
+        })
+        .collect();
     AppSnapshot {
         info,
         config_path: paths.config.clone(),
         config,
         config_error,
         stored_passwords,
+        stored_portal_secrets,
     }
 }
 
@@ -145,6 +182,47 @@ fn store_secret(secrets: &dyn SecretStore, id: &str, value: String) -> Result<()
     secrets
         .set(id, &SecretString::from(value))
         .map_err(UiError::new)
+}
+
+/// Stores user name and password of a portal. They go in once and cannot be read
+/// back.
+#[tauri::command]
+pub async fn set_portal_credentials(
+    id: String,
+    user: String,
+    password: String,
+) -> Result<(), UiError> {
+    blocking(move || store_portal_credentials(&KeyringStore, &id, user, password)).await
+}
+
+fn store_portal_credentials(
+    secrets: &dyn SecretStore,
+    id: &str,
+    user: String,
+    password: String,
+) -> Result<(), UiError> {
+    if SecretRef::from_id(id).id().is_none() {
+        return Err(UiError::new("invalid secret id"));
+    }
+    let credentials = PortalCredentials::new(user, password).map_err(UiError::new)?;
+    secrets
+        .set(id, &credentials.to_stored())
+        .map_err(UiError::new)
+}
+
+/// Stores the TOTP setup key of a portal. It goes in once and cannot be read back.
+#[tauri::command]
+pub async fn set_totp_key(id: String, key: String) -> Result<(), UiError> {
+    blocking(move || store_totp_key(&KeyringStore, &id, key)).await
+}
+
+fn store_totp_key(secrets: &dyn SecretStore, id: &str, key: String) -> Result<(), UiError> {
+    if SecretRef::from_id(id).id().is_none() {
+        return Err(UiError::new("invalid secret id"));
+    }
+    let key = SecretString::from(key);
+    TotpGenerator::new(&key).map_err(UiError::new)?;
+    secrets.set(id, &key).map_err(UiError::new)
 }
 
 /// Tries a mailbox without changing anything; returns how many mails it holds.
@@ -180,11 +258,155 @@ impl Drop for ScanGuard<'_> {
 #[tauri::command]
 pub async fn run_scan(state: State<'_, AppState>, dry_run: bool) -> Result<ScanResult, UiError> {
     if state.scanning.swap(true, Ordering::SeqCst) {
-        return Err(UiError::new("a scan is already running"));
+        return Err(UiError::new(ALREADY_RUNNING));
     }
     let _guard = ScanGuard(&state.scanning);
     let paths = state.paths.clone();
     blocking(move || scan(&paths, &KeyringStore, dry_run)).await
+}
+
+/// The result of a preview or a real portal fetch. A list, like a scan's
+/// reports, so the history treats them alike.
+#[derive(Debug, Serialize)]
+pub struct FetchResult {
+    reports: Vec<FetchReport>,
+    summary: FetchSummary,
+    warning: Option<String>,
+}
+
+#[tauri::command]
+pub async fn run_fetch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    company_id: String,
+    dry_run: bool,
+    visible: bool,
+) -> Result<FetchResult, UiError> {
+    if state.scanning.swap(true, Ordering::SeqCst) {
+        return Err(UiError::new(ALREADY_RUNNING));
+    }
+    let _guard = ScanGuard(&state.scanning);
+    let paths = state.paths.clone();
+    let mut handler = GuiConfirmation {
+        slot: Arc::clone(&state.confirmation),
+        app,
+    };
+    let window = if visible {
+        WindowMode::Visible
+    } else {
+        WindowMode::OnDemand
+    };
+    blocking(move || {
+        fetch(
+            &paths,
+            &KeyringStore,
+            &company_id,
+            dry_run,
+            window,
+            &mut handler,
+        )
+    })
+    .await
+}
+
+fn fetch<H: ConfirmationHandler>(
+    paths: &Paths,
+    secrets: &dyn SecretStore,
+    company_id: &str,
+    dry_run: bool,
+    window: WindowMode,
+    handler: &mut H,
+) -> Result<FetchResult, UiError> {
+    let config = Config::load(&paths.config)?;
+    let company = config
+        .companies
+        .iter()
+        .find(|company| company.id == company_id)
+        .ok_or_else(|| UiError::new(format!("no company `{company_id}` in the configuration")))?;
+    let fetch_paths = FetchPaths {
+        index: paths.index.clone(),
+        ..FetchPaths::of(&paths.dirs, company_id)
+    };
+    let options = FetchOptions {
+        dry_run,
+        window,
+        recipe_file: None,
+    };
+    let runtime = current_thread_runtime()?;
+    let report = runtime.block_on(fetch_company(
+        &config,
+        company,
+        secrets,
+        &fetch_paths,
+        &options,
+        handler,
+    ));
+    let reports = vec![report];
+    let summary = summarize_fetches(&reports);
+    let warning = if dry_run {
+        None
+    } else {
+        record_run(paths, &reports, &summary).err()
+    };
+    Ok(FetchResult {
+        reports,
+        summary,
+        warning,
+    })
+}
+
+/// The one question a running fetch can have open.
+#[derive(Debug, Default)]
+pub struct ConfirmationSlot(Mutex<Option<oneshot::Sender<bool>>>);
+
+impl ConfirmationSlot {
+    fn open(&self) -> oneshot::Receiver<bool> {
+        let (sender, receiver) = oneshot::channel();
+        *self.0.lock().expect("lock is never poisoned") = Some(sender);
+        receiver
+    }
+
+    fn answer(&self, done: bool) {
+        if let Some(sender) = self.0.lock().expect("lock is never poisoned").take() {
+            let _ = sender.send(done);
+        }
+    }
+
+    fn close(&self) {
+        self.0.lock().expect("lock is never poisoned").take();
+    }
+}
+
+/// Asks through a dialog in the window: an event opens it, and the command
+/// [`answer_confirmation`] brings the answer back.
+struct GuiConfirmation {
+    slot: Arc<ConfirmationSlot>,
+    app: AppHandle,
+}
+
+impl ConfirmationHandler for GuiConfirmation {
+    async fn ask(&mut self, request: &ConfirmationRequest) -> ConfirmationAnswer {
+        let answer = self.slot.open();
+        crate::tray::show_window(&self.app);
+        if self.app.emit("portal-confirmation", request).is_err() {
+            return ConfirmationAnswer::Cancelled;
+        }
+        match answer.await {
+            Ok(true) => ConfirmationAnswer::Done,
+            _ => ConfirmationAnswer::Cancelled,
+        }
+    }
+
+    fn expired(&mut self) {
+        self.slot.close();
+        let _ = self.app.emit("portal-confirmation-ended", ());
+    }
+}
+
+/// The person's answer to the dialog of a running fetch.
+#[tauri::command]
+pub fn answer_confirmation(state: State<'_, AppState>, done: bool) {
+    state.confirmation.answer(done);
 }
 
 fn scan(paths: &Paths, secrets: &dyn SecretStore, dry_run: bool) -> Result<ScanResult, UiError> {
@@ -211,10 +433,10 @@ fn scan(paths: &Paths, secrets: &dyn SecretStore, dry_run: bool) -> Result<ScanR
     })
 }
 
-fn record_run(
+fn record_run<R: Serialize, S: Serialize>(
     paths: &Paths,
-    reports: &[AccountReport],
-    summary: &ScanSummary,
+    reports: &[R],
+    summary: &S,
 ) -> Result<(), String> {
     let summary = serde_json::to_string(summary).map_err(|e| e.to_string())?;
     let report = serde_json::to_string(reports).map_err(|e| e.to_string())?;
@@ -349,6 +571,7 @@ mail:
         Paths {
             config: dir.join("docsweep.yaml"),
             index: dir.join("data").join("docsweep.db"),
+            dirs: AppDirs::from_base(&dir.join("config"), &dir.join("data")),
         }
     }
 
@@ -455,5 +678,129 @@ mail:
 
         assert_eq!(error.issues[0].path, "mail.accounts[0].user");
         assert!(!paths.config.exists());
+    }
+
+    const WITH_PORTAL: &str = r#"
+mail:
+  accounts:
+    - { id: main, imap: "127.0.0.1:1", user: u, password: "keyring:mail-main", watch: INBOX }
+  disposal: { mode: all_delete }
+companies:
+  - id: acme
+    name: Acme
+    portal: { credentials: "keyring:acme", totp: "keyring:acme-totp", recipe: acme.yaml }
+    output: { dir: invoices, filename: "{invoice_no}.pdf" }
+"#;
+
+    struct NobodyAsked;
+
+    impl ConfirmationHandler for NobodyAsked {
+        async fn ask(&mut self, _request: &ConfirmationRequest) -> ConfirmationAnswer {
+            panic!("no browser runs in these tests");
+        }
+    }
+
+    #[test]
+    fn portal_secrets_are_stored_and_bad_input_is_refused_without_quoting_it() {
+        let secrets = MemoryStore::default();
+        store_portal_credentials(&secrets, "acme", "me".into(), "secret-value".into()).unwrap();
+        let stored = secrets.get("acme").unwrap();
+        assert!(stored.expose_secret().contains("secret-value"));
+        assert!(store_portal_credentials(&secrets, "Bad Id", "me".into(), "x".into()).is_err());
+        let empty = store_portal_credentials(&secrets, "acme", "".into(), "secret-value".into());
+        assert!(!empty.unwrap_err().message.contains("secret-value"));
+
+        store_totp_key(&secrets, "acme-totp", "gezd gnbv".into()).unwrap();
+        let bad = store_totp_key(&secrets, "other", "!secret-value!".into()).unwrap_err();
+        assert!(!bad.message.contains("secret-value"));
+        assert!(secrets.get("other").is_err());
+    }
+
+    #[test]
+    fn snapshot_tells_which_portal_secrets_exist_but_never_their_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, WITH_PORTAL).unwrap();
+        let secrets = MemoryStore::with("acme", "super-secret-value");
+
+        let snapshot = snapshot(&paths, &secrets);
+
+        assert_eq!(
+            snapshot.stored_portal_secrets,
+            [(
+                "acme".to_owned(),
+                PortalSecrets {
+                    credentials: true,
+                    totp: false
+                }
+            )]
+        );
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("super-secret-value"), "{json}");
+    }
+
+    #[test]
+    fn a_real_fetch_reaches_the_history_and_a_preview_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, WITH_PORTAL).unwrap();
+        let secrets = MemoryStore::default();
+        let run = |dry_run| {
+            fetch(
+                &paths,
+                &secrets,
+                "acme",
+                dry_run,
+                WindowMode::Hidden,
+                &mut NobodyAsked,
+            )
+            .unwrap()
+        };
+
+        // The recipe file does not exist, so no browser starts.
+        let preview = run(true);
+        assert!(preview.reports[0].error.is_some());
+        assert_eq!(preview.summary.failed, 1);
+        assert!(!paths.index.exists());
+
+        let real = run(false);
+        assert!(real.warning.is_none());
+        let history = runs(&paths.index).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].summary["failed"], 1);
+        assert_eq!(history[0].reports[0]["company_id"], "acme");
+    }
+
+    #[test]
+    fn fetching_an_unknown_company_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        std::fs::write(&paths.config, WITH_PORTAL).unwrap();
+        let error = fetch(
+            &paths,
+            &MemoryStore::default(),
+            "nope",
+            true,
+            WindowMode::Hidden,
+            &mut NobodyAsked,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("nope"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_confirmation_answer_reaches_the_waiting_fetch_once() {
+        let slot = ConfirmationSlot::default();
+        slot.answer(true); // Nobody waits: nothing happens.
+
+        let mut waiting = slot.open();
+        assert!(waiting.try_recv().is_err());
+        slot.answer(true);
+        assert_eq!(waiting.try_recv(), Ok(true));
+
+        let mut closed = slot.open();
+        slot.close();
+        assert!(closed.try_recv().is_err());
+        slot.answer(false);
     }
 }

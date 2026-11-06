@@ -1383,6 +1383,7 @@ name = "docsweep-gui"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "docsweep-browser",
  "docsweep-core",
  "serde",
  "serde_json",

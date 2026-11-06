@@ -1,14 +1,16 @@
 import { api, errorText } from "../lib/api.js";
 import { h, icon, replace } from "../lib/dom.js";
-import { t } from "../lib/i18n.js";
-import { confirmDialog, emptyState, field, folderInput, notice, pageHeader, showIssues, textInput, toast } from "../lib/ui.js";
+import { t, tn } from "../lib/i18n.js";
+import { reportList, summaryStats } from "../lib/report.js";
+import { confirmDialog, emptyState, field, folderInput, notice, pageHeader, showIssues, textInput, toast, withBusy } from "../lib/ui.js";
 
 const DRAFTS_KEY = "docsweep.company-drafts";
 
 const defaultFilename = (name) => `{date:%Y-%m-%d} - ${name || "Company"} - {invoice_no}.pdf`;
 
 // Unsaved work survives leaving the page, switching companies and restarts.
-// Drafts only hold what the form shows; secrets never pass through this form.
+// Drafts hold what the form shows, except for secrets: those stay in their
+// fields and go straight to the keychain.
 function loadDrafts() {
   try {
     return JSON.parse(localStorage.getItem(DRAFTS_KEY)) ?? {};
@@ -59,6 +61,7 @@ function blankDraft(domain = "") {
     disposalChoice: "default",
     moveTo: "",
     hasPortal: false,
+    recipe: "",
     schedule: "",
   };
 }
@@ -79,6 +82,7 @@ function draftFrom(company) {
     disposalChoice: disposal === "delete" ? "delete" : disposal?.move_to ? "move" : "default",
     moveTo: disposal?.move_to ?? "",
     hasPortal: Boolean(company.portal),
+    recipe: company.portal?.recipe ?? "",
     schedule: company.portal?.schedule ?? "",
     original: company,
   };
@@ -99,6 +103,7 @@ function companyFrom(draft, id) {
       recipe: `recipes/${id}.yaml`,
       ...(draft.original?.portal ?? {}),
     };
+    if (draft.recipe?.trim()) company.portal.recipe = draft.recipe.trim();
     if (draft.schedule.trim()) company.portal.schedule = draft.schedule.trim();
     else delete company.portal.schedule;
   }
@@ -323,14 +328,49 @@ export function renderCompanies(app, options = {}) {
         },
       }, t(`companies.disposal.${choice}`))));
 
-    const portalNote = h("p", { class: "field-hint", hidden: !draft.hasPortal }, t("companies.portal.note"));
+    const secretsOf = () => (draft.isNew ? { credentials: false, totp: false } : app.portalSecretsOf(draft.id));
+    const secretInput = (autocomplete) => h("input", { type: "password", autocomplete });
+    const portalUser = textInput({ autocomplete: "off" });
+    const portalPassword = secretInput("new-password");
+    const portalTotp = secretInput("off");
+    const portalFields = h("div", { class: "form", hidden: !draft.hasPortal },
+      h("p", { class: "field-hint" }, t("companies.portal.note")),
+      field({
+        label: t("companies.portal.recipe"),
+        hint: t("companies.portal.recipe_hint"),
+        path: "portal.recipe",
+        input: textInput({
+          value: draft.recipe ?? "",
+          class: "mono",
+          placeholder: "recipes/example.yaml",
+          oninput: (event) => { draft.recipe = event.target.value; },
+        }),
+      }),
+      h("div", { class: "form-row" },
+        field({
+          label: t("companies.portal.user"),
+          hint: t(secretsOf().credentials ? "companies.portal.login_stored" : "companies.portal.login_hint"),
+          path: "portal.credentials",
+          input: portalUser,
+        }),
+        field({ label: t("companies.portal.password"), path: "portal.password", input: portalPassword }),
+      ),
+      field({
+        label: t("companies.portal.totp"),
+        hint: t(secretsOf().totp ? "companies.portal.totp_stored" : "companies.portal.totp_hint"),
+        path: "portal.totp",
+        optional: true,
+        input: portalTotp,
+      }),
+      fetchPanel(),
+    );
     const portalToggle = h("label", { class: "check" },
       h("input", {
         type: "checkbox",
         checked: draft.hasPortal,
         onchange: (event) => {
           draft.hasPortal = event.target.checked;
-          portalNote.hidden = !draft.hasPortal;
+          portalFields.hidden = !draft.hasPortal;
         },
       }),
       h("span", {}, t("companies.portal.toggle")));
@@ -340,17 +380,106 @@ export function renderCompanies(app, options = {}) {
     form.addEventListener("input", remember);
     form.addEventListener("change", remember);
 
+    // Values go into the keychain once. The fields are then cleared, and nothing
+    // ever comes back from there.
+    async function storeTypedSecrets(id, company) {
+      if (portalUser.value.trim() && portalPassword.value) {
+        await api.setPortalCredentials(company.portal.credentials.replace("keyring:", ""), portalUser.value.trim(), portalPassword.value);
+        portalUser.value = "";
+        portalPassword.value = "";
+        app.setPortalSecretStored(id, "credentials");
+      }
+      if (company.portal?.totp && portalTotp.value) {
+        await api.setTotpKey(company.portal.totp.replace("keyring:", ""), portalTotp.value);
+        portalTotp.value = "";
+        app.setPortalSecretStored(id, "totp");
+      }
+    }
+
+    // Always a preview first; a real run only after confirming what it found.
+    function fetchPanel() {
+      const saved = !draft.isNew && draft.original?.portal;
+      if (!saved) return h("p", { class: "field-hint" }, t("fetch.needs_saving"));
+      const id = draft.id;
+      const name = draft.name;
+      const result = h("div", {});
+      const showBrowser = h("input", { type: "checkbox" });
+
+      const run = async (dryRun, button, busyKey) => withBusy(button, t(busyKey), async () => {
+        try {
+          const outcome = await api.runFetch(id, dryRun, showBrowser.checked);
+          showResult(outcome, dryRun);
+          if (!dryRun) app.refreshBadges();
+        } catch (error) {
+          replace(result, notice("danger", errorText(error)));
+        }
+      });
+
+      async function confirmRun(summary, button) {
+        const items = [];
+        if (summary.saved > 0) items.push({ icon: "file", text: tn("scan.confirm_saves", summary.saved) });
+        if (summary.for_review > 0) items.push({ icon: "flag", text: tn("scan.confirm_reviews", summary.for_review) });
+        const confirmed = await confirmDialog({
+          title: t("fetch.confirm_title", { name }),
+          text: t("fetch.confirm_text"),
+          items,
+          confirmLabel: t("fetch.confirm_run"),
+        });
+        if (confirmed) run(false, button, "fetch.running");
+      }
+
+      function showResult({ reports, summary, warning }, dryRun) {
+        const hasNew = summary.saved + summary.for_review > 0;
+        const download = h("button", {
+          class: "button button-primary",
+          disabled: !hasNew,
+          onclick: () => confirmRun(summary, download),
+        }, t("fetch.run"));
+        replace(result,
+          warning && notice("warning", warning),
+          summaryStats(summary, dryRun),
+          reportList(reports, { done: !dryRun }),
+          dryRun && h("div", { class: "action-bar" },
+            h("span", { class: "action-note" }, icon("question"), t(hasNew ? "fetch.preview_note" : "fetch.nothing_new")),
+            h("div", { class: "action-buttons" }, download)),
+        );
+      }
+
+      const fetchButton = h("button", {
+        class: "button",
+        onclick: () => run(true, fetchButton, "fetch.previewing"),
+      }, t("fetch.now"));
+
+      return h("div", { class: "form" },
+        h("div", { class: "form-actions" },
+          h("label", { class: "check" }, showBrowser, h("span", {}, t("fetch.show_browser"))),
+          h("span", { class: "spacer" }),
+          fetchButton,
+        ),
+        result,
+      );
+    }
+
     async function save(button) {
       const key = draft.key;
       const id = draft.isNew ? slug(draft.name, companies().map((c) => c.id)) : draft.id;
       const company = companyFrom(draft, id);
+      if (portalUser.value.trim() || portalPassword.value) {
+        if (!draft.hasPortal || !portalUser.value.trim() || !portalPassword.value) {
+          showIssues(form, [{ path: "portal.credentials", message: t("companies.portal.both_required") }]);
+          return;
+        }
+      }
+      if (draft.hasPortal && portalTotp.value) company.portal.totp ??= `keyring:${id}-totp`;
       const next = draft.isNew
         ? [...companies(), company]
         : companies().map((existing) => (existing.id === id ? company : existing));
       const position = next.findIndex((existing) => existing.id === id);
       button.disabled = true;
       try {
+        // Saved first, so a configuration problem leaves no stray secret behind.
         await persist(next);
+        await storeTypedSecrets(id, company);
         forget(key);
         toast(t("common.saved"));
         open(id);
@@ -432,7 +561,7 @@ export function renderCompanies(app, options = {}) {
       h("section", { class: "form-section" },
         h("h3", {}, t("companies.section.portal")),
         portalToggle,
-        portalNote,
+        portalFields,
       ),
 
       message,

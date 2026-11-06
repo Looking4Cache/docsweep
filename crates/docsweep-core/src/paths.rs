@@ -24,7 +24,8 @@ impl AppDirs {
         Some(Self::from_base(base.config_dir(), base.data_dir()))
     }
 
-    fn from_base(config_base: &Path, data_base: &Path) -> Self {
+    /// The directories below given base directories.
+    pub fn from_base(config_base: &Path, data_base: &Path) -> Self {
         let app_dir = if cfg!(any(target_os = "macos", target_os = "windows")) {
             names::DISPLAY_NAME
         } else {
