@@ -343,6 +343,14 @@ impl Index {
     }
 }
 
+#[cfg(test)]
+impl Index {
+    /// Makes every later write fail, to test how callers react.
+    pub(crate) fn break_for_test(&self) {
+        self.conn.execute_batch("DROP TABLE invoices").unwrap();
+    }
+}
+
 fn schema_version(conn: &Connection) -> rusqlite::Result<usize> {
     conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
         .map(|version| version as usize)

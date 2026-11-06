@@ -3,6 +3,8 @@
 //! Dry runs and real runs share [`plan::plan_mail`]. Dry runs only ever receive
 //! a [`MailReader`], so they cannot change a mailbox by construction.
 
+pub mod execute;
+pub mod imap;
 pub mod plan;
 pub mod rules;
 
