@@ -3,6 +3,7 @@
 pub mod config;
 pub mod document;
 pub mod index;
+pub mod mail;
 pub mod names;
 pub mod naming;
 pub mod paths;
