@@ -1,4 +1,4 @@
-//! Portal recipes: steps and selectors in a YAML file (`KONZEPT.md` section 8).
+//! Portal recipes: steps and selectors in a YAML file.
 //!
 //! Loading reports every problem at once with its path, like the configuration.
 //! Recipes are meant to be shared, so a recipe holds no secrets of any kind.
@@ -532,7 +532,7 @@ fn check_url(path: &str, url: &str, report: &mut Report) {
 mod tests {
     use super::*;
 
-    /// The example from section 8 of `KONZEPT.md`.
+    /// A complete example of the documented format.
     const CONCEPT_EXAMPLE: &str = r##"
 steps:
   - goto: https://portal.example.de/login

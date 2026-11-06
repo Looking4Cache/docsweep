@@ -1,4 +1,4 @@
-//! Platform directories as defined in `KONZEPT.md`.
+//! The project's platform directories.
 //!
 //! This uses `directories::BaseDirs` on purpose. `ProjectDirs` would append
 //! `config` and `data` on Windows and build a reverse-domain name on macOS,

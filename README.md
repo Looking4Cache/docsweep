@@ -259,7 +259,7 @@ What protects you:
 
 ## Development
 
-See [CLAUDE.md](CLAUDE.md) for the workspace layout, commands and rules, and [KONZEPT.md](KONZEPT.md) for the full concept (in German).
+See [CLAUDE.md](CLAUDE.md) for the workspace layout, commands and rules.
 
 ## Kurzfassung auf Deutsch
 

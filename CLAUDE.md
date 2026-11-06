@@ -6,7 +6,9 @@ Docsweep is a free, open-source desktop app in Rust for macOS, Windows and Linux
 It saves PDF attachments from mails and names them according to a configurable schema.
 It downloads invoices from customer portals using login and TOTP, driven by recipes rather than a permanently running AI.
 It cleans up the processed mails according to rules, but only after the invoice is provably stored and indexed.
-The full concept is in `KONZEPT.md`; its naming conventions and configuration model are binding.
+The naming conventions and the configuration model are binding; `names.rs`, `paths.rs` and `config.rs` define them.
+
+`KONZEPT.md` and `BOTSCHUTZ.md` are the maintainer's private notes in the working directory. They must never be committed, and changes to them are left to the maintainer.
 
 ## Workspace
 

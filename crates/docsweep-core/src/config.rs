@@ -1,4 +1,4 @@
-//! Configuration model and YAML loader (`KONZEPT.md` section 8).
+//! Configuration model and YAML loader.
 //!
 //! Loading reports every problem at once, each with the path of the affected
 //! value. Error messages never quote values of secret fields, and YAML snippets
@@ -719,7 +719,7 @@ fn is_valid_domain(domain: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The example from section 8 of `KONZEPT.md`.
+    /// A complete example of the documented format.
     const CONCEPT_EXAMPLE: &str = r#"
 mail:
   accounts:

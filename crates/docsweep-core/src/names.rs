@@ -1,4 +1,4 @@
-//! Binding names from the "Namenskonventionen" section of `KONZEPT.md`.
+//! The project's binding names.
 //!
 //! The Bundle ID is deliberately not here: its single source is `identifier`
 //! in `crates/docsweep-gui/tauri.conf.json`.
