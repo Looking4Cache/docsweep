@@ -78,6 +78,8 @@ pub fn store_verified(dir: &Path, filename: &str, bytes: &[u8]) -> Result<PathBu
         });
     }
 
+    apply_directory_permissions(dir, temporary.path()).map_err(io_error(temporary.path()))?;
+
     let mut temporary = temporary;
     for candidate in candidates(dir, filename) {
         match temporary.persist_noclobber(&candidate) {
@@ -96,6 +98,23 @@ pub fn store_verified(dir: &Path, filename: &str, bytes: &[u8]) -> Result<PathBu
     Err(StorageError::NoFreeName {
         path: dir.join(filename),
     })
+}
+
+/// Temporary files are private, which would otherwise stick to the invoice. It
+/// gets the access of its folder instead, without the execute bits: a shared
+/// folder stays shared and a private one stays private. On Windows, new files
+/// inherit the folder's permissions anyway.
+#[cfg(unix)]
+fn apply_directory_permissions(dir: &Path, file: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory_mode = fs::metadata(dir)?.permissions().mode();
+    fs::set_permissions(file, fs::Permissions::from_mode(directory_mode & 0o666))
+}
+
+#[cfg(not(unix))]
+fn apply_directory_permissions(_dir: &Path, _file: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -149,6 +168,20 @@ mod tests {
             predicted,
             store_verified(dir.path(), "x.pdf", b"two").unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stored_files_take_their_access_from_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (folder_mode, file_mode) in [(0o755, 0o644), (0o770, 0o660), (0o700, 0o600)] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(folder_mode)).unwrap();
+            let path = store_verified(dir.path(), "x.pdf", b"content").unwrap();
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, file_mode, "folder {folder_mode:o}");
+        }
     }
 
     #[test]
