@@ -441,7 +441,7 @@ fn record_run<R: Serialize, S: Serialize>(
     let summary = serde_json::to_string(summary).map_err(|e| e.to_string())?;
     let report = serde_json::to_string(reports).map_err(|e| e.to_string())?;
     Index::open(&paths.index)
-        .and_then(|index| index.record_run(&summary, &report))
+        .and_then(|index| index.record_run(&summary, &report, false))
         .map_err(|e| format!("the run could not be added to the history: {e}"))
 }
 

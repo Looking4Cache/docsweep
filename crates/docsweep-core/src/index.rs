@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde::Serialize;
 
@@ -48,11 +48,23 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX invoices_portal_key ON invoices (company_id, portal_key)
         WHERE portal_key IS NOT NULL;
 "#,
+    r#"
+    ALTER TABLE invoices ADD COLUMN resolved_at TEXT;
+    ALTER TABLE scan_runs ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE company_runs (
+        company_id          TEXT PRIMARY KEY,
+        last_link_fetch_on  TEXT,
+        last_scheduled_run  TEXT
+    );
+"#,
 ];
 
 /// The first schema version with the column `portal_key`. A dry run reads an
 /// index without migrating it, so it can meet older ones.
 const PORTAL_KEY_VERSION: usize = 3;
+/// The first schema version that knows about resolved rows, automatic runs and
+/// the table `company_runs`.
+const AUTOMATION_VERSION: usize = 4;
 
 /// Where an invoice came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -148,6 +160,9 @@ pub struct InvoiceRecord {
     pub mail_id: Option<String>,
     pub status: Status,
     pub disposed_at: Option<String>,
+    /// Set on a `portal_fetch_required` row once its invoice is stored and its
+    /// mail cleaned up.
+    pub resolved_at: Option<String>,
 }
 
 impl InvoiceRecord {
@@ -168,6 +183,8 @@ impl InvoiceRecord {
             mail_id: row.get("mail_id")?,
             status: Status::parse(&row.get::<_, String>("status")?)?,
             disposed_at: row.get("disposed_at")?,
+            // A dry run can read an older index, which lacks this column.
+            resolved_at: row.get("resolved_at").unwrap_or(None),
         })
     }
 }
@@ -191,6 +208,8 @@ pub struct ScanRun {
     pub finished_at: String,
     pub summary: String,
     pub report: String,
+    /// Started by the schedule or by polling, not by a person.
+    pub automatic: bool,
 }
 
 /// Why the index could not be used.
@@ -339,7 +358,8 @@ impl Index {
         Ok(added > 0)
     }
 
-    /// Whether a link mail is already noted as requiring a portal fetch.
+    /// Whether a link mail is already noted as requiring a portal fetch. A
+    /// resolved row counts, so a mail that comes back is not noted twice.
     pub fn is_portal_fetch_recorded(
         &self,
         company_id: &str,
@@ -395,6 +415,113 @@ impl Index {
         Ok(())
     }
 
+    /// Whether the index holds a stored portal invoice that matches a noted link
+    /// mail: its row is newer than the mail's, or its date is on or after the
+    /// mail's. Only a file that still exists counts, as for PDF mails.
+    pub fn has_invoice_for_link_mail(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<bool, IndexError> {
+        let mut statement = self.conn.prepare(
+            "SELECT invoice.file_path FROM invoices AS invoice
+             JOIN invoices AS link ON link.company_id = invoice.company_id
+             WHERE link.company_id = ?1 AND link.mail_account = ?2 AND link.mail_id = ?3
+               AND link.status = 'portal_fetch_required'
+               AND invoice.source = 'portal' AND invoice.status = 'stored'
+               AND invoice.file_path IS NOT NULL
+               AND (invoice.id > link.id OR invoice.invoice_date >= link.invoice_date)",
+        )?;
+        let paths = statement.query_map(params![company_id, mail_account, mail_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for path in paths {
+            if Path::new(&path?).exists() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Records that a link mail's invoice is stored and the mail was cleaned up.
+    pub fn resolve_link_mail(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<(), IndexError> {
+        self.conn.execute(
+            "UPDATE invoices
+             SET resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 disposed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
+               AND status = 'portal_fetch_required'",
+            params![company_id, mail_account, mail_id],
+        )?;
+        Ok(())
+    }
+
+    /// The local date of the last fetch started because of link mails.
+    pub fn last_link_fetch_on(&self, company_id: &str) -> Result<Option<NaiveDate>, IndexError> {
+        let value = self.company_run_value("last_link_fetch_on", company_id)?;
+        Ok(value.and_then(|date| date.parse().ok()))
+    }
+
+    /// Notes that link mails started a fetch on this local date.
+    pub fn note_link_fetch(&self, company_id: &str, on: NaiveDate) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT INTO company_runs (company_id, last_link_fetch_on) VALUES (?1, ?2)
+             ON CONFLICT (company_id) DO UPDATE SET last_link_fetch_on = ?2",
+            params![company_id, on.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// When the schedule of a company last started a run.
+    pub fn last_scheduled_run(
+        &self,
+        company_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, IndexError> {
+        let value = self.company_run_value("last_scheduled_run", company_id)?;
+        Ok(value.and_then(|time| {
+            DateTime::parse_from_rfc3339(&time)
+                .ok()
+                .map(|time| time.to_utc())
+        }))
+    }
+
+    /// Notes when the schedule of a company started a run.
+    pub fn note_scheduled_run(
+        &self,
+        company_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT INTO company_runs (company_id, last_scheduled_run) VALUES (?1, ?2)
+             ON CONFLICT (company_id) DO UPDATE SET last_scheduled_run = ?2",
+            params![company_id, at.to_rfc3339_opts(SecondsFormat::Secs, true)],
+        )?;
+        Ok(())
+    }
+
+    /// `column` is one of the fixed names above, never input.
+    fn company_run_value(
+        &self,
+        column: &str,
+        company_id: &str,
+    ) -> Result<Option<String>, IndexError> {
+        if schema_version(&self.conn)? < AUTOMATION_VERSION {
+            return Ok(None);
+        }
+        let query = format!("SELECT {column} FROM company_runs WHERE company_id = ?1");
+        let value = self
+            .conn
+            .query_row(&query, [company_id], |row| row.get(0))
+            .optional()?;
+        Ok(value.flatten())
+    }
+
     /// The newest rows of all companies.
     pub fn recent_invoices(&self, limit: u32) -> Result<Vec<InvoiceRecord>, IndexError> {
         let mut statement = self
@@ -438,26 +565,38 @@ impl Index {
         Ok(())
     }
 
-    /// Adds a finished real scan to the history.
-    pub fn record_run(&self, summary: &str, report: &str) -> Result<(), IndexError> {
+    /// Adds a finished real run to the history.
+    pub fn record_run(
+        &self,
+        summary: &str,
+        report: &str,
+        automatic: bool,
+    ) -> Result<(), IndexError> {
         self.conn.execute(
-            "INSERT INTO scan_runs (summary, report) VALUES (?1, ?2)",
-            params![summary, report],
+            "INSERT INTO scan_runs (summary, report, automatic) VALUES (?1, ?2, ?3)",
+            params![summary, report, automatic],
         )?;
         Ok(())
     }
 
     /// The newest scans in the history.
     pub fn recent_runs(&self, limit: u32) -> Result<Vec<ScanRun>, IndexError> {
-        let mut statement = self.conn.prepare(
-            "SELECT id, finished_at, summary, report FROM scan_runs ORDER BY id DESC LIMIT ?1",
-        )?;
+        let automatic = if schema_version(&self.conn)? >= AUTOMATION_VERSION {
+            "automatic"
+        } else {
+            "0"
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT id, finished_at, summary, report, {automatic} FROM scan_runs
+             ORDER BY id DESC LIMIT ?1"
+        ))?;
         let rows = statement.query_map([limit], |row| {
             Ok(ScanRun {
                 id: row.get(0)?,
                 finished_at: row.get(1)?,
                 summary: row.get(2)?,
                 report: row.get(3)?,
+                automatic: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -707,11 +846,13 @@ mod tests {
     #[test]
     fn run_history_is_newest_first() {
         let index = Index::open_in_memory().unwrap();
-        index.record_run("{\"saved\":1}", "[]").unwrap();
-        index.record_run("{\"saved\":2}", "[]").unwrap();
+        index.record_run("{\"saved\":1}", "[]", false).unwrap();
+        index.record_run("{\"saved\":2}", "[]", true).unwrap();
         let runs = index.recent_runs(10).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].summary, "{\"saved\":2}");
+        assert!(runs[0].automatic);
+        assert!(!runs[1].automatic);
     }
 
     #[test]
@@ -724,7 +865,7 @@ mod tests {
         drop(conn);
 
         let index = Index::open(&path).unwrap();
-        index.record_run("{}", "[]").unwrap();
+        index.record_run("{}", "[]", false).unwrap();
         assert_eq!(index.recent_runs(1).unwrap().len(), 1);
     }
 
@@ -778,6 +919,192 @@ mod tests {
         let index = Index::open_read_only(&path).unwrap().unwrap();
         assert!(index.is_portal_entry_known("acme", "R-1").unwrap());
         assert!(!index.is_portal_entry_known("acme", "R-2").unwrap());
+    }
+
+    /// An index as the previous version left it, with one row and one run.
+    fn index_before_automation(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        for migration in &MIGRATIONS[..AUTOMATION_VERSION - 1] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (AUTOMATION_VERSION - 1) as i64)
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO invoices (company_id, invoice_no, source, status)
+             VALUES ('acme', 'R-1', 'mail', 'stored');
+             INSERT INTO scan_runs (summary, report) VALUES ('{}', '[]');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_can_read_an_index_from_before_automation_without_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        index_before_automation(&path);
+
+        let index = Index::open_read_only(&path).unwrap().unwrap();
+
+        assert_eq!(index.invoices_of("acme").unwrap()[0].resolved_at, None);
+        assert_eq!(index.last_link_fetch_on("acme").unwrap(), None);
+        assert_eq!(index.last_scheduled_run("acme").unwrap(), None);
+        assert!(!index.recent_runs(1).unwrap()[0].automatic);
+        assert_eq!(
+            schema_version(&index.conn).unwrap(),
+            AUTOMATION_VERSION - 1,
+            "a dry run never migrates"
+        );
+    }
+
+    #[test]
+    fn an_index_from_before_automation_is_migrated_by_a_real_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        index_before_automation(&path);
+
+        let index = Index::open(&path).unwrap();
+
+        assert_eq!(index.invoices_of("acme").unwrap().len(), 1);
+        assert!(!index.recent_runs(1).unwrap()[0].automatic);
+        index
+            .note_link_fetch("acme", NaiveDate::from_ymd_opt(2026, 11, 6).unwrap())
+            .unwrap();
+    }
+
+    /// A noted link mail from 3 November, and a stored file on disk.
+    fn with_link_mail(dir: &Path) -> (Index, PathBuf) {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .record_portal_fetch_required(
+                "acme",
+                "main",
+                "<link>",
+                NaiveDate::from_ymd_opt(2026, 11, 3),
+            )
+            .unwrap();
+        let file = dir.join("a.pdf");
+        fs::write(&file, b"x").unwrap();
+        (index, file)
+    }
+
+    fn portal_invoice(file: &Path, date: Option<NaiveDate>, status: Status) -> NewInvoice {
+        NewInvoice {
+            invoice_date: date,
+            file_path: file.to_path_buf(),
+            source: Source::Portal,
+            mail_account: None,
+            mail_id: None,
+            portal_key: Some("K-1".into()),
+            status,
+            ..invoice(Some("R-1"), "h1")
+        }
+    }
+
+    fn matches_link_mail(index: &Index) -> bool {
+        index
+            .has_invoice_for_link_mail("acme", "main", "<link>")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_link_mail_matches_a_portal_invoice_stored_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, file) = with_link_mail(dir.path());
+        assert!(!matches_link_mail(&index), "the mail's own row is no match");
+
+        let older = NaiveDate::from_ymd_opt(2026, 10, 1);
+        index
+            .insert(&portal_invoice(&file, older, Status::Stored))
+            .unwrap();
+
+        assert!(matches_link_mail(&index));
+    }
+
+    #[test]
+    fn a_link_mail_matches_an_earlier_portal_invoice_dated_on_or_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.pdf");
+        fs::write(&file, b"x").unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
+        for (invoice_date, expected) in [(date, true), (date.pred_opt().unwrap(), false)] {
+            let index = Index::open_in_memory().unwrap();
+            index
+                .insert(&portal_invoice(&file, Some(invoice_date), Status::Stored))
+                .unwrap();
+            index
+                .record_portal_fetch_required("acme", "main", "<link>", Some(date))
+                .unwrap();
+            assert_eq!(matches_link_mail(&index), expected, "{invoice_date}");
+        }
+    }
+
+    #[test]
+    fn a_link_mail_does_not_match_what_is_not_a_stored_portal_invoice() {
+        let dir = tempfile::tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 11, 4);
+
+        let (index, file) = with_link_mail(dir.path());
+        index
+            .insert(&portal_invoice(&file, date, Status::NeedsReview))
+            .unwrap();
+        assert!(!matches_link_mail(&index), "still in review");
+
+        let (index, file) = with_link_mail(dir.path());
+        let mut from_mail = portal_invoice(&file, date, Status::Stored);
+        from_mail.source = Source::Mail;
+        index.insert(&from_mail).unwrap();
+        assert!(!matches_link_mail(&index), "came from a mail");
+
+        let (index, file) = with_link_mail(dir.path());
+        let mut elsewhere = portal_invoice(&file, date, Status::Stored);
+        elsewhere.company_id = "other".into();
+        index.insert(&elsewhere).unwrap();
+        assert!(!matches_link_mail(&index), "another company's");
+
+        let (index, _) = with_link_mail(dir.path());
+        let gone = portal_invoice(&dir.path().join("gone.pdf"), date, Status::Stored);
+        index.insert(&gone).unwrap();
+        assert!(!matches_link_mail(&index), "its file is gone");
+    }
+
+    #[test]
+    fn resolving_a_link_mail_keeps_the_row_and_marks_only_that_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, _) = with_link_mail(dir.path());
+        index
+            .record_portal_fetch_required("acme", "main", "<other>", None)
+            .unwrap();
+
+        index.resolve_link_mail("acme", "main", "<link>").unwrap();
+
+        let rows = index.invoices_of("acme").unwrap();
+        assert!(rows[0].resolved_at.is_some());
+        assert!(rows[0].disposed_at.is_some());
+        assert_eq!(rows[1].resolved_at, None);
+        assert!(
+            !index
+                .record_portal_fetch_required("acme", "main", "<link>", None)
+                .unwrap(),
+            "a mail that comes back is not noted again"
+        );
+    }
+
+    #[test]
+    fn company_runs_are_remembered_per_company_and_kind() {
+        let index = Index::open_in_memory().unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
+        let time = DateTime::parse_from_rfc3339("2026-11-06T08:00:00Z")
+            .unwrap()
+            .to_utc();
+
+        index.note_link_fetch("acme", day).unwrap();
+        assert_eq!(index.last_link_fetch_on("acme").unwrap(), Some(day));
+        assert_eq!(index.last_scheduled_run("acme").unwrap(), None);
+
+        index.note_scheduled_run("acme", time).unwrap();
+        assert_eq!(index.last_link_fetch_on("acme").unwrap(), Some(day));
+        assert_eq!(index.last_scheduled_run("acme").unwrap(), Some(time));
+        assert_eq!(index.last_link_fetch_on("other").unwrap(), None);
     }
 
     #[test]
