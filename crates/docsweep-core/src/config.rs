@@ -7,27 +7,29 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::names;
 use crate::naming::FilenameTemplate;
 
 /// The whole `docsweep.yaml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub mail: MailConfig,
     /// Optional AI provider; unused until the AI milestone.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub llm: Option<LlmConfig>,
     #[serde(default)]
     pub companies: Vec<Company>,
 }
 
 /// The `mail` section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailConfig {
     pub accounts: Vec<MailAccount>,
@@ -35,7 +37,7 @@ pub struct MailConfig {
 }
 
 /// One IMAP mailbox.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailAccount {
     pub id: String,
@@ -57,10 +59,11 @@ impl MailAccount {
 }
 
 /// Global default for cleaning up mails.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalDisposal {
     pub mode: DisposalMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub move_to: Option<String>,
     #[serde(default = "default_true")]
     pub delete_to_trash: bool,
@@ -71,7 +74,7 @@ fn default_true() -> bool {
 }
 
 /// The three global cleanup modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisposalMode {
     AllDelete,
@@ -80,7 +83,7 @@ pub enum DisposalMode {
 }
 
 /// The `llm` section.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
     pub provider: LlmProvider,
@@ -88,7 +91,7 @@ pub struct LlmConfig {
 }
 
 /// Supported AI providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProvider {
     Anthropic,
@@ -97,41 +100,48 @@ pub enum LlmProvider {
 }
 
 /// A company, the top-level object of the configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Company {
     pub id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mail: Option<MailRule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub portal: Option<Portal>,
     pub output: Output,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disposal: Option<CompanyDisposal>,
 }
 
 /// Which mails belong to a company. All given conditions must match.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MailRule {
     pub from_domain: String,
     /// Regular expression for the subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// Regular expression for attachment file names.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<String>,
 }
 
 /// Portal access; parsed and validated now, used from the recipe milestone on.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Portal {
     pub credentials: SecretRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub totp: Option<SecretRef>,
     pub recipe: PathBuf,
     /// Cron expression with five fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
 }
 
 /// Where invoices are stored and how they are named.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Output {
     pub dir: String,
@@ -155,7 +165,7 @@ fn expand_home(dir: &str, home: Option<&Path>) -> PathBuf {
 }
 
 /// Per-company override of the global disposal.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged, expecting = "`delete` or `{ move_to: <folder> }`")]
 pub enum CompanyDisposal {
     Delete(DeleteKeyword),
@@ -163,14 +173,14 @@ pub enum CompanyDisposal {
 }
 
 /// The literal `delete`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteKeyword {
     Delete,
 }
 
 /// `{ move_to: <folder> }`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MoveTarget {
     pub move_to: String,
@@ -180,11 +190,16 @@ pub struct MoveTarget {
 ///
 /// Loading rejects everything else, so plaintext secrets cannot pass. `Debug`
 /// is redacted because an unvalidated value could be a plaintext secret.
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct SecretRef(String);
 
 impl SecretRef {
+    /// The reference for a keychain id.
+    pub fn from_id(id: &str) -> Self {
+        Self(format!("{}{id}", names::CONFIG_SECRET_PREFIX))
+    }
+
     /// The keychain id, or `None` if this is not a valid reference.
     pub fn id(&self) -> Option<&str> {
         self.0
@@ -203,7 +218,7 @@ impl fmt::Debug for SecretRef {
 }
 
 /// A single validation problem.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Issue {
     /// Path of the value, for example `companies[1].mail.subject`.
     pub path: String,
@@ -218,6 +233,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot write configuration file {path}: {message}")]
+    Write { path: PathBuf, message: String },
     #[error("{origin} has a syntax or structure error: {message}")]
     Syntax { origin: String, message: String },
     #[error("{origin} has {} problem(s):{}", issues.len(), format_issues(issues))]
@@ -259,6 +276,40 @@ impl Config {
         Self::parse(input, "the configuration")
     }
 
+    /// Validates and writes the configuration atomically.
+    ///
+    /// Writing does not preserve YAML comments. The first time an existing file
+    /// is replaced, it is therefore kept once as `docsweep.yaml.bak`.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let origin = path.display().to_string();
+        let issues = self.validate();
+        if !issues.is_empty() {
+            return Err(ConfigError::Invalid { origin, issues });
+        }
+        let write_error = |message: String| ConfigError::Write {
+            path: path.to_path_buf(),
+            message,
+        };
+        let yaml = serde_saphyr::to_string(self).map_err(|e| write_error(e.to_string()))?;
+
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(dir).map_err(|e| write_error(e.to_string()))?;
+        let backup = path.with_extension("yaml.bak");
+        if path.exists() && !backup.exists() {
+            fs::copy(path, &backup).map_err(|e| write_error(e.to_string()))?;
+        }
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(dir).map_err(|e| write_error(e.to_string()))?;
+        temporary
+            .write_all(yaml.as_bytes())
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|e| write_error(e.to_string()))?;
+        temporary
+            .persist(path)
+            .map_err(|e| write_error(e.to_string()))?;
+        Ok(())
+    }
+
     fn parse(input: &str, origin: &str) -> Result<Self, ConfigError> {
         let options = serde_saphyr::options! { with_snippet: false };
         let config: Config = serde_saphyr::from_str_with_options(input, options).map_err(|e| {
@@ -278,7 +329,8 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Vec<Issue> {
+    /// All validation problems of this configuration.
+    pub fn validate(&self) -> Vec<Issue> {
         let mut report = Report::default();
         self.mail.validate(&mut report);
         if let Some(llm) = &self.llm {
@@ -679,6 +731,69 @@ mail:
             .unwrap_err()
             .to_string();
         assert!(error.contains("single quotes"), "{error}");
+    }
+
+    #[test]
+    fn saving_round_trips_every_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("docsweep.yaml");
+        let mut config = Config::from_yaml(CONCEPT_EXAMPLE).unwrap();
+        config.companies[1].output.dir = r"C:\Users\me\Rechnungen".to_owned();
+
+        config.save(&path).unwrap();
+        let reloaded = Config::load(&path).unwrap();
+
+        assert_eq!(
+            serde_saphyr::to_string(&reloaded).unwrap(),
+            serde_saphyr::to_string(&config).unwrap()
+        );
+        let hetzner = &reloaded.companies[1];
+        assert_eq!(hetzner.output.dir, r"C:\Users\me\Rechnungen");
+        assert_eq!(
+            hetzner.mail.as_ref().unwrap().attachment.as_deref(),
+            Some("(?i).*\\.pdf")
+        );
+        assert_eq!(
+            reloaded.companies[0].disposal,
+            Some(CompanyDisposal::Delete(DeleteKeyword::Delete))
+        );
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("keyring:mail-rechnungen"), "{written}");
+    }
+
+    #[test]
+    fn saving_refuses_invalid_configurations_and_keeps_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.yaml");
+        let mut config = Config::from_yaml(MINIMAL_MAIL).unwrap();
+        config.save(&path).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        config.mail.accounts[0].password = SecretRef("plaintext".into());
+        assert!(matches!(
+            config.save(&path),
+            Err(ConfigError::Invalid { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn saving_keeps_the_original_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.yaml");
+        fs::write(&path, format!("# my comment\n{MINIMAL_MAIL}")).unwrap();
+        let config = Config::load(&path).unwrap();
+
+        config.save(&path).unwrap();
+        config.save(&path).unwrap();
+
+        let backup = fs::read_to_string(dir.path().join("docsweep.yaml.bak")).unwrap();
+        assert!(backup.contains("# my comment"));
+    }
+
+    #[test]
+    fn secret_refs_can_be_built_from_an_id() {
+        assert_eq!(SecretRef::from_id("mail").id(), Some("mail"));
     }
 
     #[test]

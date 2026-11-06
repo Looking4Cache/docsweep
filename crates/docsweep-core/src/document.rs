@@ -12,6 +12,7 @@ use lopdf::{Dictionary, Document, Object};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use regex::{Regex, RegexBuilder};
+use serde::Serialize;
 
 /// Names under which hybrid invoices embed their XML.
 const EMBEDDED_XML_NAMES: &[&str] = &[
@@ -22,7 +23,7 @@ const EMBEDDED_XML_NAMES: &[&str] = &[
 ];
 
 /// What could be read from a document. Every field may be unknown.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct InvoiceFacts {
     pub invoice_no: Option<String>,
     pub date: Option<NaiveDate>,

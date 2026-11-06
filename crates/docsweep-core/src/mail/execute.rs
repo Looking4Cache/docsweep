@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 
 use chrono::{Local, NaiveDate};
+use serde::Serialize;
 
 use super::imap::{ImapMailbox, TransportSecurity};
 use super::plan::{
@@ -22,7 +23,8 @@ use crate::secrets::{SecretError, SecretStore};
 use crate::storage::{self, StorageError};
 
 /// What came of a planned mail.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
     /// Dry run: nothing was changed.
     Planned,
@@ -35,19 +37,95 @@ pub enum Outcome {
 }
 
 /// One mail in a report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MailReport {
     pub plan: MailPlan,
     pub outcome: Outcome,
 }
 
 /// The result for one account.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct AccountReport {
     pub account_id: String,
     pub mails: Vec<MailReport>,
     /// Set if the account could not be processed (completely).
     pub error: Option<String>,
+}
+
+/// Counts of a scan, for headlines and the run history.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ScanSummary {
+    /// Documents saved as complete invoices (or planned to be).
+    pub saved: u32,
+    /// Documents saved for review (or planned to be).
+    pub for_review: u32,
+    pub already_stored: u32,
+    /// Mails cleaned up (or planned to be).
+    pub disposed: u32,
+    pub portal_fetches: u32,
+    pub unknown_invoices: u32,
+    /// Mails and accounts that failed.
+    pub failed: u32,
+}
+
+/// Summarises reports. Steps of a failed mail do not count as done.
+pub fn summarize(reports: &[AccountReport]) -> ScanSummary {
+    let mut summary = ScanSummary::default();
+    for account in reports {
+        summary.failed += u32::from(account.error.is_some());
+        for mail in &account.mails {
+            if matches!(mail.outcome, Outcome::Failed { .. }) {
+                summary.failed += 1;
+                continue;
+            }
+            match &mail.plan.action {
+                MailAction::Invoices {
+                    documents,
+                    decision,
+                    ..
+                } => {
+                    for document in documents {
+                        match document.disposition {
+                            Disposition::Store => summary.saved += 1,
+                            Disposition::StoreForReview(_) => summary.for_review += 1,
+                            Disposition::AlreadyStored { .. } | Disposition::Unresolved { .. } => {
+                                summary.already_stored += 1;
+                            }
+                        }
+                    }
+                    summary.disposed += u32::from(matches!(decision, MailDecision::Dispose(_)));
+                }
+                MailAction::PortalFetchRequired { .. } => summary.portal_fetches += 1,
+                MailAction::UnknownInvoice { .. } => summary.unknown_invoices += 1,
+                MailAction::NoDocument { .. } => {}
+            }
+        }
+    }
+    summary
+}
+
+/// Logs in and opens the watched folder without changing anything, and returns
+/// how many mails it holds.
+pub async fn test_mailbox(
+    account: &MailAccount,
+    secrets: &dyn SecretStore,
+) -> Result<u32, ScanError> {
+    let invalid = || ScanError::InvalidAccount(account.id.clone());
+    let (host, port) = account.endpoint().ok_or_else(invalid)?;
+    let secret_id = account.password.id().ok_or_else(invalid)?;
+    let password = secrets.get(secret_id)?;
+    let mut reader = ImapMailbox::connect_read_only(
+        host,
+        port,
+        TransportSecurity::for_port(port),
+        &account.user,
+        &password,
+        &account.watch,
+    )
+    .await?;
+    let count = reader.message_count();
+    reader.logout().await;
+    Ok(count)
 }
 
 /// Why a scan could not run at all.
@@ -671,6 +749,68 @@ companies:
         assert_eq!(index.invoices_of("acme").unwrap().len(), 1);
         assert_eq!(fs::read_dir(setup.dir.path()).unwrap().count(), 1);
         assert_eq!(mailbox.moved.len(), 2);
+    }
+
+    #[test]
+    fn summary_counts_what_actually_happened() {
+        let setup = setup(MOVE, "");
+        let index = Index::open_in_memory().unwrap();
+        let no_number = test_mail::raw(
+            "b@acme.example",
+            "Post",
+            "1@x",
+            &[("a.pdf", &test_pdf::with_text(&["Keine Nummer"]))],
+        );
+        let mut mailbox = FakeMailbox::with(vec![no_number, pdf_mail("2@x", "R-2")]);
+        let mails = run_real(&setup, &index, &mut mailbox);
+        let reports = [AccountReport {
+            account_id: "main".into(),
+            mails,
+            error: Some("connection lost".into()),
+        }];
+
+        let summary = summarize(&reports);
+
+        assert_eq!(summary.saved, 1);
+        assert_eq!(summary.for_review, 1);
+        assert_eq!(summary.disposed, 1);
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn failed_mails_do_not_count_as_saved() {
+        let setup = setup(MOVE, "");
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![pdf_mail("1@x", "R-1")]);
+        mailbox.fail_disposal = true;
+        let mails = run_real(&setup, &index, &mut mailbox);
+        let reports = [AccountReport {
+            account_id: "main".into(),
+            mails,
+            error: None,
+        }];
+
+        let summary = summarize(&reports);
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.disposed, 0);
+    }
+
+    #[test]
+    fn reports_serialize_with_stable_tags_for_the_gui() {
+        let setup = setup(MOVE, "");
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![pdf_mail("1@x", "R-1")]);
+        let mails = run_real(&setup, &index, &mut mailbox);
+        let json = serde_json::to_value(&mails[0]).unwrap();
+
+        assert_eq!(json["outcome"]["kind"], "completed");
+        assert_eq!(json["plan"]["action"]["kind"], "invoices");
+        let action = &json["plan"]["action"];
+        assert_eq!(action["decision"]["kind"], "dispose");
+        assert_eq!(action["decision"]["value"]["kind"], "move_to");
+        assert_eq!(action["decision"]["value"]["value"], "Done");
+        assert_eq!(action["documents"][0]["disposition"]["kind"], "store");
     }
 
     #[test]

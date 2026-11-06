@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
+use serde::Serialize;
 
 use super::IncomingMail;
 use super::rules::RuleSet;
@@ -18,7 +19,8 @@ use crate::storage::{self, StorageError, sha256_hex};
 const UNKNOWN_NUMBER_HASH_CHARS: usize = 8;
 
 /// The final step for a mail.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum DisposalAction {
     MoveTo(String),
     Trash,
@@ -64,7 +66,8 @@ pub fn disposal_for(config: &Config, company: &Company, kind: MailKind) -> Dispo
 }
 
 /// Why a stored document needs a person's attention.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ReviewReason {
     NumberNotFound,
     /// The company already has this number with a different file.
@@ -74,7 +77,8 @@ pub enum ReviewReason {
 }
 
 /// What happens to one document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Disposition {
     /// Store as a complete invoice.
     Store,
@@ -87,7 +91,7 @@ pub enum Disposition {
 }
 
 /// One PDF of a mail with its planned treatment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlannedDocument {
     pub attachment_index: usize,
     pub attachment_name: String,
@@ -102,14 +106,16 @@ pub struct PlannedDocument {
 }
 
 /// What happens to the mail once its documents are handled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum MailDecision {
     Dispose(DisposalAction),
     KeepAndFlag { reason: String },
 }
 
 /// What should happen to one relevant mail.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MailAction {
     /// A PDF mail of a known company.
     Invoices {
@@ -134,7 +140,7 @@ pub enum MailAction {
 }
 
 /// The plan for one mail.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MailPlan {
     pub uid: u32,
     pub message_id: String,

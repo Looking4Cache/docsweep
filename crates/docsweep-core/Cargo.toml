@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 directories.workspace = true
 futures-util = "0.3"
 keyring = "4"
@@ -33,4 +33,5 @@ utf7-imap = "0.3"
 
 [dev-dependencies]
 base64 = "0.22"
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt"] }

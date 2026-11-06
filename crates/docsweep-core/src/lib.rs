@@ -7,5 +7,6 @@ pub mod mail;
 pub mod names;
 pub mod naming;
 pub mod paths;
+pub mod review;
 pub mod secrets;
 pub mod storage;

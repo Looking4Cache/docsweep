@@ -223,7 +223,7 @@ impl ImapMailbox {
             .map_err(|cause| error(&format!("cannot open folder {folder}"), cause))?;
         Ok(ImapReader {
             connection,
-            is_empty: mailbox.exists == 0,
+            message_count: mailbox.exists,
         })
     }
 
@@ -245,7 +245,7 @@ impl ImapMailbox {
             .map_err(|cause| error(&format!("cannot open folder {folder}"), cause))?;
         Ok(ImapWriter {
             connection,
-            is_empty: mailbox.exists == 0,
+            message_count: mailbox.exists,
         })
     }
 }
@@ -253,10 +253,15 @@ impl ImapMailbox {
 /// A folder opened with `EXAMINE`.
 pub struct ImapReader {
     connection: Connection,
-    is_empty: bool,
+    message_count: u32,
 }
 
 impl ImapReader {
+    /// How many mails the folder held when it was opened.
+    pub fn message_count(&self) -> u32 {
+        self.message_count
+    }
+
     /// Ends the session.
     pub async fn logout(&mut self) {
         self.connection.logout().await;
@@ -265,7 +270,7 @@ impl ImapReader {
 
 impl MailReader for ImapReader {
     async fn list_headers(&mut self) -> Result<Vec<(u32, Vec<u8>)>, MailError> {
-        if self.is_empty {
+        if self.message_count == 0 {
             return Ok(Vec::new());
         }
         self.connection.list_headers().await
@@ -279,7 +284,7 @@ impl MailReader for ImapReader {
 /// A folder opened with `SELECT`.
 pub struct ImapWriter {
     connection: Connection,
-    is_empty: bool,
+    message_count: u32,
 }
 
 impl ImapWriter {
@@ -388,7 +393,7 @@ impl ImapWriter {
 
 impl MailReader for ImapWriter {
     async fn list_headers(&mut self) -> Result<Vec<(u32, Vec<u8>)>, MailError> {
-        if self.is_empty {
+        if self.message_count == 0 {
             return Ok(Vec::new());
         }
         self.connection.list_headers().await

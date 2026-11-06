@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
+use serde::Serialize;
 
 /// Schema migrations; the position plus one is the `user_version` it leads to.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
     CREATE TABLE invoices (
         id            INTEGER PRIMARY KEY,
         company_id    TEXT NOT NULL,
@@ -32,10 +34,20 @@ const MIGRATIONS: &[&str] = &[r#"
     CREATE UNIQUE INDEX invoices_pending_portal_fetch
         ON invoices (company_id, mail_account, mail_id)
         WHERE status = 'portal_fetch_required';
-"#];
+"#,
+    r#"
+    CREATE TABLE scan_runs (
+        id           INTEGER PRIMARY KEY,
+        finished_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        summary      TEXT NOT NULL,
+        report       TEXT NOT NULL
+    );
+"#,
+];
 
 /// Where an invoice came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Source {
     Mail,
     Portal,
@@ -59,7 +71,8 @@ impl Source {
 }
 
 /// Processing state of an invoice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Stored and complete.
     Stored,
@@ -109,7 +122,7 @@ pub struct NewInvoice {
 }
 
 /// A row of the index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InvoiceRecord {
     pub id: i64,
     pub company_id: String,
@@ -157,6 +170,16 @@ pub enum DuplicateCheck {
     SameFile(InvoiceRecord),
     /// The company already has this number, but with a different file.
     SameNumberDifferentFile(InvoiceRecord),
+}
+
+/// A finished real scan in the history. Summary and report are JSON, stored as
+/// shown to the user at the time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanRun {
+    pub id: i64,
+    pub finished_at: String,
+    pub summary: String,
+    pub report: String,
 }
 
 /// Why the index could not be used.
@@ -331,6 +354,74 @@ impl Index {
             params![mail_account, mail_id],
         )?;
         Ok(())
+    }
+
+    /// The newest rows of all companies.
+    pub fn recent_invoices(&self, limit: u32) -> Result<Vec<InvoiceRecord>, IndexError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT * FROM invoices ORDER BY id DESC LIMIT ?1")?;
+        let rows = statement.query_map([limit], InvoiceRecord::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One row by id.
+    pub fn invoice(&self, id: i64) -> Result<Option<InvoiceRecord>, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM invoices WHERE id = ?1",
+                [id],
+                InvoiceRecord::from_row,
+            )
+            .optional()?)
+    }
+
+    /// Completes a reviewed document with its number, date and final path.
+    pub fn complete_review(
+        &self,
+        id: i64,
+        invoice_no: &str,
+        invoice_date: NaiveDate,
+        file_path: &Path,
+    ) -> Result<(), IndexError> {
+        self.conn.execute(
+            "UPDATE invoices SET invoice_no = ?2, invoice_date = ?3, file_path = ?4,
+                                 status = 'stored'
+             WHERE id = ?1 AND status = 'needs_review'",
+            params![
+                id,
+                invoice_no,
+                invoice_date.to_string(),
+                file_path.to_string_lossy()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Adds a finished real scan to the history.
+    pub fn record_run(&self, summary: &str, report: &str) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT INTO scan_runs (summary, report) VALUES (?1, ?2)",
+            params![summary, report],
+        )?;
+        Ok(())
+    }
+
+    /// The newest scans in the history.
+    pub fn recent_runs(&self, limit: u32) -> Result<Vec<ScanRun>, IndexError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, finished_at, summary, report FROM scan_runs ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(ScanRun {
+                id: row.get(0)?,
+                finished_at: row.get(1)?,
+                summary: row.get(2)?,
+                report: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// All rows of a company, oldest first.
@@ -532,6 +623,69 @@ mod tests {
         let read_only = Index::open_read_only(&path).unwrap().unwrap();
         assert_eq!(read_only.invoices_of("acme").unwrap().len(), 1);
         assert!(read_only.insert(&invoice(Some("R-2"), "h2")).is_err());
+    }
+
+    #[test]
+    fn recent_invoices_are_newest_first_and_limited() {
+        let index = Index::open_in_memory().unwrap();
+        index.insert(&invoice(Some("R-1"), "h1")).unwrap();
+        let newest = index.insert(&invoice(Some("R-2"), "h2")).unwrap();
+
+        let rows = index.recent_invoices(1).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, newest);
+        assert_eq!(index.invoice(newest).unwrap().unwrap().id, newest);
+        assert_eq!(index.invoice(999).unwrap(), None);
+    }
+
+    #[test]
+    fn completing_a_review_only_affects_review_rows() {
+        let index = Index::open_in_memory().unwrap();
+        let mut new = invoice(None, "h1");
+        new.status = Status::NeedsReview;
+        let in_review = index.insert(&new).unwrap();
+        let stored = index.insert(&invoice(Some("R-9"), "h2")).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+
+        index
+            .complete_review(in_review, "R-1", date, Path::new("/new.pdf"))
+            .unwrap();
+        index
+            .complete_review(stored, "CHANGED", date, Path::new("/x.pdf"))
+            .unwrap();
+
+        let row = index.invoice(in_review).unwrap().unwrap();
+        assert_eq!(row.status, Status::Stored);
+        assert_eq!(row.invoice_no.as_deref(), Some("R-1"));
+        assert_eq!(row.invoice_date, Some(date));
+        assert_eq!(row.file_path, Some(PathBuf::from("/new.pdf")));
+        let untouched = index.invoice(stored).unwrap().unwrap();
+        assert_eq!(untouched.invoice_no.as_deref(), Some("R-9"));
+    }
+
+    #[test]
+    fn run_history_is_newest_first() {
+        let index = Index::open_in_memory().unwrap();
+        index.record_run("{\"saved\":1}", "[]").unwrap();
+        index.record_run("{\"saved\":2}", "[]").unwrap();
+        let runs = index.recent_runs(10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].summary, "{\"saved\":2}");
+    }
+
+    #[test]
+    fn an_existing_first_version_index_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+
+        let index = Index::open(&path).unwrap();
+        index.record_run("{}", "[]").unwrap();
+        assert_eq!(index.recent_runs(1).unwrap().len(), 1);
     }
 
     #[test]
