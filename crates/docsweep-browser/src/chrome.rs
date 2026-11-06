@@ -337,6 +337,12 @@ impl BrowserDriver for ChromeDriver {
             .map_err(|_| DriverError::Failed("the page could not be printed".to_owned()))
     }
 
+    async fn page_html(&mut self) -> Result<String, DriverError> {
+        self.evaluate("document.documentElement.outerHTML".to_owned())
+            .await
+            .map_err(|_| DriverError::Failed("could not read the page".to_owned()))
+    }
+
     async fn show_window(&mut self) -> Result<(), DriverError> {
         if self.options.window != WindowMode::OnDemand || self.has_window {
             return Ok(());

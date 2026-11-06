@@ -57,6 +57,14 @@ const MIGRATIONS: &[&str] = &[
         last_scheduled_run  TEXT
     );
 "#,
+    r#"
+    CREATE TABLE ai_consents (
+        company_id  TEXT NOT NULL,
+        provider    TEXT NOT NULL,
+        granted_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        PRIMARY KEY (company_id, provider)
+    );
+"#,
 ];
 
 /// The first schema version with the column `portal_key`. A dry run reads an
@@ -458,6 +466,29 @@ impl Index {
              WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
                AND status = 'portal_fetch_required'",
             params![company_id, mail_account, mail_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a person agreed to send this company's pages to this provider. Only
+    /// real runs ask, and those always have a migrated index.
+    pub fn has_ai_consent(&self, company_id: &str, provider: &str) -> Result<bool, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM ai_consents WHERE company_id = ?1 AND provider = ?2",
+                params![company_id, provider],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Notes that a person saw what would be sent, and agreed.
+    pub fn note_ai_consent(&self, company_id: &str, provider: &str) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO ai_consents (company_id, provider) VALUES (?1, ?2)",
+            params![company_id, provider],
         )?;
         Ok(())
     }

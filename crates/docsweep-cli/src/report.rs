@@ -7,7 +7,7 @@ use docsweep_core::mail::execute::{AccountReport, MailReport, Outcome};
 use docsweep_core::mail::plan::{
     DisposalAction, Disposition, MailAction, MailDecision, PlannedDocument, ReviewReason,
 };
-use docsweep_core::portal::engine::{EntryOutcome, FetchReport};
+use docsweep_core::portal::engine::{EntryOutcome, FetchReport, RecipeNotice};
 
 /// Renders all accounts.
 pub fn render(reports: &[AccountReport], dry_run: bool) -> String {
@@ -46,7 +46,29 @@ pub fn render_fetch(report: &FetchReport, dry_run: bool) -> String {
     if let Some(error) = &report.error {
         let _ = writeln!(out, "  ERROR: {error}");
     }
+    for notice in &report.notices {
+        let _ = writeln!(out, "  {}", describe_notice(notice));
+    }
     out
+}
+
+fn describe_notice(notice: &RecipeNotice) -> String {
+    match notice {
+        RecipeNotice::Repaired {
+            step,
+            provider,
+            backup,
+        } => format!(
+            "NOTICE: {provider} repaired the step `{step}`, and the recipe was saved. The previous recipe is {}. Please check the change.",
+            backup.display()
+        ),
+        RecipeNotice::RepairPossible { step } => format!(
+            "A real run could try to repair the step `{step}` with the configured provider. A dry run sends nothing."
+        ),
+        RecipeNotice::RepairNotDone { step, reason } => {
+            format!("The step `{step}` was not repaired: {reason}")
+        }
+    }
 }
 
 fn describe_entry(outcome: &EntryOutcome) -> String {
@@ -441,6 +463,7 @@ mod tests {
                 ),
             ],
             error: Some("gave up".into()),
+            notices: Vec::new(),
         };
 
         let text = render_fetch(&report, true);
@@ -451,5 +474,42 @@ mod tests {
         assert!(text.contains("O-3: missing"), "{text}");
         assert!(text.contains("R-4: FAILED: boom"), "{text}");
         assert!(text.contains("ERROR: gave up"), "{text}");
+    }
+
+    #[test]
+    fn fetch_reports_name_a_repaired_recipe_and_its_backup() {
+        let report = FetchReport {
+            company_id: "acme".into(),
+            company_name: "Acme".into(),
+            entries: Vec::new(),
+            error: None,
+            notices: vec![
+                RecipeNotice::Repaired {
+                    step: "login".into(),
+                    provider: "Anthropic".into(),
+                    backup: "acme.yaml.bak".into(),
+                },
+                RecipeNotice::RepairPossible {
+                    step: "extract_list".into(),
+                },
+                RecipeNotice::RepairNotDone {
+                    step: "login".into(),
+                    reason: "no answer".into(),
+                },
+            ],
+        };
+
+        let text = render_fetch(&report, false);
+
+        assert!(
+            text.contains("NOTICE: Anthropic repaired the step `login`"),
+            "{text}"
+        );
+        assert!(text.contains("acme.yaml.bak"), "{text}");
+        assert!(
+            text.contains("`extract_list` with the configured provider"),
+            "{text}"
+        );
+        assert!(text.contains("was not repaired: no answer"), "{text}");
     }
 }

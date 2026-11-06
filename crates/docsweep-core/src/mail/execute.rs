@@ -88,6 +88,7 @@ impl ScanReport {
         summary.already_stored += fetched.already_known;
         summary.missing += fetched.missing;
         summary.failed += fetched.failed;
+        summary.repaired += fetched.repaired;
         summary
     }
 }
@@ -108,6 +109,8 @@ pub struct ScanSummary {
     pub missing: u32,
     /// Mails, accounts and portal entries that failed.
     pub failed: u32,
+    /// Recipes that a language model repaired during this scan.
+    pub repaired: u32,
 }
 
 /// Summarises reports. Steps of a failed mail do not count as done.
@@ -1042,6 +1045,7 @@ companies:
             company_name: company.name.clone(),
             entries: Vec::new(),
             error: None,
+            notices: Vec::new(),
         }
     }
 

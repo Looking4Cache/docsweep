@@ -606,6 +606,7 @@ impl PortalFetcher for FakePortal<'_> {
             company_name: company.name.clone(),
             entries: Vec::new(),
             error: self.error.map(str::to_owned),
+            notices: Vec::new(),
         }
     }
 }

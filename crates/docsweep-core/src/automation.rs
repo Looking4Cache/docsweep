@@ -234,6 +234,7 @@ companies:
                 company_name: company.name.clone(),
                 entries: Vec::new(),
                 error: None,
+                notices: Vec::new(),
             }
         }
     }
@@ -609,6 +610,7 @@ companies:
             company_name: config.companies[0].name.clone(),
             entries: Vec::new(),
             error: None,
+            notices: Vec::new(),
         });
         assert!(worth_recording(&report));
     }

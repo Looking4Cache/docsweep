@@ -58,6 +58,9 @@ pub trait BrowserDriver {
     /// Makes the browser visible to a person, keeping the current address. Does
     /// nothing if it already is, or if this driver never shows a window.
     async fn show_window(&mut self) -> Result<(), DriverError>;
+    /// The document of the open page. It is untrusted and can hold anything, so
+    /// it must never go anywhere without `ai::sanitize`.
+    async fn page_html(&mut self) -> Result<String, DriverError>;
 }
 
 /// Why a run needs a person.
@@ -88,6 +91,16 @@ pub enum ConfirmationAnswer {
     Cancelled,
 }
 
+/// A question before a page goes to a language model for the first time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AiSendRequest {
+    pub company_name: String,
+    pub provider: String,
+    /// Exactly what would be sent: the cleaned text.
+    pub text: String,
+    pub timeout_secs: u64,
+}
+
 /// Asks a person for help. The engine enforces the time limit by dropping the
 /// future of [`ask`](Self::ask), and then calls [`expired`](Self::expired).
 #[allow(
@@ -98,6 +111,11 @@ pub trait ConfirmationHandler {
     async fn ask(&mut self, request: &ConfirmationRequest) -> ConfirmationAnswer;
     /// The time limit has passed, so a visible question can be taken back.
     fn expired(&mut self) {}
+    /// Whether this text may go to the provider. Unless a handler can really ask
+    /// someone, the answer is no and nothing is sent.
+    async fn approve_ai_send(&mut self, _request: &AiSendRequest) -> bool {
+        false
+    }
 }
 
 /// Starts the recipe of a company for real. Mail scans and the schedule use this,

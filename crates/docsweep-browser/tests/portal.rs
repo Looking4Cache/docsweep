@@ -18,6 +18,8 @@ use docsweep_browser::{
     BrowserFetcher, ChromeDriver, ChromeOptions, FetchOptions, FetchPaths, WindowMode,
     fetch_company,
 };
+use docsweep_core::ai::provider::{Ai, Anthropic};
+use docsweep_core::ai::test_support::FakeProviderServer;
 use docsweep_core::config::Config;
 use docsweep_core::document::{looks_like_pdf, test_pdf};
 use docsweep_core::index::{Index, Status};
@@ -29,9 +31,13 @@ use docsweep_core::mail::rules::RuleSet;
 use docsweep_core::mail::{MailError, MailReader, MailWriter};
 use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::driver::{
-    BrowserDriver, ConfirmationAnswer, ConfirmationHandler, ConfirmationReason, ConfirmationRequest,
+    AiSendRequest, BrowserDriver, ConfirmationAnswer, ConfirmationHandler, ConfirmationReason,
+    ConfirmationRequest,
 };
-use docsweep_core::portal::engine::{EntryOutcome, FetchReport, summarize_fetches};
+use docsweep_core::portal::engine::{
+    EntryOutcome, FetchJob, FetchReport, RecipeNotice, RepairSetup, run_recipe, summarize_fetches,
+};
+use docsweep_core::portal::recipe::Recipe;
 use docsweep_core::secrets::{MemoryStore, SecretStore, SecretString};
 
 const USER: &str = "fictional-user@portal.test";
@@ -853,6 +859,94 @@ fn the_driver_reports_address_and_visibility() {
         assert!(!driver.is_visible("#nope").await.unwrap());
         driver.close().await;
     });
+}
+
+/// Says yes to sending, and to nothing else.
+struct AgreesToSend(Vec<AiSendRequest>);
+
+impl ConfirmationHandler for AgreesToSend {
+    async fn ask(&mut self, _request: &ConfirmationRequest) -> ConfirmationAnswer {
+        ConfirmationAnswer::Cancelled
+    }
+    async fn approve_ai_send(&mut self, request: &AiSendRequest) -> bool {
+        self.0.push(request.clone());
+        true
+    }
+}
+
+#[test]
+#[ignore = "needs Chrome; run scripts/browser-tests.sh"]
+fn a_stale_login_is_repaired_by_a_fake_provider_and_the_real_browser_replays_it() {
+    let stale = LOGIN_RECIPE
+        .replace("#username", "#old-username")
+        .replace("params:", "ai_fallback: repair_step\nparams:")
+        .replace("step_timeout_secs: 15", "step_timeout_secs: 2");
+    let world = World::new(&stale);
+    let answer = r##"login: { user: "#username", password: "#password", submit: "button[type=submit]", totp: "#otp", logged_in: "#logout" }"##;
+    let server = FakeProviderServer::answering_anthropic(answer);
+    let company = &world.config.companies[0];
+    let recipe_file = world.dir.path().join("recipe.yaml");
+    let recipe = Recipe::load(&recipe_file)
+        .unwrap()
+        .with_params(&company.portal.as_ref().unwrap().params)
+        .unwrap();
+    let index = Index::open(&world.paths().index).unwrap();
+    let key = "fake-api-key";
+    let job = FetchJob::new(
+        &world.config,
+        company,
+        &recipe,
+        &world.secrets,
+        Some(&index),
+        NaiveDate::from_ymd_opt(2030, 1, 1).unwrap(),
+        false,
+    )
+    .unwrap()
+    .with_repair(RepairSetup {
+        ai: Ai {
+            client: Box::new(Anthropic::new(&server.url(), "m", SecretString::from(key)).unwrap()),
+            label: "Fake".to_owned(),
+            redact: vec![SecretString::from(key)],
+        },
+        recipe_file: recipe_file.clone(),
+    });
+    let mut person = AgreesToSend(Vec::new());
+
+    let report = block_on(async {
+        let mut driver = ChromeDriver::launch(ChromeOptions {
+            profile_dir: world.paths().profile_dir,
+            window: WindowMode::Hidden,
+        })
+        .await
+        .unwrap();
+        let report = run_recipe(&job, &mut driver, &mut person).await;
+        driver.close().await;
+        report
+    });
+
+    assert_eq!(report.error, None, "{report:?}");
+    assert_eq!(stored_count(&report), 3, "{report:?}");
+    assert_eq!(world.portal.count("POST /login"), 1);
+    assert!(matches!(report.notices[0], RecipeNotice::Repaired { .. }));
+
+    // What the provider got from a real browser's page holds nothing secret.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let body = &requests[0].body;
+    assert!(body.contains("username"), "{body}");
+    for secret in [USER, PASSWORD, TOTP_KEY, key, "first_factor", "session="] {
+        assert!(!body.contains(secret), "{secret} in {body}");
+    }
+
+    // The saved recipe still has its placeholders, and works without any AI.
+    let saved = fs::read_to_string(&recipe_file).unwrap();
+    assert!(saved.contains("{base}/login"), "{saved}");
+    assert!(saved.contains("#username"), "{saved}");
+    assert!(recipe_file.with_extension("yaml.bak").exists());
+    drop(index);
+    let again = world.fetch(false, &mut NobodyThere);
+    assert_eq!(again.error, None, "{again:?}");
+    assert_eq!(server.requests().len(), 1);
 }
 
 /// Opens a window, so it only runs with `scripts/browser-tests.sh --visible`.

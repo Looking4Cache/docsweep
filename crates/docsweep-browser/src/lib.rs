@@ -11,12 +11,15 @@ mod chrome;
 use std::path::{Path, PathBuf};
 
 use chrono::Local;
+use docsweep_core::ai::provider;
 use docsweep_core::config::{Company, Config};
 use docsweep_core::index::Index;
 use docsweep_core::paths::AppDirs;
 use docsweep_core::portal::driver::{ConfirmationHandler, PortalFetcher};
-use docsweep_core::portal::engine::{FetchError, FetchJob, FetchReport, run_recipe};
-use docsweep_core::portal::recipe::Recipe;
+use docsweep_core::portal::engine::{
+    FetchError, FetchJob, FetchReport, RecipeNotice, RepairSetup, run_recipe,
+};
+use docsweep_core::portal::recipe::{AiFallback, Recipe};
 use docsweep_core::portal::recipe_path;
 use docsweep_core::secrets::SecretStore;
 
@@ -57,7 +60,7 @@ fn load_recipe(
     company: &Company,
     paths: &FetchPaths,
     options: &FetchOptions,
-) -> Result<Recipe, String> {
+) -> Result<(Recipe, PathBuf), String> {
     let portal = company
         .portal
         .as_ref()
@@ -68,6 +71,7 @@ fn load_recipe(
     };
     Recipe::load(&file)
         .and_then(|recipe| recipe.with_params(&portal.params))
+        .map(|recipe| (recipe, file))
         .map_err(|error| error.to_string())
 }
 
@@ -82,8 +86,8 @@ pub async fn fetch_company<H: ConfirmationHandler>(
     handler: &mut H,
 ) -> FetchReport {
     let failed = |error: String| FetchReport::failed(company, error);
-    let recipe = match load_recipe(company, paths, options) {
-        Ok(recipe) => recipe,
+    let (recipe, recipe_file) = match load_recipe(company, paths, options) {
+        Ok(loaded) => loaded,
         Err(error) => return failed(error),
     };
     let opened = if options.dry_run {
@@ -104,10 +108,21 @@ pub async fn fetch_company<H: ConfirmationHandler>(
         Local::now().date_naive(),
         options.dry_run,
     );
-    let job = match job {
+    let mut job = match job {
         Ok(job) => job,
         Err(error) => return failed(error.to_string()),
     };
+    // Nothing is set up, and no key read, unless both the recipe and the
+    // configuration ask for it.
+    let mut setup_problem = None;
+    if recipe.ai_fallback == AiFallback::RepairStep
+        && let Some(llm) = &config.llm
+    {
+        match provider::from_config(llm, secrets) {
+            Ok(ai) => job = job.with_repair(RepairSetup { ai, recipe_file }),
+            Err(error) => setup_problem = Some(error.to_string()),
+        }
+    }
     let chrome_options = ChromeOptions {
         profile_dir: paths.profile_dir.clone(),
         window: options.window,
@@ -116,8 +131,16 @@ pub async fn fetch_company<H: ConfirmationHandler>(
         Ok(driver) => driver,
         Err(error) => return failed(error.to_string()),
     };
-    let report = run_recipe(&job, &mut driver, handler).await;
+    let mut report = run_recipe(&job, &mut driver, handler).await;
     driver.close().await;
+    if let Some(reason) = setup_problem
+        && report.error.is_some()
+    {
+        report.notices.push(RecipeNotice::RepairNotDone {
+            step: "recipe".to_owned(),
+            reason,
+        });
+    }
     report
 }
 
