@@ -1,0 +1,297 @@
+//! Text output of `mail-scan`: which mail, which company, which file, and what
+//! happens to the mail.
+
+use std::fmt::Write;
+
+use docsweep_core::mail::execute::{AccountReport, MailReport, Outcome};
+use docsweep_core::mail::plan::{
+    DisposalAction, Disposition, MailAction, MailDecision, PlannedDocument, ReviewReason,
+};
+
+/// Renders all accounts.
+pub fn render(reports: &[AccountReport], dry_run: bool) -> String {
+    let mut out = String::new();
+    if dry_run {
+        out.push_str("Dry run: nothing was changed.\n");
+    }
+    for account in reports {
+        let _ = writeln!(out, "\nAccount {}", account.account_id);
+        if account.mails.is_empty() && account.error.is_none() {
+            out.push_str("  No relevant mails.\n");
+        }
+        for mail in &account.mails {
+            render_mail(&mut out, mail, dry_run);
+        }
+        if let Some(error) = &account.error {
+            let _ = writeln!(out, "  ERROR: {error}");
+        }
+    }
+    out
+}
+
+/// How to word planned steps: they did not all happen unless the run succeeded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tense {
+    Planned,
+    Done,
+    Failed,
+}
+
+fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
+    let plan = &report.plan;
+    let tense = match report.outcome {
+        _ if dry_run => Tense::Planned,
+        Outcome::Failed { .. } => Tense::Failed,
+        _ => Tense::Done,
+    };
+    let _ = writeln!(out, "\n  Mail: \"{}\" from {}", plan.subject, plan.from);
+
+    match &plan.action {
+        MailAction::Invoices {
+            company_name,
+            documents,
+            decision,
+            ..
+        } => {
+            let _ = writeln!(out, "    Company: {company_name}");
+            for document in documents {
+                render_document(out, document, tense);
+            }
+            if tense != Tense::Failed {
+                let _ = writeln!(out, "    Mail: {}", describe_decision(decision, tense));
+            }
+        }
+        MailAction::PortalFetchRequired {
+            company_name,
+            already_recorded,
+            ..
+        } => {
+            let _ = writeln!(out, "    Company: {company_name}");
+            let note = if *already_recorded {
+                "already noted as needing a portal download"
+            } else {
+                match tense {
+                    Tense::Planned => "would be noted as needing a portal download",
+                    Tense::Done => "noted as needing a portal download",
+                    Tense::Failed => "could not be noted as needing a portal download",
+                }
+            };
+            let _ = writeln!(out, "    Invoice: {note}");
+            out.push_str("    Mail: stays in place until the invoice is stored\n");
+        }
+        MailAction::NoDocument { company_name, .. } => {
+            let _ = writeln!(out, "    Company: {company_name}");
+            out.push_str("    Mail: stays in place (no PDF, and no portal configured)\n");
+        }
+        MailAction::UnknownInvoice { attachment_names } => {
+            let _ = writeln!(
+                out,
+                "    Unknown sender, looks like an invoice: {}",
+                attachment_names.join(", ")
+            );
+            out.push_str("    Mail: stays in place; add a company to process it\n");
+        }
+    }
+
+    match &report.outcome {
+        Outcome::Planned | Outcome::Completed => {}
+        Outcome::KeptForReview { reason } => {
+            let _ = writeln!(out, "    Review needed: {reason}");
+        }
+        Outcome::Failed { message } => {
+            let _ = writeln!(out, "    FAILED: {message}");
+        }
+    }
+}
+
+fn render_document(out: &mut String, document: &PlannedDocument, tense: Tense) {
+    let path = document.target_path.display();
+    let verb = match tense {
+        Tense::Planned => "Would save",
+        Tense::Done => "Saved",
+        Tense::Failed => "Tried to save",
+    };
+    let line = match &document.disposition {
+        Disposition::Store => format!("{verb}: {path}"),
+        Disposition::StoreForReview(ReviewReason::NumberNotFound) => {
+            format!("{verb} for review (no invoice number found): {path}")
+        }
+        Disposition::StoreForReview(ReviewReason::NumberConflict { existing }) => {
+            let existing = existing
+                .as_ref()
+                .map_or_else(String::new, |p| format!(", known file: {}", p.display()));
+            format!("{verb} for review (number known with a different file{existing}): {path}")
+        }
+        Disposition::AlreadyStored { path: Some(known) } => {
+            format!("Already stored: {}", known.display())
+        }
+        Disposition::AlreadyStored { path: None } => {
+            format!("Already stored: {}", document.attachment_name)
+        }
+        Disposition::Unresolved { reason } => {
+            format!("Not saved again ({reason}): {}", document.attachment_name)
+        }
+    };
+    let _ = writeln!(out, "    {line}");
+}
+
+fn describe_decision(decision: &MailDecision, tense: Tense) -> String {
+    let dry_run = tense == Tense::Planned;
+    match decision {
+        MailDecision::KeepAndFlag { .. } if dry_run => "would stay in place and be flagged".into(),
+        MailDecision::KeepAndFlag { .. } => "stays in place, flagged".into(),
+        MailDecision::Dispose(action) => {
+            let description = match action {
+                DisposalAction::MoveTo(folder) => format!("move to {folder}"),
+                DisposalAction::Trash => "move to trash".to_owned(),
+                DisposalAction::DeletePermanently => "delete permanently".to_owned(),
+            };
+            if dry_run {
+                format!("would {description}")
+            } else {
+                format!("{description} (done)")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use docsweep_core::document::InvoiceFacts;
+    use docsweep_core::mail::plan::MailPlan;
+    use std::path::PathBuf;
+
+    fn invoice_report(decision: MailDecision, disposition: Disposition) -> AccountReport {
+        AccountReport {
+            account_id: "main".into(),
+            error: None,
+            mails: vec![MailReport {
+                outcome: Outcome::Planned,
+                plan: MailPlan {
+                    uid: 1,
+                    message_id: "<1>".into(),
+                    from: "billing@acme.example".into(),
+                    subject: "Ihre Rechnung".into(),
+                    action: MailAction::Invoices {
+                        company_id: "acme".into(),
+                        company_name: "Acme".into(),
+                        decision,
+                        documents: vec![PlannedDocument {
+                            attachment_index: 0,
+                            attachment_name: "a.pdf".into(),
+                            target_dir: PathBuf::from("/invoices"),
+                            file_name: "2026-11-03 - Acme - R-1.pdf".into(),
+                            target_path: PathBuf::from("/invoices/2026-11-03 - Acme - R-1.pdf"),
+                            hash: "h".into(),
+                            date: NaiveDate::from_ymd_opt(2026, 11, 3).unwrap(),
+                            facts: InvoiceFacts::default(),
+                            disposition,
+                        }],
+                    },
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn dry_run_names_mail_company_file_and_action() {
+        let report = invoice_report(
+            MailDecision::Dispose(DisposalAction::MoveTo("Done".into())),
+            Disposition::Store,
+        );
+        let text = render(&[report], true);
+        assert!(text.contains("nothing was changed"), "{text}");
+        assert!(
+            text.contains("\"Ihre Rechnung\" from billing@acme.example"),
+            "{text}"
+        );
+        assert!(text.contains("Company: Acme"), "{text}");
+        assert!(
+            text.contains("Would save: /invoices/2026-11-03 - Acme - R-1.pdf"),
+            "{text}"
+        );
+        assert!(text.contains("would move to Done"), "{text}");
+    }
+
+    #[test]
+    fn deleting_is_described_precisely() {
+        let trash = invoice_report(
+            MailDecision::Dispose(DisposalAction::Trash),
+            Disposition::Store,
+        );
+        assert!(render(&[trash], true).contains("would move to trash"));
+        let permanent = invoice_report(
+            MailDecision::Dispose(DisposalAction::DeletePermanently),
+            Disposition::Store,
+        );
+        assert!(render(&[permanent], true).contains("would delete permanently"));
+    }
+
+    #[test]
+    fn review_cases_explain_themselves() {
+        let report = invoice_report(
+            MailDecision::KeepAndFlag { reason: "x".into() },
+            Disposition::StoreForReview(ReviewReason::NumberNotFound),
+        );
+        let text = render(&[report], true);
+        assert!(text.contains("no invoice number found"), "{text}");
+        assert!(
+            text.contains("would stay in place and be flagged"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn account_errors_and_failures_are_visible() {
+        let mut report = invoice_report(
+            MailDecision::Dispose(DisposalAction::Trash),
+            Disposition::Store,
+        );
+        report.error = Some("login failed".into());
+        report.mails[0].outcome = Outcome::Failed {
+            message: "disk full".into(),
+        };
+        let text = render(&[report], false);
+        assert!(text.contains("ERROR: login failed"), "{text}");
+        assert!(text.contains("FAILED: disk full"), "{text}");
+    }
+
+    #[test]
+    fn failed_mails_never_claim_success() {
+        let mut report = invoice_report(
+            MailDecision::Dispose(DisposalAction::MoveTo("Done".into())),
+            Disposition::Store,
+        );
+        report.mails[0].outcome = Outcome::Failed {
+            message: "disk full".into(),
+        };
+        let text = render(&[report], false);
+        assert!(text.contains("Tried to save"), "{text}");
+        assert!(!text.contains("Saved:"), "{text}");
+        assert!(!text.contains("(done)"), "{text}");
+    }
+
+    #[test]
+    fn successful_real_runs_report_what_happened() {
+        let mut report = invoice_report(
+            MailDecision::Dispose(DisposalAction::MoveTo("Done".into())),
+            Disposition::Store,
+        );
+        report.mails[0].outcome = Outcome::Completed;
+        let text = render(&[report], false);
+        assert!(text.contains("Saved: /invoices"), "{text}");
+        assert!(text.contains("move to Done (done)"), "{text}");
+    }
+
+    #[test]
+    fn empty_accounts_say_so() {
+        let report = AccountReport {
+            account_id: "main".into(),
+            error: None,
+            mails: Vec::new(),
+        };
+        assert!(render(&[report], true).contains("No relevant mails"));
+    }
+}

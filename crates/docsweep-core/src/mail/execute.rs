@@ -332,12 +332,13 @@ async fn dispose<W: MailWriter>(
 }
 
 async fn fail<W: MailWriter>(writer: &mut W, uid: u32, message: String) -> Outcome {
-    match writer.flag(uid).await {
-        Ok(()) => Outcome::Failed { message },
-        Err(flag_error) => Outcome::Failed {
-            message: format!("{message}; flagging failed too: {flag_error}"),
-        },
-    }
+    let message = match writer.flag(uid).await {
+        Ok(()) => format!("{message}; the mail stays in place and is flagged"),
+        Err(flag_error) => {
+            format!("{message}; the mail stays in place, but flagging failed: {flag_error}")
+        }
+    };
+    Outcome::Failed { message }
 }
 
 #[cfg(test)]

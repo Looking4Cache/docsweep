@@ -13,4 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 docsweep-core.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false }
+tempfile.workspace = true
