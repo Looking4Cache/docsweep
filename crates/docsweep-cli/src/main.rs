@@ -17,11 +17,13 @@ use docsweep_core::ai::generate::{generation_prompt, known_hosts, request_draft}
 use docsweep_core::ai::provider;
 use docsweep_core::ai::sanitize::RawPage;
 use docsweep_core::config::{Company, Config};
+use docsweep_core::index::Index;
 use docsweep_core::mail::execute::{
     AccountReport, ScanReport, preview_mail_scan, run_mail_scan, summarize,
 };
 use docsweep_core::names;
 use docsweep_core::paths::AppDirs;
+use docsweep_core::pickup::{LocalFolder, import_file, preview_import};
 use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
 use docsweep_core::portal::draft::{WriteError, draft_path, draft_text, write_draft};
 use docsweep_core::portal::engine::FetchReport;
@@ -70,6 +72,16 @@ enum Command {
         /// Show the browser window
         #[arg(long)]
         visible: bool,
+    },
+    /// Files a PDF under a company, and deletes the original once it is indexed
+    Import {
+        /// The id of the company in the configuration
+        company: String,
+        /// The PDF file
+        file: PathBuf,
+        /// Show what would happen without changing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Creates the draft of a recipe, for a person to check with test-recipe
     Recipe {
@@ -152,6 +164,11 @@ fn run(cli: Cli) -> Result<ExitCode, CliError> {
             company,
             visible,
         } => test_recipe(cli.config, &file, company.as_deref(), visible),
+        Command::Import {
+            company,
+            file,
+            dry_run,
+        } => import(cli.config, &company, &file, dry_run),
         Command::Recipe { command } => match command {
             RecipeCommand::Generate {
                 company,
@@ -238,6 +255,35 @@ fn test_recipe(
         ),
         None => Ok(ExitCode::SUCCESS),
     }
+}
+
+/// Naming the file counts as the confirmation that the pick-up dialog asks for.
+fn import(
+    config_path: Option<PathBuf>,
+    company_id: &str,
+    file: &Path,
+    dry_run: bool,
+) -> Result<ExitCode, CliError> {
+    let dirs = AppDirs::discover().ok_or("no home directory found")?;
+    let config = Config::load(&config_path.unwrap_or_else(|| dirs.config_file()))?;
+    let company = find_company(&config, company_id)?;
+    let name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("this is not the path of a file with a readable name")?;
+    let parent = file.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let folder = LocalFolder::new(parent.unwrap_or(Path::new(".")).to_path_buf());
+    let today = Local::now().date_naive();
+    if dry_run {
+        let index = Index::open_read_only(&dirs.index_file())?;
+        let plan = preview_import(&config, company, index.as_ref(), &folder, name, today)?;
+        print!("{}", report::render_import_plan(&plan));
+    } else {
+        let index = Index::open(&dirs.index_file())?;
+        let outcome = import_file(&config, company, &index, &folder, name, None, today)?;
+        print!("{}", report::render_import(&outcome));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn check_web_address(address: &str) -> Result<(), CliError> {
@@ -545,6 +591,14 @@ mod tests {
         assert!(check_web_address("https://portal.test/").is_ok());
         assert!(check_web_address("file:///etc/passwd").is_err());
         assert!(check_web_address("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn import_needs_a_company_and_a_file() {
+        let cli =
+            Cli::try_parse_from(["docsweep", "import", "acme", "a.pdf", "--dry-run"]).unwrap();
+        assert!(matches!(cli.command, Command::Import { dry_run: true, .. }));
+        assert!(Cli::try_parse_from(["docsweep", "import", "acme"]).is_err());
     }
 
     #[test]

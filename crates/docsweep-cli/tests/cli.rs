@@ -283,3 +283,116 @@ fn recipe_commands_refuse_other_addresses_and_unknown_companies() {
         assert!(stderr.contains("no company `nobody`"), "{stderr}");
     }
 }
+
+/// A configuration with one assisted company, filing into a folder of its own.
+fn assisted_setup(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let output = home.join("invoices");
+    let path = home.join("docsweep.yaml");
+    fs::write(
+        &path,
+        format!(
+            "mail:\n  accounts:\n    - {{ id: a, imap: \"127.0.0.1:1\", user: u, password: \"keyring:docsweep-test-absent\", watch: INBOX }}\n  disposal: {{ mode: all_delete }}\ncompanies:\n  - id: acme\n    name: Acme\n    portal: {{ mode: assisted, url: \"https://portal.example/\" }}\n    output: {{ dir: '{}', filename: \"{{invoice_no}}.pdf\" }}\n",
+            output.display()
+        ),
+    )
+    .unwrap();
+    (path, output)
+}
+
+/// A PDF nobody else in this test run has, because the index compares by content.
+fn unique_pdf(home: &std::path::Path) -> Vec<u8> {
+    format!("%PDF-1.4 dummy {}", home.display()).into_bytes()
+}
+
+#[test]
+fn import_dry_run_changes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let (config, output) = assisted_setup(home.path());
+    let file = home.path().join("invoice.pdf");
+    fs::write(&file, unique_pdf(home.path())).unwrap();
+
+    let result = docsweep(
+        home.path(),
+        &[
+            "import",
+            "acme",
+            file.to_str().unwrap(),
+            "--dry-run",
+            "--config",
+            config.to_str().unwrap(),
+        ],
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(result.status.success(), "{result:?}");
+    assert!(stdout.contains("Would save for review"), "{stdout}");
+    assert!(stdout.contains("Nothing was changed"), "{stdout}");
+    assert!(file.exists());
+    assert!(!output.exists());
+}
+
+#[test]
+fn import_refuses_what_is_not_a_pdf_and_leaves_it_alone() {
+    let home = tempfile::tempdir().unwrap();
+    let (config, output) = assisted_setup(home.path());
+    let file = home.path().join("invoice.pdf");
+    fs::write(&file, b"MZ a program").unwrap();
+
+    let result = docsweep(
+        home.path(),
+        &[
+            "import",
+            "acme",
+            file.to_str().unwrap(),
+            "--dry-run",
+            "--config",
+            config.to_str().unwrap(),
+        ],
+    );
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(stderr.contains("is not a PDF"), "{stderr}");
+    assert!(file.exists());
+    assert!(!output.exists());
+}
+
+/// Not on Windows: there the index would land in the real user profile, because
+/// the system's folders do not follow `HOME`.
+#[cfg(not(windows))]
+#[test]
+fn import_files_the_pdf_deletes_the_original_and_keeps_a_duplicate() {
+    let home = tempfile::tempdir().unwrap();
+    let (config, output) = assisted_setup(home.path());
+    let pdf = unique_pdf(home.path());
+    let file = home.path().join("invoice.pdf");
+    fs::write(&file, &pdf).unwrap();
+    let import = || {
+        docsweep(
+            home.path(),
+            &[
+                "import",
+                "acme",
+                file.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+            ],
+        )
+    };
+
+    let first = import();
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first.status.success(), "{first:?}");
+    assert!(stdout.contains("Saved for review as"), "{stdout}");
+    assert!(!file.exists());
+    let stored = fs::read_dir(&output).unwrap().next().unwrap().unwrap();
+    assert_eq!(fs::read(stored.path()).unwrap(), pdf);
+
+    fs::write(&file, &pdf).unwrap();
+    let second = import();
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second.status.success(), "{second:?}");
+    assert!(stdout.contains("Not saved again"), "{stdout}");
+    assert!(file.exists());
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+}

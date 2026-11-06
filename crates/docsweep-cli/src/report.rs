@@ -7,6 +7,7 @@ use docsweep_core::mail::execute::{AccountReport, MailReport, Outcome};
 use docsweep_core::mail::plan::{
     DisposalAction, Disposition, MailAction, MailDecision, PlannedDocument, ReviewReason,
 };
+use docsweep_core::pickup::{ImportDecision, ImportOutcome, ImportPlan};
 use docsweep_core::portal::engine::{EntryOutcome, FetchReport, RecipeNotice};
 
 /// Renders all accounts.
@@ -28,6 +29,82 @@ pub fn render(reports: &[AccountReport], dry_run: bool) -> String {
         }
     }
     out
+}
+
+/// What `docsweep import --dry-run` found.
+pub fn render_import_plan(plan: &ImportPlan) -> String {
+    let unknown = "not found".to_owned();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Number: {}",
+        plan.invoice_no.clone().unwrap_or_else(|| unknown.clone())
+    );
+    let _ = writeln!(
+        out,
+        "Date: {}",
+        plan.date.map_or(unknown, |date| date.to_string())
+    );
+    let path = plan.target_path.display();
+    let _ = match &plan.decision {
+        ImportDecision::Store => writeln!(out, "Would save as {path}"),
+        ImportDecision::ReviewNoNumber => {
+            writeln!(
+                out,
+                "Would save for review as {path}: no invoice number found"
+            )
+        }
+        ImportDecision::ReviewNoDate => {
+            writeln!(
+                out,
+                "Would save for review as {path}: no invoice date found"
+            )
+        }
+        ImportDecision::ReviewNumberConflict => writeln!(
+            out,
+            "Would save for review as {path}: this number is known with a different file"
+        ),
+        ImportDecision::Duplicate { existing, reason } => {
+            out.push_str(&describe_duplicate(existing.as_deref(), reason.as_deref()));
+            Ok(())
+        }
+    };
+    let _ = writeln!(out, "Nothing was changed.");
+    out
+}
+
+/// What came of `docsweep import`.
+pub fn render_import(outcome: &ImportOutcome) -> String {
+    match outcome {
+        ImportOutcome::Stored {
+            path,
+            needs_review,
+            original_kept,
+        } => {
+            let verb = if *needs_review {
+                "Saved for review as"
+            } else {
+                "Saved as"
+            };
+            let mut out = format!("{verb} {}\n", path.display());
+            if let Some(reason) = original_kept {
+                let _ = writeln!(out, "The original could not be deleted: {reason}");
+            }
+            out
+        }
+        ImportOutcome::Duplicate { existing, reason } => {
+            describe_duplicate(existing.as_deref(), reason.as_deref())
+        }
+    }
+}
+
+fn describe_duplicate(existing: Option<&std::path::Path>, reason: Option<&str>) -> String {
+    let known = match (existing, reason) {
+        (Some(path), _) => format!("this invoice is already saved as {}", path.display()),
+        (None, Some(reason)) => reason.to_owned(),
+        (None, None) => "this invoice is already known".to_owned(),
+    };
+    format!("Not saved again: {known}. The file stays where it is.\n")
 }
 
 /// Renders a portal fetch: one line per list entry.
