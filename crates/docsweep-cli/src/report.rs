@@ -127,10 +127,22 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
         MailAction::PortalFetchRequired {
             company_name,
             fetch_due,
+            assisted,
+            cleanup,
             ..
         } => {
             let _ = writeln!(out, "    Company: {company_name}");
-            render_link_mail(out, &report.outcome, *fetch_due);
+            match (assisted, cleanup, &report.outcome) {
+                (true, Some(disposal), Outcome::Planned) => {
+                    out.push_str("    Invoice: stored\n");
+                    let _ = writeln!(out, "    Mail: would {}", describe_disposal(disposal));
+                }
+                (true, _, Outcome::Planned | Outcome::AwaitingInvoice) => {
+                    out.push_str("    Invoice: not picked up yet; pick it up in the app, or with `docsweep import`\n");
+                    out.push_str("    Mail: stays in place until the invoice is stored\n");
+                }
+                _ => render_link_mail(out, &report.outcome, *fetch_due),
+            }
         }
         MailAction::NoDocument { company_name, .. } => {
             let _ = writeln!(out, "    Company: {company_name}");
@@ -386,10 +398,37 @@ mod tests {
                         company_name: "Acme".into(),
                         already_recorded: false,
                         fetch_due,
+                        assisted: false,
+                        cleanup: None,
                     },
                 },
             }],
         }
+    }
+
+    #[test]
+    fn assisted_link_mails_say_that_a_person_picks_them_up() {
+        let assisted = |outcome, cleanup| {
+            let mut report = link_report(outcome, false);
+            let MailAction::PortalFetchRequired {
+                assisted,
+                cleanup: slot,
+                ..
+            } = &mut report.mails[0].plan.action
+            else {
+                unreachable!();
+            };
+            *assisted = true;
+            *slot = cleanup;
+            report
+        };
+        let waiting = render(&[assisted(Outcome::AwaitingInvoice, None)], false);
+        assert!(waiting.contains("docsweep import"), "{waiting}");
+        let stored = render(
+            &[assisted(Outcome::Planned, Some(DisposalAction::Trash))],
+            true,
+        );
+        assert!(stored.contains("Invoice: stored"), "{stored}");
     }
 
     #[test]

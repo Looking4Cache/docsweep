@@ -130,8 +130,13 @@ pub enum MailAction {
         company_name: String,
         already_recorded: bool,
         /// Whether a real run would start the portal download: a new mail always
-        /// does, one that is still waiting at most once per day.
+        /// does, one that is still waiting at most once per day. Never for a
+        /// company in assisted mode, whose invoices a person picks up.
         fetch_due: bool,
+        /// The company is in assisted mode.
+        assisted: bool,
+        /// Assisted mode only: its invoice is stored, so a real run would do this.
+        cleanup: Option<DisposalAction>,
     },
     /// Rule matches, but there is no PDF and no portal, so nothing can be done.
     NoDocument {
@@ -212,23 +217,7 @@ fn plan_for_company(
     let positions = context.rules.documents_of(company, mail);
     if positions.is_empty() {
         return if company.portal.is_some() {
-            let (already_recorded, fetched_today) = match context.index {
-                Some(index) => (
-                    index.is_portal_fetch_recorded(
-                        &company.id,
-                        context.account_id,
-                        &mail.message_id,
-                    )?,
-                    index.last_link_fetch_on(&company.id)? == Some(context.today),
-                ),
-                None => (false, false),
-            };
-            Ok(MailAction::PortalFetchRequired {
-                company_id: company.id.clone(),
-                company_name: company.name.clone(),
-                already_recorded,
-                fetch_due: !already_recorded || !fetched_today,
-            })
+            plan_link_mail(context, company, mail)
         } else {
             Ok(MailAction::NoDocument {
                 company_id: company.id.clone(),
@@ -253,6 +242,32 @@ fn plan_for_company(
         company_name: company.name.clone(),
         documents,
         decision,
+    })
+}
+
+fn plan_link_mail(
+    context: &PlanContext<'_>,
+    company: &Company,
+    mail: &IncomingMail,
+) -> Result<MailAction, PlanError> {
+    let id = (&company.id, context.account_id, &mail.message_id);
+    let assisted = company.is_assisted();
+    let (already_recorded, fetched_today, cleanup) = match context.index {
+        Some(index) => (
+            index.is_portal_fetch_recorded(id.0, id.1, id.2)?,
+            index.last_link_fetch_on(id.0)? == Some(context.today),
+            (assisted && index.has_invoice_for_link_mail(id.0, id.1, id.2)?)
+                .then(|| disposal_for(context.config, company, MailKind::Link)),
+        ),
+        None => (false, false, None),
+    };
+    Ok(MailAction::PortalFetchRequired {
+        company_id: company.id.clone(),
+        company_name: company.name.clone(),
+        already_recorded,
+        fetch_due: !assisted && (!already_recorded || !fetched_today),
+        assisted,
+        cleanup,
     })
 }
 
@@ -760,6 +775,64 @@ companies:
         index.note_link_fetch("acme", today).unwrap();
         assert!(!due(plan_for("old@x")), "tried today");
         assert!(due(plan_for("new@x")), "a new mail does not wait");
+    }
+
+    const ASSISTED: &str = "portal: { mode: assisted, url: \"https://portal.example/\" }";
+
+    #[test]
+    fn a_link_mail_of_an_assisted_company_is_noted_without_any_download_due() {
+        let config = config_with(MOVE_DEFAULT, ASSISTED, "/x");
+        let index = Index::open_in_memory().unwrap();
+        let raw = test_mail::raw("b@acme.example", "Rechnung online", "m@x", &[]);
+
+        let action = plan(&config, Some(&index), &raw).unwrap().action;
+
+        assert!(matches!(
+            action,
+            MailAction::PortalFetchRequired {
+                assisted: true,
+                fetch_due: false,
+                already_recorded: false,
+                cleanup: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_stored_invoice_shows_up_as_the_cleanup_of_an_assisted_link_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with(MOVE_DEFAULT, ASSISTED, "/x");
+        let index = Index::open_in_memory().unwrap();
+        index
+            .record_portal_fetch_required("acme", "main", "m@x", None)
+            .unwrap();
+        let file = dir.path().join("R-1.pdf");
+        std::fs::write(&file, b"x").unwrap();
+        index
+            .insert(&NewInvoice {
+                company_id: "acme".into(),
+                invoice_date: None,
+                invoice_no: Some("R-1".into()),
+                amount: None,
+                currency: None,
+                file_path: file,
+                file_hash: "h".into(),
+                source: Source::Portal,
+                mail_account: None,
+                mail_id: None,
+                portal_key: None,
+                status: Status::Stored,
+            })
+            .unwrap();
+        let raw = test_mail::raw("b@acme.example", "Rechnung online", "m@x", &[]);
+
+        let action = plan(&config, Some(&index), &raw).unwrap().action;
+
+        let MailAction::PortalFetchRequired { cleanup, .. } = action else {
+            panic!("unexpected action {action:?}");
+        };
+        assert_eq!(cleanup, Some(DisposalAction::Trash));
     }
 
     #[test]

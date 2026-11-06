@@ -9,6 +9,9 @@
 //! stay open that long. Only then is the mail looked at again: it is cleaned up
 //! if the fetch had no failures and the index holds its invoice, it is flagged
 //! if the fetch failed, and otherwise it stays noted and is checked again later.
+//!
+//! A company in assisted mode never starts anything here. A person picks up its
+//! invoice, and the next scan finds it in the index under the same rule.
 
 use std::collections::HashSet;
 use std::fs;
@@ -140,8 +143,9 @@ pub fn summarize(reports: &[AccountReport]) -> ScanSummary {
                     }
                     summary.disposed += u32::from(matches!(decision, MailDecision::Dispose(_)));
                 }
-                MailAction::PortalFetchRequired { .. } => {
-                    if matches!(mail.outcome, Outcome::LinkResolved { .. }) {
+                MailAction::PortalFetchRequired { cleanup, .. } => {
+                    let planned_cleanup = mail.outcome == Outcome::Planned && cleanup.is_some();
+                    if planned_cleanup || matches!(mail.outcome, Outcome::LinkResolved { .. }) {
                         summary.disposed += 1;
                     } else {
                         summary.portal_fetches += 1;
@@ -363,7 +367,8 @@ async fn settle_account(
 
 /// Starts the recipes that link mails call for, once per company however many
 /// mails it has, and remembers the attempt. A mail that could not even be noted
-/// has failed already and starts nothing.
+/// has failed already and starts nothing, and neither does a company in assisted
+/// mode, whatever a plan says.
 pub async fn fetch_for_link_mails<'m, F: PortalFetcher>(
     config: &Config,
     index: &Index,
@@ -385,7 +390,7 @@ pub async fn fetch_for_link_mails<'m, F: PortalFetcher>(
     }
     let mut reports = Vec::with_capacity(due.len());
     for company in &config.companies {
-        if due.contains(company.id.as_str()) {
+        if due.contains(company.id.as_str()) && !company.is_assisted() {
             reports.push(match index.note_link_fetch(&company.id, today) {
                 Ok(()) => fetcher.fetch(company).await,
                 Err(error) => FetchReport::failed(company, error.to_string()),
@@ -412,7 +417,8 @@ enum LinkAction {
 /// The safety rule for link mails: a mail is only cleaned up if a fetch ran now
 /// and had no failures, and the index holds a stored invoice that matches this
 /// mail. A successful fetch alone is not enough, because the invoice may not be
-/// in the portal yet. Mails that simply stay are settled here; the returned steps
+/// in the portal yet. A company in assisted mode has no fetch to wait for, so only
+/// the index counts. Mails that simply stay are settled here; the returned steps
 /// need the mailbox.
 pub fn decide_link_mails(
     config: &Config,
@@ -431,11 +437,11 @@ pub fn decide_link_mails(
         }
         let company = config.companies.iter().find(|c| &c.id == company_id);
         let fetch = fetches.iter().find(|f| &f.company_id == company_id);
-        let (Some(company), Some(fetch)) = (company, fetch) else {
+        let Some(company) = company.filter(|c| fetch.is_some() || c.is_assisted()) else {
             mail.outcome = Outcome::AwaitingInvoice;
             continue;
         };
-        let action = if fetch.has_failures() {
+        let action = if let Some(fetch) = fetch.filter(|fetch| fetch.has_failures()) {
             let reason = fetch
                 .error
                 .as_deref()
@@ -1383,6 +1389,8 @@ companies:
                     company_name: "Acme".into(),
                     already_recorded: false,
                     fetch_due: true,
+                    assisted: false,
+                    cleanup: None,
                 },
             },
             outcome: Outcome::Failed {
@@ -1403,6 +1411,87 @@ companies:
         assert!(portal.started.is_empty());
         assert!(steps.is_empty());
         assert!(matches!(mails[0].outcome, Outcome::Failed { .. }));
+    }
+
+    const ASSISTED: &str = "portal: { mode: assisted, url: \"https://portal.example/\" }";
+
+    #[test]
+    fn a_scan_never_starts_a_fetcher_for_an_assisted_company() {
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x"), link_mail("2@x")]);
+        let mut portal = fetcher(fine);
+
+        for today in [day(1), day(1), day(2)] {
+            let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, today);
+            assert_eq!(mails[0].outcome, Outcome::AwaitingInvoice);
+        }
+
+        assert!(portal.started.is_empty());
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
+        let rows = index.invoices_of("acme").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.status == Status::PortalFetchRequired));
+        assert_eq!(index.last_link_fetch_on("acme").unwrap(), None);
+    }
+
+    #[test]
+    fn a_plan_that_calls_for_a_download_still_starts_nothing_for_an_assisted_company() {
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mails = [MailReport {
+            plan: MailPlan {
+                uid: 1,
+                message_id: "1@x".into(),
+                from: "b@acme.example".into(),
+                subject: "Rechnung".into(),
+                action: MailAction::PortalFetchRequired {
+                    company_id: "acme".into(),
+                    company_name: "Acme".into(),
+                    already_recorded: false,
+                    fetch_due: true,
+                    assisted: true,
+                    cleanup: None,
+                },
+            },
+            outcome: Outcome::Completed,
+        }];
+        let mut portal = fetcher(fine);
+
+        let fetches = block_on(fetch_for_link_mails(
+            &setup.config,
+            &index,
+            day(1),
+            mails.iter(),
+            &mut portal,
+        ));
+
+        assert!(portal.started.is_empty());
+        assert!(fetches.is_empty());
+    }
+
+    #[test]
+    fn a_stored_invoice_lets_a_scan_clean_up_an_assisted_link_mail_without_a_fetcher() {
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        assert!(mailbox.untouched());
+
+        store_portal_invoice(&setup, &index, "R-1");
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(2));
+
+        assert!(portal.started.is_empty());
+        assert_eq!(mailbox.trashed, [1], "the default for link mails");
+        assert_eq!(
+            mails[0].outcome,
+            Outcome::LinkResolved {
+                disposal: DisposalAction::Trash
+            }
+        );
+        assert!(index.invoices_of("acme").unwrap()[0].resolved_at.is_some());
     }
 
     #[test]

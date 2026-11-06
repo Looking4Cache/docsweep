@@ -64,7 +64,9 @@ pub fn due_work<Tz: TimeZone>(
         last_poll.is_none_or(|last| now.to_utc() - last >= TimeDelta::minutes(i64::from(minutes)))
     });
     let mut companies = Vec::new();
-    for company in &config.companies {
+    // An assisted company cannot have a schedule in a valid configuration, and
+    // nothing may ever start one on its own.
+    for company in config.companies.iter().filter(|c| !c.is_assisted()) {
         let schedule = company.portal.as_ref().and_then(|p| p.schedule.as_deref());
         let Some(Ok(schedule)) = schedule.map(Schedule::parse) else {
             continue;
@@ -314,6 +316,21 @@ companies:
         let index = Index::open_in_memory().unwrap();
         let due = due_work(&config, &index, None, &at(2026, 11, 6, 12, 0)).unwrap();
         assert!(!due.poll);
+    }
+
+    #[test]
+    fn nothing_ever_comes_due_for_an_assisted_company() {
+        let mut config = config(ON);
+        let portal = config.companies[0].portal.as_mut().unwrap();
+        portal.mode = crate::config::PortalMode::Assisted;
+        let index = Index::open_in_memory().unwrap();
+        index
+            .note_scheduled_run("a", at(2026, 1, 1, 0, 0).to_utc())
+            .unwrap();
+
+        let due = due_work(&config, &index, None, &at(2026, 11, 10, 9, 0)).unwrap();
+
+        assert!(!due.companies.contains(&"a".to_owned()));
     }
 
     #[test]
