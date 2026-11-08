@@ -1068,6 +1068,7 @@ companies:
             entries: Vec::new(),
             error: None,
             notices: Vec::new(),
+            bot_check: None,
         }
     }
 

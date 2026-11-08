@@ -223,9 +223,23 @@ function noticeText(notice) {
   }
 }
 
+// A run that ended on a captcha or bot check. The button only opens the editor
+// with assisted mode filled in; the person reviews it and saves, or does not.
+function botCheckRow(report, onSuggestAssisted) {
+  return h("li", { class: "mail-row" },
+    h("div", { class: "mail-main" },
+      h("span", { class: "mail-subject" }, report.company_name),
+      h("p", { class: "recipe-note" }, t("row.bot_check"))),
+    onSuggestAssisted && h("div", { class: "mail-side" },
+      h("button", {
+        class: "button button-small",
+        onclick: () => onSuggestAssisted(report.company_id, report.bot_check.portal_url ?? ""),
+      }, t("row.bot_check_switch"))));
+}
+
 // The reports of portal fetches: one row per list entry, by urgency. Whatever
 // happened to a recipe comes first, because a person should look at that.
-function fetchReportList(reports) {
+function fetchReportList(reports, { onSuggestAssisted } = {}) {
   const order = ["recipe", "failed", "review", "save", "missing", "known"];
   const groups = Object.fromEntries(order.map((name) => [name, []]));
   for (const report of reports) {
@@ -242,6 +256,7 @@ function fetchReportList(reports) {
           h("span", { class: "mail-subject" }, report.company_name),
           h("p", { class: "row-failure" }, report.error))));
     }
+    if (report.bot_check) groups.recipe.push(botCheckRow(report, onSuggestAssisted));
     for (const entry of report.entries) {
       groups[FETCH_GROUP_OF[entry.outcome.kind]].push(fetchEntryRow(entry, report.company_name));
     }
@@ -253,17 +268,17 @@ function fetchReportList(reports) {
 }
 
 // Renders groups in order of urgency. Empty groups do not appear.
-export function reportList(reports, { onCreateCompany, done = true } = {}) {
+export function reportList(reports, { onCreateCompany, onSuggestAssisted, done = true } = {}) {
   // The history keeps mailboxes and portal downloads in one list.
   const fetches = reports.filter((report) => report.entries);
   const accounts = reports.filter((report) => report.mails);
-  if (accounts.length === 0) return fetchReportList(fetches);
+  if (accounts.length === 0) return fetchReportList(fetches, { onSuggestAssisted });
   const mailSections = mailReportList(accounts, { onCreateCompany, done });
   if (fetches.length === 0) return mailSections;
   return [
     mailSections,
     h("h2", { class: "report-heading" }, t("report.portal_downloads")),
-    fetchReportList(fetches),
+    fetchReportList(fetches, { onSuggestAssisted }),
   ];
 }
 

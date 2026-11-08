@@ -607,6 +607,7 @@ impl PortalFetcher for FakePortal<'_> {
             entries: Vec::new(),
             error: self.error.map(str::to_owned),
             notices: Vec::new(),
+            bot_check: None,
         }
     }
 }

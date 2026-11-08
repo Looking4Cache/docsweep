@@ -124,6 +124,18 @@ pub fn render_fetch(report: &FetchReport, dry_run: bool) -> String {
     if let Some(error) = &report.error {
         let _ = writeln!(out, "  ERROR: {error}");
     }
+    if let Some(check) = &report.bot_check {
+        out.push_str(
+            "  The run ended on a captcha or bot check, so this portal seems to turn away automated browsers.\n  \
+             Consider assisted mode: set `portal.mode: assisted` and `portal.url`",
+        );
+        if let Some(url) = &check.portal_url {
+            let _ = write!(out, " (for instance {url})");
+        }
+        out.push_str(
+            ", and remove `credentials`, `totp` and `schedule`, which assisted mode does not use.\n",
+        );
+    }
     for notice in &report.notices {
         let _ = writeln!(out, "  {}", describe_notice(notice));
     }
@@ -604,6 +616,7 @@ mod tests {
             ],
             error: Some("gave up".into()),
             notices: Vec::new(),
+            bot_check: None,
         };
 
         let text = render_fetch(&report, true);
@@ -614,6 +627,27 @@ mod tests {
         assert!(text.contains("O-3: missing"), "{text}");
         assert!(text.contains("R-4: FAILED: boom"), "{text}");
         assert!(text.contains("ERROR: gave up"), "{text}");
+    }
+
+    #[test]
+    fn a_run_that_ended_on_a_bot_check_suggests_assisted_mode() {
+        let mut report = FetchReport {
+            company_id: "acme".into(),
+            company_name: "Acme".into(),
+            entries: Vec::new(),
+            error: Some("nobody answered the confirmation in time; the run was ended".into()),
+            notices: Vec::new(),
+            bot_check: None,
+        };
+        assert!(!render_fetch(&report, false).contains("assisted"));
+
+        report.bot_check = Some(docsweep_core::portal::engine::BotCheck {
+            portal_url: Some("https://portal.example/login".into()),
+        });
+        let text = render_fetch(&report, false);
+
+        assert!(text.contains("portal.mode: assisted"), "{text}");
+        assert!(text.contains("https://portal.example/login"), "{text}");
     }
 
     #[test]
@@ -637,6 +671,7 @@ mod tests {
                     reason: "no answer".into(),
                 },
             ],
+            bot_check: None,
         };
 
         let text = render_fetch(&report, false);

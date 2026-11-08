@@ -289,6 +289,18 @@ pub struct FetchReport {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<RecipeNotice>,
+    /// Set if the run failed while the page showed a captcha or the recipe's
+    /// confirmation. The portal then probably turns away automated browsers, and
+    /// assisted mode is the way to go. Nothing tries to get past the check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_check: Option<BotCheck>,
+}
+
+/// A failed run that ended on a captcha or a bot check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BotCheck {
+    /// The recipe's first address, as a start for `portal.url` in assisted mode.
+    pub portal_url: Option<String>,
 }
 
 impl FetchReport {
@@ -300,6 +312,7 @@ impl FetchReport {
             entries: Vec::new(),
             error: Some(error),
             notices: Vec::new(),
+            bot_check: None,
         }
     }
 
@@ -369,12 +382,23 @@ pub async fn run_recipe<D: BrowserDriver, H: ConfirmationHandler>(
     let mut run = Run::new(job, driver, handler);
     let error = run.all_steps().await.err().map(|error| error.to_string());
     run.keep_or_drop_repair(error.is_some());
+    let bot_check = if error.is_some() && run.ended_on_bot_check().await {
+        Some(BotCheck {
+            portal_url: job.recipe.steps.iter().find_map(|step| match step {
+                Step::Goto(url) => Some(url.clone()),
+                _ => None,
+            }),
+        })
+    } else {
+        None
+    };
     FetchReport {
         company_id: job.company.id.clone(),
         company_name: job.company.name.clone(),
         entries: run.entries,
         error,
         notices: run.notices,
+        bot_check,
     }
 }
 
@@ -975,6 +999,19 @@ impl<'a, 'j, D: BrowserDriver, H: ConfirmationHandler> Run<'a, 'j, D, H> {
                 Ok(visible.is_none() && !self.driver.is_visible(gone).await?)
             }
         }
+    }
+
+    /// Whether the open page shows the recipe's confirmation or a captcha. It only
+    /// looks, so that a failed run can say that the portal seems to turn away
+    /// automated browsers; nothing here tries to get past such a check.
+    async fn ended_on_bot_check(&mut self) -> bool {
+        if self.confirmation_shown().await.unwrap_or(false) {
+            return true;
+        }
+        self.driver
+            .page_html()
+            .await
+            .is_ok_and(|html| looks_like_captcha(&html))
     }
 
     async fn confirmation_shown(&mut self) -> Result<bool, DriverError> {
@@ -2475,6 +2512,90 @@ steps:
     }
 
     #[test]
+    fn a_run_that_ends_on_its_confirmation_suggests_assisted_mode() {
+        let setup = setup();
+        let mut driver = portal_with_captcha_forever();
+        let mut handler = FakeHandler::new(Person::Never);
+
+        let report = run_with(
+            &setup,
+            CONFIRM_RECIPE,
+            Some(&setup.index),
+            false,
+            &mut driver,
+            &mut handler,
+        );
+
+        assert_eq!(
+            report.bot_check,
+            Some(BotCheck {
+                portal_url: Some("https://portal.test/invoices".into())
+            })
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["bot_check"]["portal_url"],
+            "https://portal.test/invoices"
+        );
+    }
+
+    #[test]
+    fn a_run_that_ends_on_a_captcha_page_suggests_assisted_mode() {
+        let setup = setup();
+        let page = FakePage {
+            html: r#"<div class="cf-turnstile" data-sitekey="x"></div>"#.to_owned(),
+            ..FakePage::default()
+        };
+        let mut driver = FakeDriver::default().page(LIST_URL, page);
+        let mut handler = FakeHandler::new(Person::Never);
+
+        let report = run_with(
+            &setup,
+            CONFIRM_RECIPE,
+            Some(&setup.index),
+            false,
+            &mut driver,
+            &mut handler,
+        );
+
+        assert!(report.error.is_some());
+        assert!(report.bot_check.is_some());
+    }
+
+    #[test]
+    fn other_failures_and_successful_runs_suggest_nothing() {
+        let setup = setup();
+        let mut handler = FakeHandler::new(Person::Never);
+        // The list never comes, but nothing on the page is a check.
+        let mut driver = FakeDriver::default().page(LIST_URL, FakePage::default());
+        let failed = run_with(
+            &setup,
+            CONFIRM_RECIPE,
+            Some(&setup.index),
+            false,
+            &mut driver,
+            &mut handler,
+        );
+        assert!(failed.error.is_some());
+        assert_eq!(failed.bot_check, None);
+        let json = serde_json::to_value(&failed).unwrap();
+        assert!(json.get("bot_check").is_none());
+
+        let mut driver = list_portal(vec![row("R-1", "/doc/1.pdf")])
+            .file("https://portal.test/doc/1.pdf", invoice_pdf("R-1"));
+        let fine = run_with(
+            &setup,
+            CONFIRM_RECIPE,
+            Some(&setup.index),
+            false,
+            &mut driver,
+            &mut handler,
+        );
+        assert_eq!(fine.error, None);
+        assert_eq!(fine.bot_check, None);
+    }
+
+    #[test]
     fn a_time_out_later_in_the_run_keeps_what_was_stored() {
         let setup = setup();
         let recipe = r##"
@@ -2955,6 +3076,7 @@ steps:
             }],
             error: None,
             notices: Vec::new(),
+            bot_check: None,
         };
         let json = serde_json::to_value(&report).unwrap();
         let outcome = &json["entries"][0]["outcome"];

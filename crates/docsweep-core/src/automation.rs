@@ -237,6 +237,7 @@ companies:
                 entries: Vec::new(),
                 error: None,
                 notices: Vec::new(),
+                bot_check: None,
             }
         }
     }
@@ -628,6 +629,7 @@ companies:
             entries: Vec::new(),
             error: None,
             notices: Vec::new(),
+            bot_check: None,
         });
         assert!(worth_recording(&report));
     }

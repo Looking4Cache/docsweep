@@ -164,6 +164,20 @@ export function renderCompanies(app, options = {}) {
     paint();
   }
 
+  // A run ended on a bot check. The editor gets assisted mode and an address filled
+  // in, and says what changes; nothing is saved, and no keychain entry goes away,
+  // until the person saves.
+  function suggestAssisted(companyId, portalUrl) {
+    open(companyId);
+    if (!draft || draft.isNew) return;
+    draft.hasPortal = true;
+    draft.portalMode = "assisted";
+    if (!draft.portalUrl?.trim()) draft.portalUrl = portalUrl;
+    draft.assistedSuggested = true;
+    remember();
+    paint();
+  }
+
   function startNew(domain) {
     draft = blankDraft(domain);
     selectedKey = draft.key;
@@ -465,7 +479,9 @@ export function renderCompanies(app, options = {}) {
       fetchPanel(),
       recipeTools(),
     );
+    const suggestion = draft.assistedSuggested && notice("info", t("companies.portal.assisted_suggested"));
     const portalFields = h("div", { class: "form", hidden: !draft.hasPortal },
+      suggestion,
       h("div", { class: "field" }, h("span", { class: "field-label" }, t("companies.portal.mode")), modes, modeHint),
       urlField,
       recipeFields,
@@ -546,7 +562,7 @@ export function renderCompanies(app, options = {}) {
         replace(result,
           warning && notice("warning", warning),
           summaryStats(summary, dryRun),
-          reportList(reports, { done: !dryRun }),
+          reportList(reports, { onSuggestAssisted: app.suggestAssisted, done: !dryRun }),
           dryRun && h("div", { class: "action-bar" },
             h("span", { class: "action-note" }, icon("question"), t(hasNew ? "fetch.preview_note" : "fetch.nothing_new")),
             h("div", { class: "action-buttons" }, download)),
@@ -825,7 +841,8 @@ export function renderCompanies(app, options = {}) {
       ));
   }
 
-  if (options.draftDomain !== undefined) startNew(options.draftDomain);
+  if (options.suggestAssisted) suggestAssisted(options.suggestAssisted.companyId, options.suggestAssisted.portalUrl);
+  else if (options.draftDomain !== undefined) startNew(options.draftDomain);
   else if (options.create) startNew("");
   else if (selectedKey && (drafts[selectedKey] || companies().some((c) => c.id === selectedKey))) open(selectedKey);
   else openFirst();

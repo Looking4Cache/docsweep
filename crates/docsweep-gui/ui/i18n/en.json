@@ -198,6 +198,8 @@
   "row.recipe_repaired_badge": "Please check",
   "row.repair_possible": "The step {step} no longer matches. A real run could try to repair it with your AI provider. A preview sends nothing.",
   "row.repair_not_done": "The step {step} was not repaired: {reason}",
+  "row.bot_check": "The run ended on a captcha or bot check. This portal seems to turn away automated browsers. In assisted mode you log in and download in your own browser, and Docsweep files the PDF.",
+  "row.bot_check_switch": "Switch to assisted mode…",
 
   "invoices.title": "Invoices",
   "invoices.lead": "Everything Docsweep has saved or noted.",
@@ -277,6 +279,7 @@
   "companies.portal.mode_recipe_hint": "Docsweep logs in with a recipe and downloads what is new. This works for most portals.",
   "companies.portal.mode_assisted_hint": "For portals that turn away automated browsers, for example with a Cloudflare check. When a link mail arrives, Docsweep shows an invoice to pick up. One click opens the portal in your usual browser, you log in and download the PDF as always, and Docsweep files it after you confirm. No password is stored, and nothing runs on its own.",
   "companies.portal.url": "Portal address",
+  "companies.portal.assisted_suggested": "A run ended on a captcha or bot check, so assisted mode is filled in, with the portal address from the recipe. Please check the address. Assisted mode uses no portal login, TOTP key or schedule: they leave this company when you save, and the configuration would refuse them otherwise. Nothing is deleted from the system keychain. Nothing changes until you save.",
   "companies.portal.url_hint": "The page that opens in your browser, usually the login page. It starts with https:// or http://.",
   "companies.portal.note": "Docsweep logs in with a recipe file and downloads what is new. You can start this here, a link mail starts it during a real scan, and a schedule can start it too. A link mail is only tidied up once its invoice is saved.",
   "companies.portal.recipe": "Recipe file",

@@ -82,7 +82,11 @@ export function renderScan(app) {
     return [
       result.warning && notice("warning", result.warning),
       summaryStats(summary, dryRun),
-      reportList([...reports, ...fetches], { onCreateCompany: createCompanyFrom, done: !dryRun }),
+      reportList([...reports, ...fetches], {
+        onCreateCompany: createCompanyFrom,
+        onSuggestAssisted: app.suggestAssisted,
+        done: !dryRun,
+      }),
       dryRun && h("div", { class: "action-bar" },
         h("span", { class: "action-note" }, icon("question"),
           hasEffects(effects) ? t("scan.preview_note") : t("scan.nothing_to_run")),

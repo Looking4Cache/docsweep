@@ -180,7 +180,7 @@ companies:
       filename: "{date:%Y-%m-%d} - Example - {invoice_no}.pdf"
 ```
 
-`portal.url` is required and must be `http` or `https`. An assisted company has no `credentials` or `totp`, because Docsweep keeps no login for it, and no `schedule`, because nothing runs on its own. Switching a company to this mode is a choice in its editor, or in this file; Docsweep does not do it by itself.
+`portal.url` is required and must be `http` or `https`. An assisted company has no `credentials` or `totp`, because Docsweep keeps no login for it, and no `schedule`, because nothing runs on its own. Switching a company to this mode is a choice in its editor, or in this file; Docsweep does not do it by itself. If a run ends on a captcha or on the recipe's `confirmation.detect`, the app suggests this mode: the button opens the company's editor with assisted mode and the recipe's first address filled in, and you check and save it. `docsweep fetch` says the same in its report. Saving drops `credentials`, `totp` and `schedule` from the company, but the keychain entries stay until you remove them.
 
 1. A scan notes a link mail of this company and starts nothing, whether you started the scan or it runs automatically.
 2. The Scan page lists it under "Invoices to pick up", with a count in the navigation. Automatic runs do not open a browser or the window for it.

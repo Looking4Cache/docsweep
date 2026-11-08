@@ -4,7 +4,7 @@ import { formatDateTime, t } from "../lib/i18n.js";
 import { reportList, summaryStats } from "../lib/report.js";
 import { badge, emptyState, notice, pageHeader } from "../lib/ui.js";
 
-function runCard(run) {
+function runCard(run, app) {
   const summary = run.summary ?? {};
   const failed = summary.failed > 0;
   const hasContent = Object.values(summary).some((value) => value > 0);
@@ -15,7 +15,9 @@ function runCard(run) {
       run.automatic && badge("neutral", t("history.automatic")),
       hasContent ? summaryStats(summary, false) : h("span", { class: "muted" }, t("history.nothing")),
     ),
-    h("div", { class: "run-body" }, Array.isArray(run.reports) ? reportList(run.reports) : null),
+    h("div", { class: "run-body" }, Array.isArray(run.reports)
+      ? reportList(run.reports, { onSuggestAssisted: app.suggestAssisted })
+      : null),
   );
 }
 
@@ -27,7 +29,7 @@ export function renderHistory(app) {
     app.markHistorySeen(runs);
     replace(root, header, runs.length === 0
       ? emptyState("history", t("history.empty_title"), t("history.empty_lead"))
-      : h("div", { class: "runs" }, runs.map(runCard)));
+      : h("div", { class: "runs" }, runs.map((run) => runCard(run, app))));
   }).catch((error) => {
     replace(root, header, notice("danger", errorText(error)));
   });

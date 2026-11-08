@@ -91,6 +91,10 @@ const app = {
       showProblems([]);
     }
   },
+  // Opens the company editor with assisted mode filled in, for the person to check.
+  suggestAssisted(companyId, portalUrl) {
+    navigate("companies", { suggestAssisted: { companyId, portalUrl } });
+  },
   markHistorySeen(runs) {
     try {
       if (runs.length > 0) localStorage.setItem(HISTORY_SEEN_KEY, String(runs[0].id));
