@@ -954,6 +954,15 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), UiError> {
     }
 }
 
+/// The interface reports the language it shows, so the tray menu matches it.
+/// Unsupported codes change nothing.
+#[tauri::command]
+pub fn set_language(app: AppHandle, language: String) {
+    if crate::i18n::set_language(&language) {
+        crate::tray::relabel(&app);
+    }
+}
+
 /// Runs blocking work off the main thread. SQLite connections and parsers are
 /// not `Sync`, so the scan keeps to one thread with its own small runtime.
 pub async fn blocking<T, F>(work: F) -> Result<T, UiError>

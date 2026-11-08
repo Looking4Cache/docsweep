@@ -410,6 +410,12 @@
   "settings.link_mails.label": "Stop waiting after … days",
   "settings.link_mails.hint": "Counted from the date of the mail. At least 1; the default is {days}.",
   "settings.link_mails.invalid": "Please enter a whole number of days, at least 1.",
+  "settings.language.title": "Language",
+  "settings.language.label": "Interface language",
+  "settings.language.auto": "Automatic (system language)",
+  "settings.language.en": "English",
+  "settings.language.de": "Deutsch",
+  "settings.language.hint": "Applies right away. Messages from Docsweep's core are still in English for now.",
   "settings.about": "About",
   "settings.about.version": "Version",
   "settings.about.config": "Configuration file"

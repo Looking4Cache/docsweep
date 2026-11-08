@@ -1,6 +1,6 @@
 import { api, errorText, onAutomationStatus, onTrayPreview } from "./lib/api.js";
 import { h, icon, mark, replace } from "./lib/dom.js";
-import { loadTranslations, t } from "./lib/i18n.js";
+import { loadTranslations, setLanguageChoice, t } from "./lib/i18n.js";
 import { watchPickups } from "./lib/pickup.js";
 import { notice, watchPortalConfirmations } from "./lib/ui.js";
 import { renderCompanies } from "./views/companies.js";
@@ -57,6 +57,12 @@ const app = {
   portalSecretsOf: (id) => app.portalSecrets.get(id) ?? { credentials: false, totp: false },
   setPortalSecretStored: (id, kind) => app.portalSecrets.set(id, { ...app.portalSecretsOf(id), [kind]: true }),
   navigate,
+  // Loads the other catalogue and draws everything again, on the same page.
+  async changeLanguage(choice) {
+    setLanguageChoice(choice);
+    await loadTranslations(choice);
+    showShell();
+  },
   // Whether an automatic run is active, and those with problems nobody has seen.
   automationRunning: false,
   automaticProblems: [],

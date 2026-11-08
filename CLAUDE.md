@@ -58,7 +58,7 @@ cargo install tauri-cli --locked      # once, for bundling
 ## Conventions
 
 - One commit per working step. Code, identifiers, comments, commit messages and docs are in English; the conversation with the maintainer is in German.
-- All user-visible GUI text goes through the translation catalogues in `crates/docsweep-gui/ui/i18n/`. English is the initial language, German follows.
+- All user-visible GUI text goes through the translation catalogues in `crates/docsweep-gui/ui/i18n/` (`en.json`, `de.json`). Every key needs both, with the same `{placeholders}`; a test checks that. The language is chosen on the Settings page (automatic follows the system) and kept in the web view's storage; the web view reports it through `set_language`, so the tray follows. German texts address the user with "du", and a link mail is a "Hinweis-Mail".
 - Names, paths, keychain entries and environment variables come from `docsweep_core::names` and `docsweep_core::paths`. Never repeat those literals elsewhere.
 - The Bundle ID has a single source: `identifier` in `crates/docsweep-gui/tauri.conf.json`. `build.rs` exposes it as a constant. It must be final before the first signed build.
 - Only password-based IMAP is supported. OAuth2 mailboxes are deliberately out of scope.
@@ -94,7 +94,7 @@ cargo install tauri-cli --locked      # once, for bundling
 - The recorder's listener (`docsweep-browser/src/recorder.js`) must never read a typed value, and a test checks its text for that. Its events come from a page, so `portal::recording::build_draft` checks selectors and addresses again. Recorder and AI only ever write draft files; a person decides whether to use them.
 - `defaults.output_dir` is the folder for companies without their own `output.dir`; settings that apply to everything belong on the Settings page.
 - Unsaved company forms are kept as drafts in the web view's `localStorage`. Never put secrets into anything stored there.
-- Core error messages are English for now; they need keys before the German translation.
+- Core error messages are still English, also in the German interface; they need keys to be translated.
 - Pin GitHub Actions to commit SHAs.
 
 ## Security rules (not negotiable)

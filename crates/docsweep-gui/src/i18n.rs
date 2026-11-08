@@ -1,16 +1,56 @@
 //! Text for the few places outside the web view, from the same catalogues.
 
+//! The web view picks the language and reports it through [`set_language`], so
+//! the tray follows the same choice. Until then it is English.
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-static ENGLISH: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
+type Catalogue = HashMap<String, String>;
+
+static ENGLISH: LazyLock<Catalogue> = LazyLock::new(|| {
     serde_json::from_str(include_str!("../ui/i18n/en.json"))
         .expect("the English catalogue is valid JSON")
 });
 
-/// Translates a key; an unknown key is shown as it is.
+static GERMAN: LazyLock<Catalogue> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../ui/i18n/de.json"))
+        .expect("the German catalogue is valid JSON")
+});
+
+static USE_GERMAN: AtomicBool = AtomicBool::new(false);
+
+/// Switches the language; returns whether it is supported. Unsupported codes
+/// leave the current language alone.
+pub fn set_language(code: &str) -> bool {
+    let Some(german) = is_german(code) else {
+        return false;
+    };
+    USE_GERMAN.store(german, Ordering::SeqCst);
+    true
+}
+
+fn is_german(code: &str) -> Option<bool> {
+    match code {
+        "en" => Some(false),
+        "de" => Some(true),
+        _ => None,
+    }
+}
+
+/// Translates a key, falling back to English; an unknown key is shown as it is.
 pub fn text(key: &str) -> String {
-    ENGLISH.get(key).cloned().unwrap_or_else(|| key.to_owned())
+    text_in(USE_GERMAN.load(Ordering::SeqCst), key)
+}
+
+fn text_in(german: bool, key: &str) -> String {
+    let current: &Catalogue = if german { &GERMAN } else { &ENGLISH };
+    current
+        .get(key)
+        .or_else(|| ENGLISH.get(key))
+        .cloned()
+        .unwrap_or_else(|| key.to_owned())
 }
 
 #[cfg(test)]
@@ -82,6 +122,58 @@ mod tests {
         ] {
             assert!(ENGLISH.contains_key(key), "{key}");
         }
+    }
+
+    /// The `{name}` placeholders of a text, sorted.
+    fn placeholders(text: &str) -> Vec<String> {
+        let mut found: Vec<String> = text
+            .split('{')
+            .skip(1)
+            .filter_map(|rest| rest.split_once('}').map(|(name, _)| name.to_owned()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn the_german_catalogue_has_every_key_with_the_same_placeholders() {
+        let mut problems = Vec::new();
+        for (key, english) in ENGLISH.iter() {
+            match GERMAN.get(key) {
+                None => problems.push(format!("missing: {key}")),
+                Some(german) if placeholders(german) != placeholders(english) => {
+                    problems.push(format!("placeholders differ: {key}"));
+                }
+                Some(_) => {}
+            }
+        }
+        for key in GERMAN.keys() {
+            if !ENGLISH.contains_key(key) {
+                problems.push(format!("only in German: {key}"));
+            }
+        }
+        problems.sort();
+        assert!(problems.is_empty(), "{problems:#?}");
+    }
+
+    #[test]
+    fn the_interface_lists_exactly_the_shipped_catalogues() {
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let script = fs::read_to_string(ui.join("lib/i18n.js")).unwrap();
+        assert!(script.contains(r#"SUPPORTED_LANGUAGES = ["en", "de"]"#));
+        for code in ["en", "de"] {
+            assert!(ui.join(format!("i18n/{code}.json")).is_file());
+        }
+    }
+
+    #[test]
+    fn only_shipped_languages_are_accepted() {
+        assert_eq!(is_german("de"), Some(true));
+        assert_eq!(is_german("en"), Some(false));
+        assert_eq!(is_german("fr"), None);
+        assert_eq!(text_in(true, "tray.open"), "Docsweep öffnen");
+        assert_eq!(text_in(false, "tray.open"), "Open Docsweep");
+        assert_eq!(text_in(true, "does.not.exist"), "does.not.exist");
     }
 
     #[test]

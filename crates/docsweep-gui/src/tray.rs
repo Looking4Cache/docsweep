@@ -18,6 +18,9 @@ const RUNS_TO_SEARCH: u32 = 100;
 /// The status line of the menu.
 struct StatusLine(MenuItem<Wry>);
 
+/// The menu entries with fixed text, kept to relabel them in another language.
+struct Labels(Vec<(MenuItem<Wry>, &'static str)>);
+
 /// Event telling the interface to start a preview.
 const EVENT_PREVIEW: &str = "tray-preview";
 
@@ -49,6 +52,11 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
     app.manage(StatusLine(status));
+    app.manage(Labels(vec![
+        (open, "tray.open"),
+        (preview, "tray.preview"),
+        (quit, "tray.quit"),
+    ]));
     refresh_status(app);
 
     let mut builder = TrayIconBuilder::with_id("main")
@@ -74,6 +82,16 @@ fn show_status(app: &AppHandle, line: &str) {
     if let Some(status) = app.try_state::<StatusLine>() {
         let _ = status.0.set_text(line);
     }
+}
+
+/// Writes the menu again in the current language.
+pub fn relabel(app: &AppHandle) {
+    if let Some(labels) = app.try_state::<Labels>() {
+        for (item, key) in &labels.0 {
+            let _ = item.set_text(text(key));
+        }
+    }
+    refresh_status(app);
 }
 
 /// Shows that an automatic run could not get going at all.

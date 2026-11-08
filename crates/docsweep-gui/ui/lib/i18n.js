@@ -1,30 +1,71 @@
 // Translation catalogues live in i18n/<language>.json. To add a language, add
-// its catalogue and list it in SUPPORTED_LANGUAGES.
-const SUPPORTED_LANGUAGES = ["en"];
+// its catalogue, list it in SUPPORTED_LANGUAGES and give it a name under
+// settings.language.<code>. src/i18n.rs needs it too, for the tray.
+import { api } from "./api.js";
+
+const SUPPORTED_LANGUAGES = ["en", "de"];
 const FALLBACK_LANGUAGE = "en";
+// "auto" follows the system. The choice is a convenience of this computer, so it
+// lives in the web view's storage, which may be unavailable.
+const CHOICE_KEY = "docsweep.language";
 
 let catalogue = {};
+let fallback = {};
 let language = FALLBACK_LANGUAGE;
 
-export async function loadTranslations() {
-  const preferred = navigator.language.split("-")[0];
+export const languageChoices = ["auto", ...SUPPORTED_LANGUAGES];
+
+export function languageChoice() {
+  try {
+    const stored = localStorage.getItem(CHOICE_KEY);
+    return languageChoices.includes(stored) ? stored : "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+export function setLanguageChoice(choice) {
+  try {
+    if (choice === "auto") localStorage.removeItem(CHOICE_KEY);
+    else localStorage.setItem(CHOICE_KEY, choice);
+  } catch {
+    // Without storage the choice lasts until the window reloads.
+  }
+}
+
+async function loadCatalogue(code) {
+  const response = await fetch(`i18n/${code}.json`);
+  return response.json();
+}
+
+export async function loadTranslations(choice = languageChoice()) {
+  const preferred = choice === "auto" ? navigator.language.split("-")[0] : choice;
   language = SUPPORTED_LANGUAGES.includes(preferred) ? preferred : FALLBACK_LANGUAGE;
-  const response = await fetch(`i18n/${language}.json`);
-  catalogue = await response.json();
+  fallback = await loadCatalogue(FALLBACK_LANGUAGE);
+  catalogue = language === FALLBACK_LANGUAGE ? fallback : await loadCatalogue(language);
   document.documentElement.lang = language;
+  try {
+    api.setLanguage(language).catch(() => {});
+  } catch {
+    // The tray keeps its language; the window is what matters.
+  }
 }
 
 function fill(template, values) {
   return template.replace(/\{(\w+)\}/g, (match, key) => values[key] ?? match);
 }
 
+function lookup(key) {
+  return catalogue[key] ?? fallback[key];
+}
+
 export function t(key, values = {}) {
-  return fill(catalogue[key] ?? key, values);
+  return fill(lookup(key) ?? key, values);
 }
 
 export function tn(key, count, values = {}) {
   const form = new Intl.PluralRules(language).select(count) === "one" ? "one" : "other";
-  return fill(catalogue[`${key}_${form}`] ?? key, { count, ...values });
+  return fill(lookup(`${key}_${form}`) ?? key, { count, ...values });
 }
 
 export function formatDate(iso) {

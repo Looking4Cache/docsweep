@@ -27,6 +27,7 @@ export const api = {
   describeSchedule: (expression) => invoke("describe_schedule", { expression }),
   autostartEnabled: () => invoke("autostart_enabled"),
   setAutostart: (enabled) => invoke("set_autostart", { enabled }),
+  setLanguage: (language) => invoke("set_language", { language }),
   listPickups: () => invoke("list_pickups"),
   dismissPickup: (id) => invoke("dismiss_pickup", { id }),
   pickupStatus: () => invoke("pickup_status"),

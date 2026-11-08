@@ -1,6 +1,6 @@
 import { api, errorText } from "../lib/api.js";
 import { h, replace } from "../lib/dom.js";
-import { t } from "../lib/i18n.js";
+import { languageChoice, languageChoices, t } from "../lib/i18n.js";
 import { field, folderInput, notice, pageHeader, showIssues, textInput, toast, withBusy } from "../lib/ui.js";
 import { cleanupForm } from "./mailboxes.js";
 
@@ -87,6 +87,30 @@ export function renderSettings(app) {
       form,
       save: () => withDefault("downloads_dir", folder.trim()),
     });
+  }
+
+  // The language belongs to this computer, not to the configuration, so it
+  // applies at once and has no part in saving.
+  function languageCard() {
+    const current = languageChoice();
+    const choices = h("div", { class: "segmented", role: "radiogroup", "aria-label": t("settings.language.label") },
+      languageChoices.map((choice) =>
+        h("button", {
+          class: `segment${current === choice ? " is-active" : ""}`,
+          role: "radio",
+          "aria-checked": String(current === choice),
+          onclick: () => {
+            if (choice !== current) app.changeLanguage(choice);
+          },
+        }, t(`settings.language.${choice}`))));
+    return h("article", { class: "card" },
+      h("header", { class: "card-header card-header-stacked" },
+        h("h2", { class: "card-heading" }, t("settings.language.title"))),
+      h("div", { class: "form" },
+        h("div", { class: "field" },
+          h("span", { class: "field-label" }, t("settings.language.label")),
+          choices,
+          h("span", { class: "field-hint" }, t("settings.language.hint")))));
   }
 
   // How long a link mail of a recipe company waits for its invoice.
@@ -305,6 +329,7 @@ export function renderSettings(app) {
     cleanupCard(),
     automationCard(),
     aiCard(),
+    languageCard(),
     h("article", { class: "card" },
       h("h2", { class: "card-heading" }, t("settings.about")),
       h("dl", { class: "about" },

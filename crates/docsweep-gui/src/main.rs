@@ -95,6 +95,7 @@ fn main() {
             commands::describe_schedule,
             commands::autostart_enabled,
             commands::set_autostart,
+            commands::set_language,
             pickup::list_pickups,
             pickup::dismiss_pickup,
             pickup::pickup_status,
