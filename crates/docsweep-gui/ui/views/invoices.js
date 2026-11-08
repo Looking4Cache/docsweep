@@ -12,6 +12,7 @@ const FILTERS = [
 
 function statusBadge(row) {
   if (row.dismissed_at) return badge("neutral", t("status.portal_dismissed"));
+  if (row.given_up_at) return badge("warning", t("status.portal_given_up"));
   if (row.resolved_at) return badge("success", t("status.portal_resolved"));
   return badge(STATUS_TONES[row.status], t(`status.${row.status}`));
 }

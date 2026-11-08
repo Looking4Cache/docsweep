@@ -72,6 +72,9 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE invoices ADD COLUMN dismissed_at TEXT;
 "#,
+    r#"
+    ALTER TABLE invoices ADD COLUMN given_up_at TEXT;
+"#,
 ];
 
 /// The first schema version with the column `portal_key`. A dry run reads an
@@ -86,6 +89,9 @@ const SETTLED_BY_VERSION: usize = 6;
 /// The first schema version in which a person can mark a link mail as done
 /// (`dismissed_at`).
 const DISMISSED_VERSION: usize = 7;
+/// The first schema version in which a link mail can stop waiting because its
+/// invoice did not come in time (`given_up_at`).
+const GIVEN_UP_VERSION: usize = 8;
 
 /// Where an invoice came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -155,6 +161,8 @@ pub enum LinkClosure {
     Settled,
     /// A person marked it as done; Docsweep did nothing to the mail.
     Dismissed,
+    /// No invoice came in time; Docsweep flagged the mail and stopped waiting.
+    GivenUp,
 }
 
 /// A stored document to add to the index.
@@ -199,6 +207,9 @@ pub struct InvoiceRecord {
     /// On a resolved `portal_fetch_required` row: when a person marked it as done
     /// without Docsweep storing an invoice or touching the mail.
     pub dismissed_at: Option<String>,
+    /// On a resolved `portal_fetch_required` row: when Docsweep stopped waiting
+    /// for its invoice and flagged the mail instead.
+    pub given_up_at: Option<String>,
 }
 
 impl InvoiceRecord {
@@ -223,6 +234,7 @@ impl InvoiceRecord {
             resolved_at: row.get("resolved_at").unwrap_or(None),
             settled_by: row.get("settled_by").unwrap_or(None),
             dismissed_at: row.get("dismissed_at").unwrap_or(None),
+            given_up_at: row.get("given_up_at").unwrap_or(None),
         })
     }
 }
@@ -644,30 +656,73 @@ impl Index {
         if version < AUTOMATION_VERSION {
             return Ok(None);
         }
-        let dismissed = if version >= DISMISSED_VERSION {
-            "dismissed_at"
-        } else {
-            "NULL"
-        };
+        let column = |name, since| if version >= since { name } else { "NULL" };
         let query = format!(
-            "SELECT resolved_at, {dismissed} FROM invoices
+            "SELECT resolved_at, {}, {} FROM invoices
              WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
-               AND status = 'portal_fetch_required'"
+               AND status = 'portal_fetch_required'",
+            column("dismissed_at", DISMISSED_VERSION),
+            column("given_up_at", GIVEN_UP_VERSION),
         );
         let found = self
             .conn
             .query_row(&query, params![company_id, mail_account, mail_id], |row| {
                 Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(0)?.is_some(),
+                    row.get::<_, Option<String>>(1)?.is_some(),
+                    row.get::<_, Option<String>>(2)?.is_some(),
                 ))
             })
             .optional()?;
         Ok(match found {
-            Some((Some(_), Some(_))) => Some(LinkClosure::Dismissed),
-            Some((Some(_), None)) => Some(LinkClosure::Settled),
+            Some((true, true, _)) => Some(LinkClosure::Dismissed),
+            Some((true, _, true)) => Some(LinkClosure::GivenUp),
+            Some((true, false, false)) => Some(LinkClosure::Settled),
             _ => None,
         })
+    }
+
+    /// Since when a noted link mail waits: the mail's date, or without one, the
+    /// day it was noted. `None` if it is not noted or no longer waits.
+    pub fn link_mail_waiting_since(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<Option<NaiveDate>, IndexError> {
+        let query = format!(
+            "SELECT COALESCE(invoice_date, substr(created_at, 1, 10)) FROM invoices
+             WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
+               AND status = 'portal_fetch_required' {}",
+            self.waiting_condition()?
+        );
+        let date: Option<Option<String>> = self
+            .conn
+            .query_row(&query, params![company_id, mail_account, mail_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(date.flatten().and_then(|date| date.parse().ok()))
+    }
+
+    /// Records that Docsweep stopped waiting for a link mail's invoice. Nothing
+    /// claims an invoice for it, and `disposed_at` stays empty, since the mail
+    /// stays where it is. Returns whether a waiting row was found.
+    pub fn give_up_link_mail(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<bool, IndexError> {
+        let changed = self.conn.execute(
+            "UPDATE invoices
+             SET resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 given_up_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
+               AND status = 'portal_fetch_required' AND resolved_at IS NULL",
+            params![company_id, mail_account, mail_id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Records that a person marked a waiting link mail as done, for instance
@@ -1395,6 +1450,83 @@ mod tests {
                 .unwrap(),
             "a dismissed mail is not noted again"
         );
+    }
+
+    #[test]
+    fn giving_up_on_a_link_mail_resolves_it_without_an_invoice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, _) = with_link_mail(dir.path());
+        assert_eq!(
+            index
+                .link_mail_waiting_since("acme", "main", "<link>")
+                .unwrap(),
+            NaiveDate::from_ymd_opt(2026, 11, 3)
+        );
+
+        assert!(index.give_up_link_mail("acme", "main", "<link>").unwrap());
+        assert!(!index.give_up_link_mail("acme", "main", "<link>").unwrap());
+
+        let row = index.invoices_of("acme").unwrap().remove(0);
+        assert!(row.given_up_at.is_some());
+        assert!(row.resolved_at.is_some());
+        assert_eq!(
+            (row.disposed_at, row.settled_by, row.dismissed_at),
+            (None, None, None)
+        );
+        assert_eq!(
+            index.link_mail_closure("acme", "main", "<link>").unwrap(),
+            Some(LinkClosure::GivenUp)
+        );
+        assert_eq!(
+            index
+                .link_mail_waiting_since("acme", "main", "<link>")
+                .unwrap(),
+            None,
+            "no longer waiting"
+        );
+    }
+
+    #[test]
+    fn a_link_mail_without_a_date_waits_since_it_was_noted() {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .record_portal_fetch_required("acme", "main", "<undated>", None)
+            .unwrap();
+        let since = index
+            .link_mail_waiting_since("acme", "main", "<undated>")
+            .unwrap()
+            .unwrap();
+        assert!((Utc::now().date_naive() - since).num_days().abs() <= 1);
+    }
+
+    #[test]
+    fn a_dry_run_reads_closures_on_an_index_from_before_giving_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..GIVEN_UP_VERSION - 1] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (GIVEN_UP_VERSION - 1) as i64)
+            .unwrap();
+        drop(conn);
+        let writer = Index {
+            conn: Connection::open(&path).unwrap(),
+        };
+        writer
+            .record_portal_fetch_required("acme", "main", "<link>", None)
+            .unwrap();
+        let link = writer.invoices_of("acme").unwrap()[0].id;
+        writer.dismiss_link_mail(link).unwrap();
+        drop(writer);
+
+        let index = Index::open_read_only(&path).unwrap().unwrap();
+
+        assert_eq!(
+            index.link_mail_closure("acme", "main", "<link>").unwrap(),
+            Some(LinkClosure::Dismissed)
+        );
+        assert_eq!(index.invoices_of("acme").unwrap()[0].given_up_at, None);
     }
 
     #[test]

@@ -21,6 +21,10 @@ use crate::schedule::Schedule;
 /// Fewer minutes between polls would only burden the mail server.
 pub const MIN_POLL_MINUTES: u32 = 5;
 
+/// How many days a link mail of a recipe company waits for its invoice, unless
+/// `defaults.link_mail_give_up_days` says otherwise.
+pub const DEFAULT_LINK_MAIL_GIVE_UP_DAYS: u32 = 45;
+
 /// The whole `docsweep.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -41,7 +45,7 @@ pub struct Config {
 }
 
 /// The `defaults` section.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// Folder for invoices of companies without their own `output.dir`.
@@ -51,11 +55,37 @@ pub struct Defaults {
     /// system's downloads folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downloads_dir: Option<String>,
+    /// After this many days since its date, a link mail of a company in recipe
+    /// mode stops waiting for its invoice: no more downloads, and the mail is
+    /// flagged for a person.
+    #[serde(
+        default = "default_give_up_days",
+        skip_serializing_if = "is_default_give_up_days"
+    )]
+    pub link_mail_give_up_days: u32,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            output_dir: None,
+            downloads_dir: None,
+            link_mail_give_up_days: DEFAULT_LINK_MAIL_GIVE_UP_DAYS,
+        }
+    }
+}
+
+fn default_give_up_days() -> u32 {
+    DEFAULT_LINK_MAIL_GIVE_UP_DAYS
+}
+
+fn is_default_give_up_days(days: &u32) -> bool {
+    *days == DEFAULT_LINK_MAIL_GIVE_UP_DAYS
 }
 
 impl Defaults {
     fn is_empty(&self) -> bool {
-        self.output_dir.is_none() && self.downloads_dir.is_none()
+        *self == Self::default()
     }
 }
 
@@ -468,6 +498,9 @@ impl Config {
         }
         if let Some(dir) = &self.defaults.downloads_dir {
             report.not_blank("defaults.downloads_dir", dir);
+        }
+        if self.defaults.link_mail_give_up_days == 0 {
+            report.add("defaults.link_mail_give_up_days", "must be at least 1 day");
         }
         self.mail.validate(&mut report);
         if let Some(llm) = &self.llm {
@@ -967,6 +1000,28 @@ mail:
         let reloaded = Config::load(&path).unwrap();
         assert!(reloaded.automation.enabled);
         assert_eq!(reloaded.mail.poll_minutes, Some(30));
+    }
+
+    #[test]
+    fn link_mails_wait_45_days_unless_configured_otherwise() {
+        let config = Config::from_yaml(MINIMAL_MAIL).unwrap();
+        assert_eq!(config.defaults.link_mail_give_up_days, 45);
+        let written = serde_saphyr::to_string(&config).unwrap();
+        assert!(!written.contains("give_up"), "{written}");
+
+        let yaml = format!("defaults: {{ link_mail_give_up_days: 30 }}\n{MINIMAL_MAIL}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.yaml");
+        Config::from_yaml(&yaml).unwrap().save(&path).unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.link_mail_give_up_days,
+            30
+        );
+
+        let zero = format!("defaults: {{ link_mail_give_up_days: 0 }}\n{MINIMAL_MAIL}");
+        assert_eq!(issues_of(&zero)[0].path, "defaults.link_mail_give_up_days");
+        let one = format!("defaults: {{ link_mail_give_up_days: 1 }}\n{MINIMAL_MAIL}");
+        assert!(Config::from_yaml(&one).is_ok());
     }
 
     #[test]

@@ -137,9 +137,14 @@ pub enum MailAction {
         assisted: bool,
         /// Assisted mode only: its invoice is stored, so a real run would do this.
         cleanup: Option<DisposalAction>,
-        /// The mail no longer waits: its invoice settled it, or a person marked it
-        /// as done. Nothing more happens to it, neither a download nor a cleanup.
+        /// The mail no longer waits: its invoice settled it, a person marked it
+        /// as done, or Docsweep gave up on it. Nothing more happens to it, neither
+        /// a download nor a cleanup.
         closed: Option<LinkClosure>,
+        /// Recipe mode only: the mail has waited at least this many days
+        /// (`defaults.link_mail_give_up_days`) without a matching invoice, so a
+        /// real run stops waiting, starts no download and flags it.
+        give_up_after_days: Option<u32>,
     },
     /// Rule matches, but there is no PDF and no portal, so nothing can be done.
     NoDocument {
@@ -265,15 +270,49 @@ fn plan_link_mail(
         ),
         None => (false, false, None, None),
     };
+    let give_up_after_days = match context.index {
+        Some(index) if !assisted && already_recorded && closed.is_none() => {
+            give_up_after(context, index, mail, (id.0, id.1, id.2))?
+        }
+        _ => None,
+    };
     Ok(MailAction::PortalFetchRequired {
         company_id: company.id.clone(),
         company_name: company.name.clone(),
         already_recorded,
-        fetch_due: !assisted && closed.is_none() && (!already_recorded || !fetched_today),
+        fetch_due: !assisted
+            && closed.is_none()
+            && give_up_after_days.is_none()
+            && (!already_recorded || !fetched_today),
         assisted,
         cleanup,
         closed,
+        give_up_after_days,
     })
+}
+
+/// A waiting link mail of a recipe company is given up once it is at least
+/// `defaults.link_mail_give_up_days` old, counted from the mail's date or, without
+/// one, from the day it was noted. A new mail always gets its first download, and
+/// a mail whose invoice is in the index is left for the cleanup.
+fn give_up_after(
+    context: &PlanContext<'_>,
+    index: &Index,
+    mail: &IncomingMail,
+    id: (&str, &str, &str),
+) -> Result<Option<u32>, PlanError> {
+    let days = context.config.defaults.link_mail_give_up_days;
+    let Some(since) = mail
+        .date
+        .or(index.link_mail_waiting_since(id.0, id.1, id.2)?)
+    else {
+        return Ok(None);
+    };
+    let waited = (context.today - since).num_days();
+    if waited < i64::from(days) || index.has_invoice_for_link_mail(id.0, id.1, id.2)? {
+        return Ok(None);
+    }
+    Ok(Some(days))
 }
 
 fn plan_document(
@@ -451,7 +490,7 @@ companies:
             rules: &rules,
             index,
             account_id: "main",
-            today: NaiveDate::from_ymd_opt(2030, 1, 1).unwrap(),
+            today: NaiveDate::from_ymd_opt(2026, 11, 6).unwrap(),
         };
         plan_mail(&context, &IncomingMail::parse(1, raw), &mut HashSet::new()).unwrap()
     }
@@ -759,7 +798,7 @@ companies:
         );
         let index = Index::open_in_memory().unwrap();
         // The date `plan` uses as today.
-        let today = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 6).unwrap();
         index
             .record_portal_fetch_required("acme", "main", "old@x", None)
             .unwrap();

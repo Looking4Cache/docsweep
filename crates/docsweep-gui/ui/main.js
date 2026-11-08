@@ -168,6 +168,7 @@ async function start() {
   app.llmKeyStored = state.llm_key_stored;
   app.anthropicDefaultModel = state.anthropic_default_model;
   app.systemDownloadsDir = state.system_downloads_dir;
+  app.defaultGiveUpDays = state.default_link_mail_give_up_days;
   watchPortalConfirmations();
   watchPickups(app);
   onAutomationStatus(({ running }) => {

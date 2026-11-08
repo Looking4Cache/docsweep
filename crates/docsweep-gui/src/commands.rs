@@ -14,7 +14,8 @@ use docsweep_core::ai::generate::{generation_prompt, known_hosts, request_draft}
 use docsweep_core::ai::provider::{self, ANTHROPIC_DEFAULT_MODEL};
 use docsweep_core::ai::sanitize::{RawPage, SanitizedPrompt};
 use docsweep_core::config::{
-    Company, Config, ConfigError, Issue, MailAccount, SecretRef, system_downloads_dir,
+    Company, Config, ConfigError, DEFAULT_LINK_MAIL_GIVE_UP_DAYS, Issue, MailAccount, SecretRef,
+    system_downloads_dir,
 };
 use docsweep_core::index::{Index, IndexError, InvoiceRecord};
 use docsweep_core::mail::execute::{self, AccountReport, ScanReport, ScanSummary, summarize};
@@ -113,6 +114,8 @@ pub struct AppSnapshot {
     anthropic_default_model: &'static str,
     /// Where pick-ups look unless Settings say otherwise.
     system_downloads_dir: Option<PathBuf>,
+    /// How long link mails wait unless Settings say otherwise.
+    default_link_mail_give_up_days: u32,
 }
 
 /// Whether the secrets of a portal exist; never their values.
@@ -181,6 +184,7 @@ fn snapshot(paths: &Paths, secrets: &dyn SecretStore) -> AppSnapshot {
         llm_key_stored,
         anthropic_default_model: ANTHROPIC_DEFAULT_MODEL,
         system_downloads_dir: system_downloads_dir(),
+        default_link_mail_give_up_days: DEFAULT_LINK_MAIL_GIVE_UP_DAYS,
     }
 }
 

@@ -27,6 +27,7 @@ function effectItems(effects) {
   add(effects.permanent, "scan.confirm_permanent", "trash", true);
   add(effects.fetches, "scan.confirm_fetches", "link");
   add(effects.pickups, "scan.confirm_pickups", "link");
+  add(effects.giveUps, "scan.confirm_give_ups", "flag");
   return items;
 }
 

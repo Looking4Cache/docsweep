@@ -102,6 +102,8 @@
   "scan.confirm_permanent_other": "Permanently delete {count} mails",
   "scan.confirm_fetches_one": "Start a portal download for {count} company; link mails are only tidied up once their invoice is saved",
   "scan.confirm_fetches_other": "Start portal downloads for {count} companies; link mails are only tidied up once their invoice is saved",
+  "scan.confirm_give_ups_one": "Stop waiting for {count} link mail whose invoice did not come in time, and flag it",
+  "scan.confirm_give_ups_other": "Stop waiting for {count} link mails whose invoices did not come in time, and flag them",
   "scan.confirm_pickups_one": "Note {count} invoice for you to pick up in your browser",
   "scan.confirm_pickups_other": "Note {count} invoices for you to pick up in your browser",
   "scan.auto_running": "Docsweep is running automatically right now. You can start a scan when it has finished.",
@@ -187,6 +189,8 @@
   "row.pickup_done": "Invoice picked up",
   "row.link_settled": "Already done: its invoice is saved",
   "row.link_dismissed": "Marked as done by you; Docsweep leaves this mail alone",
+  "row.link_given_up": "No invoice came in time; Docsweep stopped waiting and leaves this mail alone",
+  "row.link_give_up": "No matching invoice in the portal within {days} days. A real run stops waiting and flags the mail",
   "row.no_document": "No PDF, and no portal configured",
   "row.unknown": "Unknown sender",
   "row.make_company": "Create company",
@@ -223,6 +227,7 @@
   "status.portal_fetch_required": "Portal download",
   "status.portal_resolved": "Downloaded",
   "status.portal_dismissed": "Marked as done",
+  "status.portal_given_up": "Gave up waiting",
 
   "review.title": "Complete this invoice",
   "review.lead": "Open the file, then enter what Docsweep could not read. The file is renamed, and the next scan tidies up its mail.",
@@ -399,6 +404,11 @@
   "automation.autostart": "Start Docsweep at login",
   "automation.autostart_hint": "Applies right away. Docsweep then starts in the tray, without a window.",
 
+  "settings.link_mails.title": "Link mails",
+  "settings.link_mails.lead": "A mail that only says your invoice is in the portal starts a download, and waits until its invoice is saved. For portals where Docsweep logs in, it stops waiting at some point and flags the mail for you instead. Invoices you pick up yourself wait until you mark them as done.",
+  "settings.link_mails.label": "Stop waiting after … days",
+  "settings.link_mails.hint": "Counted from the date of the mail. At least 1; the default is {days}.",
+  "settings.link_mails.invalid": "Please enter a whole number of days, at least 1.",
   "settings.about": "About",
   "settings.about.version": "Version",
   "settings.about.config": "Configuration file"

@@ -144,12 +144,15 @@ pub fn summarize(reports: &[AccountReport]) -> ScanSummary {
                     summary.disposed += u32::from(matches!(decision, MailDecision::Dispose(_)));
                 }
                 MailAction::PortalFetchRequired {
-                    cleanup, closed, ..
+                    cleanup,
+                    closed,
+                    give_up_after_days,
+                    ..
                 } => {
                     let planned_cleanup = mail.outcome == Outcome::Planned && cleanup.is_some();
                     if planned_cleanup || matches!(mail.outcome, Outcome::LinkResolved { .. }) {
                         summary.disposed += 1;
-                    } else if closed.is_none() {
+                    } else if closed.is_none() && give_up_after_days.is_none() {
                         summary.portal_fetches += 1;
                     }
                 }
@@ -631,6 +634,19 @@ async fn execute_plan<W: MailWriter>(
         MailAction::PortalFetchRequired {
             closed: Some(_), ..
         } => Outcome::Completed,
+        MailAction::PortalFetchRequired {
+            company_id,
+            give_up_after_days: Some(days),
+            ..
+        } => match index.give_up_link_mail(company_id, account_id, &mail.message_id) {
+            Ok(_) => {
+                let message = format!(
+                    "no matching invoice was found in the portal within {days} days, so Docsweep stopped waiting for it"
+                );
+                fail(writer, mail.uid, message).await
+            }
+            Err(error) => fail(writer, mail.uid, error.to_string()).await,
+        },
         MailAction::PortalFetchRequired { company_id, .. } => {
             match index.record_portal_fetch_required(
                 company_id,
@@ -823,7 +839,7 @@ companies:
             rules: &rules,
             index: Some(index),
             account_id: "main",
-            today: NaiveDate::from_ymd_opt(2030, 1, 1).unwrap(),
+            today: NaiveDate::from_ymd_opt(2026, 11, 4).unwrap(),
         };
         let mut mails = Vec::new();
         block_on(scan_and_execute(&context, index, mailbox, &mut mails)).unwrap();
@@ -1038,7 +1054,7 @@ companies:
     }
 
     fn day(number: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(2030, 1, number).unwrap()
+        NaiveDate::from_ymd_opt(2026, 11, number).unwrap()
     }
 
     /// Stands in for the browser and says what each fetch comes to.
@@ -1505,6 +1521,7 @@ companies:
                     assisted: false,
                     cleanup: None,
                     closed: None,
+                    give_up_after_days: None,
                 },
             },
             outcome: Outcome::Failed {
@@ -1568,6 +1585,7 @@ companies:
                     assisted: true,
                     cleanup: None,
                     closed: None,
+                    give_up_after_days: None,
                 },
             },
             outcome: Outcome::Completed,
@@ -1623,7 +1641,7 @@ companies:
         let downloads = tempfile::tempdir().unwrap();
         fs::write(
             downloads.path().join("invoice.pdf"),
-            test_pdf::with_text(&["Rechnungsnummer: R-1", "Rechnungsdatum: 01.01.2030"]),
+            test_pdf::with_text(&["Rechnungsnummer: R-1", "Rechnungsdatum: 01.11.2026"]),
         )
         .unwrap();
         let folder = LocalFolder::new(downloads.path().to_path_buf());
@@ -1705,6 +1723,227 @@ companies:
         assert_eq!(portal.started.len(), 1, "only the first day");
         assert!(mailbox.untouched());
         assert!(mailbox.flagged.is_empty());
+    }
+
+    /// The date of the test mails, and a day that many days later.
+    fn days_after_the_mail(days: u64) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, 3).unwrap() + chrono::Days::new(days)
+    }
+
+    #[test]
+    fn a_link_mail_is_given_up_once_it_waited_the_configured_days() {
+        for (days, given_up) in [(44, false), (45, true), (46, true)] {
+            let setup = setup(MOVE, WITH_PORTAL);
+            let index = Index::open_in_memory().unwrap();
+            let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+            let mut portal = fetcher(fine);
+            scan_with(
+                &setup,
+                &index,
+                &mut mailbox,
+                &mut portal,
+                days_after_the_mail(0),
+            );
+            assert_eq!(portal.started.len(), 1);
+
+            let mails = scan_with(
+                &setup,
+                &index,
+                &mut mailbox,
+                &mut portal,
+                days_after_the_mail(days),
+            );
+
+            let row = index.invoices_of("acme").unwrap().remove(0);
+            assert!(mailbox.untouched(), "{days} days");
+            if given_up {
+                assert_eq!(portal.started.len(), 1, "{days} days: no more downloads");
+                assert_eq!(mailbox.flagged, [1], "{days} days");
+                let Outcome::Failed { message } = &mails[0].outcome else {
+                    panic!("{days} days: {:?}", mails[0].outcome);
+                };
+                assert!(
+                    message.contains("no matching invoice was found in the portal within 45 days"),
+                    "{message}"
+                );
+                assert!(row.given_up_at.is_some());
+                assert!(row.resolved_at.is_some());
+                assert_eq!(row.disposed_at, None);
+                assert_eq!(row.settled_by, None);
+            } else {
+                assert_eq!(portal.started.len(), 2, "{days} days: still waiting");
+                assert!(mailbox.flagged.is_empty(), "{days} days");
+                assert_eq!(mails[0].outcome, Outcome::AwaitingInvoice);
+                assert_eq!(row.resolved_at, None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_given_up_link_mail_is_left_alone_afterwards() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(0),
+        );
+        scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(50),
+        );
+        assert_eq!(mailbox.flagged, [1]);
+
+        // Even an invoice that arrives later does not bring the mail back.
+        store_portal_invoice(&setup, &index, "R-1");
+        let mails = scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(51),
+        );
+
+        assert_eq!(portal.started.len(), 1);
+        assert_eq!(mailbox.flagged, [1], "not flagged again");
+        assert!(mailbox.untouched());
+        assert_eq!(mails[0].outcome, Outcome::Completed);
+        assert!(matches!(
+            mails[0].plan.action,
+            MailAction::PortalFetchRequired {
+                closed: Some(crate::index::LinkClosure::GivenUp),
+                fetch_due: false,
+                give_up_after_days: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn the_number_of_days_comes_from_the_configuration() {
+        let mut setup = setup(MOVE, WITH_PORTAL);
+        setup.config.defaults.link_mail_give_up_days = 10;
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(0),
+        );
+
+        let mails = scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(10),
+        );
+
+        let Outcome::Failed { message } = &mails[0].outcome else {
+            panic!("{:?}", mails[0].outcome);
+        };
+        assert!(message.contains("within 10 days"), "{message}");
+    }
+
+    #[test]
+    fn an_old_link_mail_seen_for_the_first_time_still_gets_its_download() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+
+        let mails = scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(90),
+        );
+
+        assert_eq!(portal.started.len(), 1);
+        assert_eq!(mails[0].outcome, Outcome::AwaitingInvoice);
+        assert!(mailbox.flagged.is_empty());
+    }
+
+    #[test]
+    fn link_mails_of_assisted_companies_are_never_given_up() {
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(0),
+        );
+
+        let mails = scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut portal,
+            days_after_the_mail(200),
+        );
+
+        assert_eq!(mails[0].outcome, Outcome::AwaitingInvoice);
+        assert!(mailbox.flagged.is_empty());
+        assert!(mailbox.untouched());
+        assert_eq!(index.invoices_of("acme").unwrap()[0].resolved_at, None);
+        assert_eq!(
+            crate::pickup::pending_pickups(&setup.config, &index)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_dry_run_shows_the_give_up_and_changes_nothing() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        scan_with(
+            &setup,
+            &index,
+            &mut mailbox,
+            &mut fetcher(fine),
+            days_after_the_mail(0),
+        );
+
+        let rules = RuleSet::new(&setup.config);
+        let context = PlanContext {
+            config: &setup.config,
+            rules: &rules,
+            index: Some(&index),
+            account_id: "main",
+            today: days_after_the_mail(45),
+        };
+        let mut mails = Vec::new();
+        block_on(scan_read_only(&context, &mut mailbox, &mut mails)).unwrap();
+
+        assert!(matches!(
+            mails[0].plan.action,
+            MailAction::PortalFetchRequired {
+                give_up_after_days: Some(45),
+                fetch_due: false,
+                ..
+            }
+        ));
+        assert_eq!(mails[0].outcome, Outcome::Planned);
+        assert!(mailbox.flagged.is_empty());
+        assert_eq!(index.invoices_of("acme").unwrap()[0].resolved_at, None);
     }
 
     #[test]

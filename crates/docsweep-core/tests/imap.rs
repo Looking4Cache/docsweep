@@ -427,8 +427,9 @@ companies:
     .unwrap()
 }
 
+/// Two days after the date of the test mails.
 fn today() -> NaiveDate {
-    NaiveDate::from_ymd_opt(2030, 1, 1).unwrap()
+    NaiveDate::from_ymd_opt(2026, 11, 5).unwrap()
 }
 
 async fn add_example_mails(inspector: &mut Inspector) {
@@ -764,4 +765,55 @@ async fn a_failed_fetch_keeps_and_flags_the_link_mail() {
     let inbox = inspector.contents("INBOX").await;
     assert_eq!(inbox.len(), 1);
     assert!(is_flagged(&inbox[0].1), "{inbox:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs GreenMail, see scripts/imap-tests.sh"]
+async fn a_link_mail_without_an_invoice_for_too_long_is_flagged_and_then_left_alone() {
+    let mut inspector = Inspector::reset().await;
+    inspector
+        .add(&raw_mail(
+            "b@portal.example",
+            "Rechnung online",
+            "link@x",
+            None,
+        ))
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = link_config(dir.path());
+    let index = Index::open(&dir.path().join("docsweep.db")).unwrap();
+    let mut portal = FakePortal {
+        index: &index,
+        dir: dir.path(),
+        store: &[],
+        error: None,
+        started: 0,
+    };
+    scan_links(&config, &index, &mut portal, today()).await;
+    assert_eq!(portal.started, 1);
+
+    // The test mails are from 3 November; 45 days later Docsweep stops waiting.
+    let mail_date = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
+    let late = mail_date + chrono::Days::new(45);
+    let mails = scan_links(&config, &index, &mut portal, late).await;
+
+    assert_eq!(portal.started, 1, "no download for a mail given up on");
+    let Outcome::Failed { message } = &mails[0].outcome else {
+        panic!("{:?}", mails[0].outcome);
+    };
+    assert!(message.contains("within 45 days"), "{message}");
+    let inbox = inspector.contents("INBOX").await;
+    assert_eq!(inbox.len(), 1, "the mail stays");
+    assert!(is_flagged(&inbox[0].1), "{inbox:?}");
+    let row = index.invoices_of("portal").unwrap().remove(0);
+    assert!(row.given_up_at.is_some());
+    assert_eq!(row.disposed_at, None);
+
+    // Afterwards nothing happens to it any more.
+    let later = late + chrono::Days::new(1);
+    let mails = scan_links(&config, &index, &mut portal, later).await;
+    assert_eq!(portal.started, 1);
+    assert_eq!(mails[0].outcome, Outcome::Completed);
+    assert_eq!(inspector.contents("INBOX").await.len(), 1);
 }

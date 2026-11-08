@@ -36,7 +36,7 @@ export function groupReports(reports) {
 
 // What a real run would do, for the confirmation dialog.
 export function plannedEffects(reports) {
-  const effects = { saves: 0, reviews: 0, moves: 0, trash: 0, permanent: 0, fetches: 0, pickups: 0 };
+  const effects = { saves: 0, reviews: 0, moves: 0, trash: 0, permanent: 0, fetches: 0, pickups: 0, giveUps: 0 };
   const countDisposal = (disposal) => {
     if (disposal === "move_to") effects.moves += 1;
     if (disposal === "trash") effects.trash += 1;
@@ -47,6 +47,7 @@ export function plannedEffects(reports) {
     for (const mail of account.mails) {
       const action = mail.plan.action;
       if (action.kind === "portal_fetch_required" && action.fetch_due) fetching.add(action.company_id);
+      if (action.kind === "portal_fetch_required" && action.give_up_after_days) effects.giveUps += 1;
       if (action.kind === "portal_fetch_required" && action.cleanup) countDisposal(action.cleanup.kind);
       else if (action.kind === "portal_fetch_required" && action.assisted && !action.already_recorded) effects.pickups += 1;
       if (action.kind !== "invoices") continue;
@@ -106,6 +107,9 @@ function destination(mail, done) {
 function linkMailNote(mail) {
   const { assisted, cleanup, already_recorded: noted, closed } = mail.plan.action;
   if (closed) return t(`row.link_${closed}`);
+  if (mail.outcome.kind === "planned" && mail.plan.action.give_up_after_days) {
+    return t("row.link_give_up", { days: mail.plan.action.give_up_after_days });
+  }
   if (assisted && mail.outcome.kind === "planned" && cleanup) return t("row.pickup_done");
   if (assisted && mail.outcome.kind === "planned" && !noted) return t("row.pickup_new");
   if (assisted && mail.outcome.kind === "planned") return t("row.pickup_waiting");

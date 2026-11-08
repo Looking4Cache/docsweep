@@ -220,6 +220,7 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
             assisted,
             cleanup,
             closed,
+            give_up_after_days,
             ..
         } => {
             let _ = writeln!(out, "    Company: {company_name}");
@@ -229,8 +230,19 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
                         Some(LinkClosure::Dismissed) => {
                             "    Invoice: marked as done by you\n    Mail: left alone\n"
                         }
+                        Some(LinkClosure::GivenUp) => {
+                            "    Invoice: none came in time; Docsweep stopped waiting\n    Mail: left alone\n"
+                        }
                         _ => "    Invoice: already stored\n    Mail: left alone\n",
                     });
+                }
+                (_, _, Outcome::Planned) if give_up_after_days.is_some() => {
+                    let days = give_up_after_days.unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "    Invoice: no matching invoice was found in the portal within {days} days; would stop waiting for it"
+                    );
+                    out.push_str("    Mail: would stay in place and be flagged\n");
                 }
                 (true, Some(disposal), Outcome::Planned) => {
                     out.push_str("    Invoice: stored\n");
@@ -500,6 +512,7 @@ mod tests {
                         assisted: false,
                         cleanup: None,
                         closed: None,
+                        give_up_after_days: None,
                     },
                 },
             }],
@@ -529,6 +542,24 @@ mod tests {
             true,
         );
         assert!(stored.contains("Invoice: stored"), "{stored}");
+    }
+
+    #[test]
+    fn a_link_mail_given_up_on_says_so_in_a_dry_run() {
+        let mut report = link_report(Outcome::Planned, false);
+        let MailAction::PortalFetchRequired {
+            give_up_after_days, ..
+        } = &mut report.mails[0].plan.action
+        else {
+            unreachable!();
+        };
+        *give_up_after_days = Some(45);
+        let text = render(&[report], true);
+        assert!(text.contains("within 45 days"), "{text}");
+        assert!(
+            text.contains("would stay in place and be flagged"),
+            "{text}"
+        );
     }
 
     #[test]
