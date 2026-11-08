@@ -1,0 +1,5 @@
+# On macOS, `cargo run` can sign the app before it starts, so the keychain keeps
+# "Always Allow" across rebuilds. It does nothing unless DOCSWEEP_CODESIGN_IDENTITY
+# is set; see scripts/macos-dev-sign.sh.
+[target.'cfg(target_os = "macos")']
+runner = "scripts/macos-dev-sign.sh"

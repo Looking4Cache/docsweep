@@ -49,6 +49,7 @@ cargo run -p docsweep-cli -- test-recipe <file> [--company <id>]
 cargo run -p docsweep-cli -- recipe generate <company> --url <url> [--describe "..."]
 cargo run -p docsweep-cli -- recipe record <company> --url <url>   # opens a window
 cargo run -p docsweep-gui
+DOCSWEEP_CODESIGN_IDENTITY=<hash> cargo run -p docsweep-gui  # macOS: sign first, so the keychain's "Always Allow" survives rebuilds
 cargo install tauri-cli --locked      # once, for bundling
 (cd crates/docsweep-gui && cargo tauri build)
 ```
