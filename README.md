@@ -160,6 +160,8 @@ The mail is only cleaned up by the normal rules (`disposal`, the trash by defaul
 - the download finished without failures, and
 - the index holds a stored portal invoice of that company that matches the mail: its entry is newer than the mail's, or its invoice date is on or after the mail's date.
 
+Each invoice settles only one link mail. With two mails waiting, say for October and November, the October invoice cleans up the October mail, and the November mail waits for its own invoice. Docsweep pairs mails and invoices by the closest dates and remembers which invoice settled which mail.
+
 A successful download that found nothing new is not enough, because the invoice may not be in the portal yet. The mail then stays in place, unflagged, and the portal is checked again at most once per day. A new link mail does not wait for that. A failed download leaves the mail in place and flags it.
 
 ## Assisted mode

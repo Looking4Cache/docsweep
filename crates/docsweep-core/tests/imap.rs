@@ -569,11 +569,11 @@ companies:
     .unwrap()
 }
 
-/// Says that a fetch went well; `store` decides whether it found an invoice.
+/// Says that a fetch went well; `store` names the invoices it finds.
 struct FakePortal<'a> {
     index: &'a Index,
     dir: &'a std::path::Path,
-    store: bool,
+    store: &'static [&'static str],
     error: Option<&'static str>,
     started: u32,
 }
@@ -581,22 +581,22 @@ struct FakePortal<'a> {
 impl PortalFetcher for FakePortal<'_> {
     async fn fetch(&mut self, company: &Company) -> FetchReport {
         self.started += 1;
-        if self.store {
-            let file = self.dir.join("R-1.pdf");
+        for number in std::mem::take(&mut self.store) {
+            let file = self.dir.join(format!("{number}.pdf"));
             fs::write(&file, b"x").unwrap();
             self.index
                 .insert(&NewInvoice {
                     company_id: company.id.clone(),
                     invoice_date: Some(today()),
-                    invoice_no: Some("R-1".into()),
+                    invoice_no: Some((*number).into()),
                     amount: None,
                     currency: None,
                     file_path: file,
-                    file_hash: "h".into(),
+                    file_hash: (*number).into(),
                     source: Source::Portal,
                     mail_account: None,
                     mail_id: None,
-                    portal_key: Some("R-1".into()),
+                    portal_key: Some((*number).into()),
                     status: Status::Stored,
                 })
                 .unwrap();
@@ -672,7 +672,7 @@ async fn link_mails_stay_until_their_invoice_is_stored_and_are_then_moved() {
     let mut portal = FakePortal {
         index: &index,
         dir: dir.path(),
-        store: false,
+        store: &[],
         error: None,
         started: 0,
     };
@@ -689,16 +689,28 @@ async fn link_mails_stay_until_their_invoice_is_stored_and_are_then_moved() {
     scan_links(&config, &index, &mut portal, today()).await;
     assert_eq!(portal.started, 1);
 
-    // The next day the invoice is there.
-    portal.store = true;
+    // The next day one invoice is there; it settles one mail, not both.
+    portal.store = &["R-1"];
     let next_day = today().succ_opt().unwrap();
     let mails = scan_links(&config, &index, &mut portal, next_day).await;
     assert_eq!(portal.started, 2);
-    assert!(
+    let resolved = |mails: &[MailReport]| {
         mails
             .iter()
-            .all(|m| matches!(m.outcome, Outcome::LinkResolved { .. }))
-    );
+            .filter(|m| matches!(m.outcome, Outcome::LinkResolved { .. }))
+            .count()
+    };
+    assert_eq!(resolved(&mails), 1);
+    let inbox = inspector.contents("INBOX").await;
+    assert_eq!(inbox.len(), 1);
+    assert!(!is_flagged(&inbox[0].1), "{inbox:?}");
+
+    // A day later the second invoice settles the other mail.
+    portal.store = &["R-2"];
+    let day_after = next_day.succ_opt().unwrap();
+    let mails = scan_links(&config, &index, &mut portal, day_after).await;
+    assert_eq!(portal.started, 3);
+    assert_eq!(resolved(&mails), 1);
     assert!(inspector.contents("INBOX").await.is_empty());
     let folders: Vec<String> = inspector
         .session
@@ -740,7 +752,7 @@ async fn a_failed_fetch_keeps_and_flags_the_link_mail() {
     let mut portal = FakePortal {
         index: &index,
         dir: dir.path(),
-        store: true,
+        store: &["R-1"],
         error: Some("the portal did not answer"),
         started: 0,
     };

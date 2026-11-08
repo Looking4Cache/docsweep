@@ -1,5 +1,6 @@
 //! SQLite index of all known invoices and the duplicate check.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +66,9 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (company_id, provider)
     );
 "#,
+    r#"
+    ALTER TABLE invoices ADD COLUMN settled_by INTEGER;
+"#,
 ];
 
 /// The first schema version with the column `portal_key`. A dry run reads an
@@ -73,6 +77,9 @@ const PORTAL_KEY_VERSION: usize = 3;
 /// The first schema version that knows about resolved rows, automatic runs and
 /// the table `company_runs`.
 const AUTOMATION_VERSION: usize = 4;
+/// The first schema version in which a link mail's row names the invoice that
+/// settled it (`settled_by`).
+const SETTLED_BY_VERSION: usize = 6;
 
 /// Where an invoice came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -171,6 +178,8 @@ pub struct InvoiceRecord {
     /// Set on a `portal_fetch_required` row once its invoice is stored and its
     /// mail cleaned up.
     pub resolved_at: Option<String>,
+    /// On a resolved `portal_fetch_required` row: the invoice that settled it.
+    pub settled_by: Option<i64>,
 }
 
 impl InvoiceRecord {
@@ -193,6 +202,7 @@ impl InvoiceRecord {
             disposed_at: row.get("disposed_at")?,
             // A dry run can read an older index, which lacks this column.
             resolved_at: row.get("resolved_at").unwrap_or(None),
+            settled_by: row.get("settled_by").unwrap_or(None),
         })
     }
 }
@@ -423,16 +433,31 @@ impl Index {
         Ok(())
     }
 
-    /// Whether the index holds a stored portal invoice that matches a noted link
-    /// mail: its row is newer than the mail's, or its date is on or after the
-    /// mail's. Only a file that still exists counts, as for PDF mails.
+    /// The stored portal invoice that settles a noted link mail that still
+    /// waits, if there is one. Each invoice settles at most one link mail; see
+    /// [`Self::link_assignment`].
+    pub fn invoice_for_link_mail(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<Option<i64>, IndexError> {
+        let Some(link) = self.waiting_link_row(company_id, mail_account, mail_id)? else {
+            return Ok(None);
+        };
+        Ok(self.link_assignment(company_id, false)?.remove(&link))
+    }
+
+    /// Whether [`Self::invoice_for_link_mail`] finds an invoice.
     pub fn has_invoice_for_link_mail(
         &self,
         company_id: &str,
         mail_account: &str,
         mail_id: &str,
     ) -> Result<bool, IndexError> {
-        self.link_mail_matches(company_id, mail_account, mail_id, "'stored'")
+        Ok(self
+            .invoice_for_link_mail(company_id, mail_account, mail_id)?
+            .is_some())
     }
 
     /// Like [`Self::has_invoice_for_link_mail`], but a document waiting for review
@@ -443,40 +468,132 @@ impl Index {
         mail_account: &str,
         mail_id: &str,
     ) -> Result<bool, IndexError> {
-        self.link_mail_matches(
-            company_id,
-            mail_account,
-            mail_id,
-            "'stored', 'needs_review'",
-        )
+        let Some(link) = self.waiting_link_row(company_id, mail_account, mail_id)? else {
+            return Ok(false);
+        };
+        Ok(self.link_assignment(company_id, true)?.contains_key(&link))
     }
 
-    /// `statuses` is one of the fixed lists above, never input.
-    fn link_mail_matches(
+    /// The id of a link mail's row while it still waits for its invoice.
+    fn waiting_link_row(
         &self,
         company_id: &str,
         mail_account: &str,
         mail_id: &str,
-        statuses: &str,
-    ) -> Result<bool, IndexError> {
-        let mut statement = self.conn.prepare(&format!(
-            "SELECT invoice.file_path FROM invoices AS invoice
-             JOIN invoices AS link ON link.company_id = invoice.company_id
-             WHERE link.company_id = ?1 AND link.mail_account = ?2 AND link.mail_id = ?3
-               AND link.status = 'portal_fetch_required'
-               AND invoice.source = 'portal' AND invoice.status IN ({statuses})
-               AND invoice.file_path IS NOT NULL
-               AND (invoice.id > link.id OR invoice.invoice_date >= link.invoice_date)"
-        ))?;
-        let paths = statement.query_map(params![company_id, mail_account, mail_id], |row| {
-            row.get::<_, String>(0)
-        })?;
-        for path in paths {
-            if Path::new(&path?).exists() {
-                return Ok(true);
+    ) -> Result<Option<i64>, IndexError> {
+        let query = format!(
+            "SELECT id FROM invoices
+             WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
+               AND status = 'portal_fetch_required' {}",
+            self.waiting_condition()?
+        );
+        Ok(self
+            .conn
+            .query_row(&query, params![company_id, mail_account, mail_id], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    /// The SQL condition for a link row that still waits, starting with `AND`.
+    /// An index from before `resolved_at` only has waiting rows.
+    fn waiting_condition(&self) -> Result<&'static str, IndexError> {
+        Ok(if schema_version(&self.conn)? >= AUTOMATION_VERSION {
+            "AND resolved_at IS NULL"
+        } else {
+            ""
+        })
+    }
+
+    /// Pairs the waiting link mails of a company with its portal invoices, as
+    /// link row id to invoice id. Each invoice settles at most one link mail, and
+    /// one that already settled a mail (`settled_by`) is no longer available.
+    ///
+    /// A pair is possible if the invoice's row is newer than the link's, or its
+    /// date is on or after the mail's; the invoice came from the portal, is
+    /// stored and its file still exists. Among the possible pairs the closest
+    /// dates go first, ties by the older link and then the older invoice. The
+    /// whole company is paired at once, so two mails never claim one invoice.
+    /// `with_review` also counts documents waiting for review.
+    pub fn link_assignment(
+        &self,
+        company_id: &str,
+        with_review: bool,
+    ) -> Result<HashMap<i64, i64>, IndexError> {
+        let query = format!(
+            "SELECT id, invoice_date FROM invoices
+             WHERE company_id = ?1 AND status = 'portal_fetch_required' {}",
+            self.waiting_condition()?
+        );
+        let links = self.ids_and_dates(&query, company_id, false)?;
+        if links.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let statuses = if with_review {
+            "'stored', 'needs_review'"
+        } else {
+            "'stored'"
+        };
+        let available = if schema_version(&self.conn)? >= SETTLED_BY_VERSION {
+            "AND id NOT IN (SELECT settled_by FROM invoices WHERE settled_by IS NOT NULL)"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT id, invoice_date, file_path FROM invoices
+             WHERE company_id = ?1 AND source = 'portal' AND status IN ({statuses})
+               AND file_path IS NOT NULL {available}"
+        );
+        let invoices = self.ids_and_dates(&query, company_id, true)?;
+
+        let mut pairs = Vec::new();
+        for &(link, mail_date) in &links {
+            for &(invoice, invoice_date) in &invoices {
+                let dates = mail_date.zip(invoice_date);
+                if invoice > link || dates.is_some_and(|(mail, document)| document >= mail) {
+                    let distance = dates.map_or(i64::MAX, |(mail, document)| {
+                        (document - mail).num_days().abs()
+                    });
+                    pairs.push((distance, link, invoice));
+                }
             }
         }
-        Ok(false)
+        pairs.sort_unstable();
+
+        let mut assignment = HashMap::new();
+        let mut taken = HashSet::new();
+        for (_, link, invoice) in pairs {
+            if !assignment.contains_key(&link) && taken.insert(invoice) {
+                assignment.insert(link, invoice);
+            }
+        }
+        Ok(assignment)
+    }
+
+    /// Rows as id and date. With `existing_file`, the query's third column is a
+    /// path, and rows whose file is gone are left out.
+    fn ids_and_dates(
+        &self,
+        query: &str,
+        company_id: &str,
+        existing_file: bool,
+    ) -> Result<Vec<(i64, Option<NaiveDate>)>, IndexError> {
+        let mut statement = self.conn.prepare(query)?;
+        let rows = statement.query_map([company_id], |row| {
+            let id: i64 = row.get(0)?;
+            let date: Option<String> = row.get(1)?;
+            let present = !existing_file
+                || row
+                    .get::<_, Option<String>>(2)?
+                    .is_some_and(|path| Path::new(&path).exists());
+            Ok(present.then(|| (id, date.and_then(|d| d.parse().ok()))))
+        })?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.extend(row?);
+        }
+        Ok(found)
     }
 
     /// The noted link mails that are not done yet, newest first. An index from
@@ -495,20 +612,23 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Records that a link mail's invoice is stored and the mail was cleaned up.
+    /// Records that a link mail's invoice is stored and the mail was cleaned up,
+    /// and which invoice settled it, so that this invoice settles no other mail.
     pub fn resolve_link_mail(
         &self,
         company_id: &str,
         mail_account: &str,
         mail_id: &str,
+        invoice_id: i64,
     ) -> Result<(), IndexError> {
         self.conn.execute(
             "UPDATE invoices
              SET resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                 disposed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 disposed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 settled_by = ?4
              WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
                AND status = 'portal_fetch_required'",
-            params![company_id, mail_account, mail_id],
+            params![company_id, mail_account, mail_id, invoice_id],
         )?;
         Ok(())
     }
@@ -1159,11 +1279,14 @@ mod tests {
             .record_portal_fetch_required("acme", "main", "<other>", None)
             .unwrap();
 
-        index.resolve_link_mail("acme", "main", "<link>").unwrap();
+        index
+            .resolve_link_mail("acme", "main", "<link>", 42)
+            .unwrap();
 
         let rows = index.invoices_of("acme").unwrap();
         assert!(rows[0].resolved_at.is_some());
         assert!(rows[0].disposed_at.is_some());
+        assert_eq!(rows[0].settled_by, Some(42));
         assert_eq!(rows[1].resolved_at, None);
         assert!(
             !index
@@ -1171,6 +1294,176 @@ mod tests {
                 .unwrap(),
             "a mail that comes back is not noted again"
         );
+    }
+
+    fn ymd(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    /// Stores a portal invoice of this date with its own file and hash.
+    fn add_portal_invoice(index: &Index, dir: &Path, number: &str, date: NaiveDate) -> i64 {
+        let file = dir.join(format!("{number}.pdf"));
+        fs::write(&file, b"x").unwrap();
+        index
+            .insert(&NewInvoice {
+                invoice_no: Some(number.into()),
+                file_hash: number.into(),
+                portal_key: Some(number.into()),
+                ..portal_invoice(&file, Some(date), Status::Stored)
+            })
+            .unwrap()
+    }
+
+    /// Link mails of 3 October and 3 November, both waiting.
+    fn october_and_november() -> Index {
+        let index = Index::open_in_memory().unwrap();
+        for (mail, date) in [("<oct>", ymd(2026, 10, 3)), ("<nov>", ymd(2026, 11, 3))] {
+            index
+                .record_portal_fetch_required("acme", "main", mail, Some(date))
+                .unwrap();
+        }
+        index
+    }
+
+    fn invoice_of(index: &Index, mail: &str) -> Option<i64> {
+        index.invoice_for_link_mail("acme", "main", mail).unwrap()
+    }
+
+    #[test]
+    fn one_invoice_settles_only_the_link_mail_closest_to_its_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = october_and_november();
+
+        let october = add_portal_invoice(&index, dir.path(), "R-10", ymd(2026, 10, 1));
+
+        assert_eq!(invoice_of(&index, "<oct>"), Some(october));
+        assert_eq!(invoice_of(&index, "<nov>"), None, "November still waits");
+        assert!(
+            !index
+                .link_mail_has_document("acme", "main", "<nov>")
+                .unwrap()
+        );
+
+        // Once the October mail is settled, its invoice is gone for good.
+        index
+            .resolve_link_mail("acme", "main", "<oct>", october)
+            .unwrap();
+        assert_eq!(invoice_of(&index, "<oct>"), None, "no longer waiting");
+        assert_eq!(invoice_of(&index, "<nov>"), None);
+    }
+
+    #[test]
+    fn the_november_invoice_alone_settles_the_november_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = october_and_november();
+
+        let november = add_portal_invoice(&index, dir.path(), "R-11", ymd(2026, 11, 1));
+
+        assert_eq!(invoice_of(&index, "<oct>"), None);
+        assert_eq!(invoice_of(&index, "<nov>"), Some(november));
+    }
+
+    #[test]
+    fn two_invoices_settle_both_link_mails_each_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = october_and_november();
+        // Stored in the other order, so the row order does not decide.
+        let november = add_portal_invoice(&index, dir.path(), "R-11", ymd(2026, 11, 1));
+        let october = add_portal_invoice(&index, dir.path(), "R-10", ymd(2026, 10, 1));
+
+        assert_eq!(invoice_of(&index, "<oct>"), Some(october));
+        assert_eq!(invoice_of(&index, "<nov>"), Some(november));
+        index
+            .resolve_link_mail("acme", "main", "<nov>", november)
+            .unwrap();
+        assert_eq!(invoice_of(&index, "<oct>"), Some(october));
+    }
+
+    #[test]
+    fn an_old_invoice_from_before_the_link_mails_settles_none_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open_in_memory().unwrap();
+        add_portal_invoice(&index, dir.path(), "R-9", ymd(2026, 9, 1));
+        for (mail, date) in [("<oct>", ymd(2026, 10, 3)), ("<nov>", ymd(2026, 11, 3))] {
+            index
+                .record_portal_fetch_required("acme", "main", mail, Some(date))
+                .unwrap();
+        }
+
+        assert_eq!(invoice_of(&index, "<oct>"), None);
+        assert_eq!(invoice_of(&index, "<nov>"), None);
+    }
+
+    #[test]
+    fn an_invoice_that_settled_a_mail_does_not_settle_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open_in_memory().unwrap();
+        index
+            .record_portal_fetch_required("acme", "main", "<oct>", Some(ymd(2026, 10, 3)))
+            .unwrap();
+        let october = add_portal_invoice(&index, dir.path(), "R-10", ymd(2026, 10, 1));
+        index
+            .resolve_link_mail("acme", "main", "<oct>", october)
+            .unwrap();
+
+        index
+            .record_portal_fetch_required("acme", "main", "<again>", None)
+            .unwrap();
+
+        assert_eq!(invoice_of(&index, "<again>"), None);
+    }
+
+    #[test]
+    fn a_dry_run_pairs_link_mails_on_an_index_from_before_settled_by() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..SETTLED_BY_VERSION - 1] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (SETTLED_BY_VERSION - 1) as i64)
+            .unwrap();
+        drop(conn);
+        let writer = Index {
+            conn: Connection::open(&path).unwrap(),
+        };
+        for (mail, date) in [("<oct>", ymd(2026, 10, 3)), ("<nov>", ymd(2026, 11, 3))] {
+            writer
+                .record_portal_fetch_required("acme", "main", mail, Some(date))
+                .unwrap();
+        }
+        let october = add_portal_invoice(&writer, dir.path(), "R-10", ymd(2026, 10, 1));
+        drop(writer);
+
+        let index = Index::open_read_only(&path).unwrap().unwrap();
+
+        assert_eq!(invoice_of(&index, "<oct>"), Some(october));
+        assert_eq!(invoice_of(&index, "<nov>"), None);
+        assert_eq!(index.invoices_of("acme").unwrap()[0].settled_by, None);
+        assert_eq!(
+            schema_version(&index.conn).unwrap(),
+            SETTLED_BY_VERSION - 1,
+            "a dry run never migrates"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_pairs_link_mails_on_an_index_from_before_automation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        index_before_automation(&path);
+        let writer = Index {
+            conn: Connection::open(&path).unwrap(),
+        };
+        writer
+            .record_portal_fetch_required("acme", "main", "<oct>", Some(ymd(2026, 10, 3)))
+            .unwrap();
+        let october = add_portal_invoice(&writer, dir.path(), "R-10", ymd(2026, 10, 1));
+        drop(writer);
+
+        let index = Index::open_read_only(&path).unwrap().unwrap();
+
+        assert_eq!(invoice_of(&index, "<oct>"), Some(october));
     }
 
     #[test]

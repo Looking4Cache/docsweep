@@ -410,13 +410,14 @@ pub struct LinkStep {
 
 #[derive(Debug)]
 enum LinkAction {
-    Dispose(DisposalAction),
+    /// Clean up the mail; the invoice with this id settles it.
+    Dispose(DisposalAction, i64),
     Flag(String),
 }
 
 /// The safety rule for link mails: a mail is only cleaned up if a fetch ran now
 /// and had no failures, and the index holds a stored invoice that matches this
-/// mail. A successful fetch alone is not enough, because the invoice may not be
+/// mail and no other ([`Index::link_assignment`]). A successful fetch alone is not enough, because the invoice may not be
 /// in the portal yet. A company in assisted mode has no fetch to wait for, so only
 /// the index counts. Mails that simply stay are settled here; the returned steps
 /// need the mailbox.
@@ -450,13 +451,12 @@ pub fn decide_link_mails(
                 "the portal download failed: {reason}"
             )))
         } else {
-            match index.has_invoice_for_link_mail(company_id, account_id, &mail.plan.message_id) {
-                Ok(true) => Some(LinkAction::Dispose(disposal_for(
-                    config,
-                    company,
-                    MailKind::Link,
-                ))),
-                Ok(false) => None,
+            match index.invoice_for_link_mail(company_id, account_id, &mail.plan.message_id) {
+                Ok(Some(invoice)) => Some(LinkAction::Dispose(
+                    disposal_for(config, company, MailKind::Link),
+                    invoice,
+                )),
+                Ok(None) => None,
                 Err(error) => Some(LinkAction::Flag(error.to_string())),
             }
         };
@@ -496,22 +496,28 @@ pub async fn apply_link_steps<W: MailWriter>(
         } else {
             match step.action {
                 LinkAction::Flag(message) => fail(writer, uid, message).await,
-                LinkAction::Dispose(disposal) => match dispose(writer, uid, &disposal).await {
-                    Err(error) => fail(writer, uid, error.to_string()).await,
-                    Ok(()) => {
-                        let noted =
-                            index.resolve_link_mail(&step.company_id, account_id, message_id);
-                        match noted {
-                            Ok(()) => Outcome::LinkResolved { disposal },
-                            // The mail has been handled, so flagging would be wrong.
-                            Err(error) => Outcome::Failed {
-                                message: format!(
-                                    "mail cleaned up, but not noted in the index: {error}"
-                                ),
-                            },
+                LinkAction::Dispose(disposal, invoice) => {
+                    match dispose(writer, uid, &disposal).await {
+                        Err(error) => fail(writer, uid, error.to_string()).await,
+                        Ok(()) => {
+                            let noted = index.resolve_link_mail(
+                                &step.company_id,
+                                account_id,
+                                message_id,
+                                invoice,
+                            );
+                            match noted {
+                                Ok(()) => Outcome::LinkResolved { disposal },
+                                // The mail has been handled, so flagging would be wrong.
+                                Err(error) => Outcome::Failed {
+                                    message: format!(
+                                        "mail cleaned up, but not noted in the index: {error}"
+                                    ),
+                                },
+                            }
                         }
                     }
-                },
+                }
             }
         };
     }
@@ -1221,7 +1227,9 @@ companies:
         let mut mailbox =
             FakeMailbox::with(vec![link_mail("1@x"), link_mail("2@x"), link_mail("3@x")]);
         let mut portal = fetcher(|company| {
-            store_portal_invoice(&setup, &index, "R-1");
+            for number in ["R-1", "R-2", "R-3"] {
+                store_portal_invoice(&setup, &index, number);
+            }
             fine(company)
         });
 
@@ -1230,6 +1238,100 @@ companies:
         assert_eq!(portal.started, ["acme"]);
         assert_eq!(mailbox.trashed, [1, 2, 3]);
         assert_eq!(mails.len(), 3);
+    }
+
+    #[test]
+    fn one_stored_invoice_settles_only_one_of_several_link_mails() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x"), link_mail("2@x")]);
+        let mut portal = fetcher(|company| {
+            store_portal_invoice(&setup, &index, "R-1");
+            fine(company)
+        });
+
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(mailbox.trashed, [1]);
+        assert!(mailbox.flagged.is_empty());
+        assert!(matches!(mails[0].outcome, Outcome::LinkResolved { .. }));
+        assert_eq!(mails[1].outcome, Outcome::AwaitingInvoice);
+        let rows = index.invoices_of("acme").unwrap();
+        let invoice = rows.iter().find(|r| r.status == Status::Stored).unwrap();
+        assert_eq!(rows[0].settled_by, Some(invoice.id));
+        assert_eq!(rows[1].resolved_at, None);
+    }
+
+    /// A link mail sent on another day than the usual 3 November 2026.
+    fn link_mail_of(id: &str, date: &str) -> Vec<u8> {
+        String::from_utf8(link_mail(id))
+            .unwrap()
+            .replace("Tue, 03 Nov 2026", date)
+            .into_bytes()
+    }
+
+    fn import(setup: &Setup, index: &Index, text: &[&str]) {
+        use crate::pickup::{LocalFolder, import_file};
+        let downloads = tempfile::tempdir().unwrap();
+        fs::write(
+            downloads.path().join("invoice.pdf"),
+            test_pdf::with_text(text),
+        )
+        .unwrap();
+        let folder = LocalFolder::new(downloads.path().to_path_buf());
+        import_file(
+            &setup.config,
+            &setup.config.companies[0],
+            index,
+            &folder,
+            "invoice.pdf",
+            None,
+            day(1),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn importing_the_october_invoice_cleans_up_only_the_october_link_mail() {
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![
+            link_mail_of("oct@x", "Sat, 03 Oct 2026"),
+            link_mail("nov@x"),
+        ]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        assert!(mailbox.untouched());
+
+        import(
+            &setup,
+            &index,
+            &["Rechnungsnummer: R-10", "Rechnungsdatum: 01.10.2026"],
+        );
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(mailbox.trashed, [1], "only October");
+        assert!(matches!(mails[0].outcome, Outcome::LinkResolved { .. }));
+        assert_eq!(mails[1].outcome, Outcome::AwaitingInvoice);
+        assert_eq!(
+            crate::pickup::pending_pickups(&setup.config, &index)
+                .unwrap()
+                .len(),
+            1,
+            "November is still to pick up"
+        );
+
+        import(
+            &setup,
+            &index,
+            &["Rechnungsnummer: R-11", "Rechnungsdatum: 01.11.2026"],
+        );
+        mailbox.mails.remove(&1);
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+
+        assert_eq!(mailbox.trashed, [1, 2]);
+        assert!(matches!(mails[0].outcome, Outcome::LinkResolved { .. }));
+        assert!(mailbox.flagged.is_empty());
     }
 
     #[test]
