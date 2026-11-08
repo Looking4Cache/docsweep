@@ -20,7 +20,7 @@ use docsweep_core::portal::driver::{
     BrowserDriver, ConfirmationHandler, DriverError, PortalFetcher,
 };
 use docsweep_core::portal::engine::{
-    FetchError, FetchJob, FetchReport, RecipeNotice, RepairSetup, run_recipe,
+    FetchError, FetchJob, FetchReport, RecipeNotice, RepairSetup, RunOrigin, run_recipe,
 };
 use docsweep_core::portal::recipe::{AiFallback, Recipe};
 use docsweep_core::portal::recipe_path;
@@ -58,6 +58,8 @@ pub struct FetchOptions {
     pub window: WindowMode,
     /// Use this recipe instead of the company's `portal.recipe`.
     pub recipe_file: Option<PathBuf>,
+    /// Who started the run, which decides how a repair asks before it sends.
+    pub origin: RunOrigin,
 }
 
 fn load_recipe(
@@ -117,7 +119,7 @@ pub async fn fetch_company<H: ConfirmationHandler>(
         options.dry_run,
     );
     let mut job = match job {
-        Ok(job) => job,
+        Ok(job) => job.with_origin(options.origin),
         Err(error) => return failed(error.to_string()),
     };
     // Nothing is set up, and no key read, unless both the recipe and the
@@ -194,6 +196,8 @@ pub struct BrowserFetcher<'a, H> {
     pub index: &'a Path,
     pub window: WindowMode,
     pub handler: &'a mut H,
+    /// Automatic for the schedule and polling, so that every repair send asks.
+    pub origin: RunOrigin,
 }
 
 impl<H: ConfirmationHandler> PortalFetcher for BrowserFetcher<'_, H> {
@@ -206,6 +210,7 @@ impl<H: ConfirmationHandler> PortalFetcher for BrowserFetcher<'_, H> {
             dry_run: false,
             window: self.window,
             recipe_file: None,
+            origin: self.origin,
         };
         fetch_company(
             self.config,

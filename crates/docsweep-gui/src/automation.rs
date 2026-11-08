@@ -10,6 +10,7 @@ use chrono::{DateTime, Local, Utc};
 use docsweep_browser::{BrowserFetcher, WindowMode};
 use docsweep_core::automation::{Tick, run_tick, worth_recording};
 use docsweep_core::config::Config;
+use docsweep_core::portal::engine::RunOrigin;
 use docsweep_core::secrets::KeyringStore;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -65,6 +66,8 @@ fn tick(app: &AppHandle, last_poll: &mut Option<DateTime<Utc>>) {
         index: &paths.index,
         window: WindowMode::OnDemand,
         handler: &mut handler,
+        // Every repair send of an automatic run waits for a person's yes.
+        origin: RunOrigin::Automatic,
     };
     let result = runtime.block_on(run_tick(
         &config,

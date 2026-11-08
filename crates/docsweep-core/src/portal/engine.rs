@@ -129,6 +129,18 @@ pub struct RepairSetup {
     pub recipe_file: PathBuf,
 }
 
+/// Who started a run. It decides how a repair gets permission to send a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunOrigin {
+    /// A person started it, or a scan a person started. The first send per
+    /// company and provider needs their yes, which is remembered.
+    #[default]
+    Manual,
+    /// The schedule or polling started it. Every send needs a yes for that very
+    /// send; a remembered yes does not count, and none is remembered.
+    Automatic,
+}
+
 /// Everything a run depends on.
 pub struct FetchJob<'a> {
     pub config: &'a Config,
@@ -143,6 +155,7 @@ pub struct FetchJob<'a> {
     pub dry_run: bool,
     /// Only set if a provider is configured. The recipe still has to allow it.
     repair: Option<RepairSetup>,
+    origin: RunOrigin,
 }
 
 impl<'a> FetchJob<'a> {
@@ -170,7 +183,14 @@ impl<'a> FetchJob<'a> {
             today,
             dry_run,
             repair: None,
+            origin: RunOrigin::Manual,
         })
+    }
+
+    /// Says who started the run.
+    pub fn with_origin(mut self, origin: RunOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// Lets the run repair a step, if the recipe says `ai_fallback: repair_step`.
@@ -661,14 +681,18 @@ impl<'a, 'j, D: BrowserDriver, H: ConfirmationHandler> Run<'a, 'j, D, H> {
     }
 
     /// The first send for a company goes through a person, who sees the very text.
-    /// After that, `ai_fallback: repair_step` in the recipe is permission enough.
+    /// After that, `ai_fallback: repair_step` in the recipe is permission enough,
+    /// but only in a run a person started. An automatic run asks for every send,
+    /// and its answers are not remembered.
     async fn get_consent(&mut self, provider: &str, text: &str) -> Result<(), String> {
         let job = self.job;
         let index = job.index.ok_or("no index")?;
         let company = &job.company.id;
-        let known = index
-            .has_ai_consent(company, provider)
-            .map_err(|error| error.to_string())?;
+        let automatic = job.origin == RunOrigin::Automatic;
+        let known = !automatic
+            && index
+                .has_ai_consent(company, provider)
+                .map_err(|error| error.to_string())?;
         if known {
             return Ok(());
         }
@@ -678,6 +702,7 @@ impl<'a, 'j, D: BrowserDriver, H: ConfirmationHandler> Run<'a, 'j, D, H> {
             provider: provider.to_owned(),
             text: text.to_owned(),
             timeout_secs: limit,
+            automatic,
         };
         let answer = timeout_at(
             Instant::now() + Duration::from_secs(limit),
@@ -685,6 +710,7 @@ impl<'a, 'j, D: BrowserDriver, H: ConfirmationHandler> Run<'a, 'j, D, H> {
         )
         .await;
         match answer {
+            Ok(true) if automatic => Ok(()),
             Ok(true) => index
                 .note_ai_consent(company, provider)
                 .map_err(|error| error.to_string()),
@@ -1639,6 +1665,8 @@ mod tests {
         expired: bool,
         /// Whether a person agrees to send a page to a provider.
         approves_send: bool,
+        /// Nobody answers the question about a send.
+        ignores_send: bool,
         send_requests: Vec<AiSendRequest>,
     }
 
@@ -1649,6 +1677,7 @@ mod tests {
                 asked: Vec::new(),
                 expired: false,
                 approves_send: true,
+                ignores_send: false,
                 send_requests: Vec::new(),
             }
         }
@@ -1668,6 +1697,9 @@ mod tests {
         }
         async fn approve_ai_send(&mut self, request: &AiSendRequest) -> bool {
             self.send_requests.push(request.clone());
+            if self.ignores_send {
+                std::future::pending::<()>().await;
+            }
             self.approves_send
         }
     }
@@ -3179,6 +3211,17 @@ steps:
                 driver: &mut FakeDriver,
                 handler: &mut FakeHandler,
             ) -> FetchReport {
+                self.run_as(RunOrigin::Manual, dry_run, with_ai, driver, handler)
+            }
+
+            fn run_as(
+                &self,
+                origin: RunOrigin,
+                dry_run: bool,
+                with_ai: bool,
+                driver: &mut FakeDriver,
+                handler: &mut FakeHandler,
+            ) -> FetchReport {
                 let recipe = Recipe::load(&self.file)
                     .unwrap()
                     .with_params(&BTreeMap::new())
@@ -3192,7 +3235,8 @@ steps:
                     today(),
                     dry_run,
                 )
-                .unwrap();
+                .unwrap()
+                .with_origin(origin);
                 if with_ai {
                     job = job.with_repair(RepairSetup {
                         ai: self.ai(),
@@ -3366,6 +3410,135 @@ steps:
 
             assert_eq!(handler.send_requests.len(), 1);
             assert_eq!(world.server.requests().len(), 2);
+        }
+
+        /// A person agreed to sends for this company in an earlier, manual run.
+        fn with_stored_consent(world: &World) {
+            world
+                .setup
+                .index
+                .note_ai_consent("acme", "Anthropic")
+                .unwrap();
+        }
+
+        #[test]
+        fn a_manual_run_with_stored_consent_does_not_ask() {
+            let world = World::new(RECIPE, GOOD_LOGIN);
+            with_stored_consent(&world);
+            let mut handler = nobody();
+
+            let report = world.run_as(RunOrigin::Manual, false, true, &mut portal(), &mut handler);
+
+            assert_eq!(report.error, None, "{report:?}");
+            assert!(handler.send_requests.is_empty());
+            assert_eq!(world.server.requests().len(), 1);
+        }
+
+        #[test]
+        fn an_automatic_run_asks_for_every_send_despite_stored_consent() {
+            let world = World::new(RECIPE, GOOD_LOGIN);
+            with_stored_consent(&world);
+            let mut handler = nobody();
+
+            let report = world.run_as(
+                RunOrigin::Automatic,
+                false,
+                true,
+                &mut portal(),
+                &mut handler,
+            );
+            fs::write(&world.file, RECIPE).unwrap();
+            world.run_as(
+                RunOrigin::Automatic,
+                false,
+                true,
+                &mut portal(),
+                &mut handler,
+            );
+
+            assert_eq!(report.error, None, "{report:?}");
+            assert_eq!(handler.send_requests.len(), 2, "one question per send");
+            assert!(
+                handler
+                    .send_requests
+                    .iter()
+                    .all(|request| request.automatic)
+            );
+            assert_eq!(world.server.requests().len(), 2);
+        }
+
+        #[test]
+        fn a_yes_in_an_automatic_run_is_not_remembered() {
+            let world = World::new(RECIPE, GOOD_LOGIN);
+            let mut handler = nobody();
+
+            world.run_as(
+                RunOrigin::Automatic,
+                false,
+                true,
+                &mut portal(),
+                &mut handler,
+            );
+
+            assert_eq!(world.server.requests().len(), 1);
+            assert!(
+                !world
+                    .setup
+                    .index
+                    .has_ai_consent("acme", "Anthropic")
+                    .unwrap()
+            );
+            fs::write(&world.file, RECIPE).unwrap();
+            world.run_as(RunOrigin::Manual, false, true, &mut portal(), &mut handler);
+            assert_eq!(
+                handler.send_requests.len(),
+                2,
+                "a manual run still asks first"
+            );
+            assert!(!handler.send_requests[1].automatic);
+        }
+
+        #[test]
+        fn a_no_in_an_automatic_run_sends_nothing_despite_stored_consent() {
+            let world = World::new(RECIPE, GOOD_LOGIN);
+            with_stored_consent(&world);
+            let mut handler = nobody();
+            handler.approves_send = false;
+
+            let report = world.run_as(
+                RunOrigin::Automatic,
+                false,
+                true,
+                &mut portal(),
+                &mut handler,
+            );
+
+            assert_eq!(handler.send_requests.len(), 1);
+            assert!(world.server.requests().is_empty());
+            assert!(not_done_reason(&report).contains("nothing was sent"));
+            assert_eq!(world.file_text(), RECIPE);
+        }
+
+        #[test]
+        fn without_an_answer_in_time_an_automatic_run_sends_nothing() {
+            let recipe = format!("confirmation: {{ timeout_secs: 1 }}\n{RECIPE}");
+            let world = World::new(&recipe, GOOD_LOGIN);
+            with_stored_consent(&world);
+            let mut handler = nobody();
+            handler.ignores_send = true;
+
+            let report = world.run_as(
+                RunOrigin::Automatic,
+                false,
+                true,
+                &mut portal(),
+                &mut handler,
+            );
+
+            assert_eq!(handler.send_requests.len(), 1);
+            assert!(handler.expired);
+            assert!(world.server.requests().is_empty());
+            assert!(not_done_reason(&report).contains("in time"), "{report:?}");
         }
 
         #[test]

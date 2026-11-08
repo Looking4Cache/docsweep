@@ -26,7 +26,7 @@ use docsweep_core::portal::draft::{WriteError, draft_path, draft_text, write_dra
 use docsweep_core::portal::driver::{
     AiSendRequest, ConfirmationAnswer, ConfirmationHandler, ConfirmationRequest,
 };
-use docsweep_core::portal::engine::{FetchReport, FetchSummary, summarize_fetches};
+use docsweep_core::portal::engine::{FetchReport, FetchSummary, RunOrigin, summarize_fetches};
 use docsweep_core::portal::hosts::{HostChange, is_web_address};
 use docsweep_core::portal::recording::build_draft;
 use docsweep_core::review;
@@ -633,6 +633,7 @@ fn fetch<H: ConfirmationHandler>(
         dry_run,
         window,
         recipe_file: None,
+        origin: RunOrigin::Manual,
     };
     let runtime = current_thread_runtime()?;
     let report = runtime.block_on(fetch_company(
@@ -763,6 +764,7 @@ fn scan<H: ConfirmationHandler>(
         index: &paths.index,
         window: WindowMode::OnDemand,
         handler,
+        origin: RunOrigin::Manual,
     };
     let report = runtime
         .block_on(execute::run_mail_scan(

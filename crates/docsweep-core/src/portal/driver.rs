@@ -99,6 +99,9 @@ pub struct AiSendRequest {
     /// Exactly what would be sent: the cleaned text.
     pub text: String,
     pub timeout_secs: u64,
+    /// An automatic run asks for every send, and the answer counts for this
+    /// send only.
+    pub automatic: bool,
 }
 
 /// Asks a person for help. The engine enforces the time limit by dropping the

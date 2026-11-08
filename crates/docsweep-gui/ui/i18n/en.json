@@ -346,6 +346,7 @@
   "ai.dont_send": "Don't send",
   "ai.send_to": "Send to {provider}",
   "ai.repair_title": "{name}: ask {provider} for a repair?",
+  "ai.repair_lead_automatic": "A step of this recipe no longer matches the portal, during an automatic run. This is exactly what would go to {provider}, with Docsweep's fixed instructions. Automatic runs ask every time, and your answer counts for this send only. Without an answer, nothing is sent.",
   "ai.repair_lead": "A step of this recipe no longer matches the portal. This is the first time this company's pages would go to {provider}, and this is exactly what goes out, with Docsweep's fixed instructions. Later repairs for this company go without asking, and every one is shown in the history.",
 
   "schedule.label": "Schedule",

@@ -178,7 +178,7 @@ export function watchPortalConfirmations() {
     closeOpen?.("replaced");
     sendDialog({
       title: t("ai.repair_title", { name: request.company_name, provider: request.provider }),
-      lead: t("ai.repair_lead", { provider: request.provider }),
+      lead: t(request.automatic ? "ai.repair_lead_automatic" : "ai.repair_lead", { provider: request.provider }),
       text: request.text,
       confirmLabel: t("ai.send_to", { provider: request.provider }),
       onClose: (close) => { closeOpen = close; },

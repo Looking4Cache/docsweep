@@ -26,7 +26,7 @@ use docsweep_core::paths::AppDirs;
 use docsweep_core::pickup::{LocalFolder, import_file, preview_import};
 use docsweep_core::portal::credentials::{PortalCredentials, TotpGenerator};
 use docsweep_core::portal::draft::{WriteError, draft_path, draft_text, write_draft};
-use docsweep_core::portal::engine::FetchReport;
+use docsweep_core::portal::engine::{FetchReport, RunOrigin};
 use docsweep_core::portal::hosts::is_web_address;
 use docsweep_core::portal::recipe::Recipe;
 use docsweep_core::portal::recording::build_draft;
@@ -211,6 +211,7 @@ fn fetch(
             WindowMode::OnDemand
         },
         recipe_file,
+        origin: RunOrigin::Manual,
     };
     let paths = FetchPaths::of(&dirs, &company.id);
 
@@ -453,6 +454,7 @@ fn mail_scan(config_path: Option<PathBuf>, dry_run: bool) -> Result<ExitCode, Cl
         index: &index_path,
         window: WindowMode::OnDemand,
         handler: &mut confirm::TerminalConfirmation,
+        origin: RunOrigin::Manual,
     };
     let scan: ScanReport = runtime.block_on(run_mail_scan(
         &config,

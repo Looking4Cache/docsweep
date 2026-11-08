@@ -36,7 +36,8 @@ use docsweep_core::portal::driver::{
     ConfirmationRequest,
 };
 use docsweep_core::portal::engine::{
-    EntryOutcome, FetchJob, FetchReport, RecipeNotice, RepairSetup, run_recipe, summarize_fetches,
+    EntryOutcome, FetchJob, FetchReport, RecipeNotice, RepairSetup, RunOrigin, run_recipe,
+    summarize_fetches,
 };
 use docsweep_core::portal::recipe::{Recipe, Step};
 use docsweep_core::portal::recording::build_draft;
@@ -414,6 +415,7 @@ companies:
             // Local runs must never open a window on the desktop.
             window: WindowMode::Hidden,
             recipe_file: None,
+            origin: RunOrigin::Manual,
         };
         block_on(fetch_company(
             &self.config,
@@ -581,6 +583,7 @@ fn a_link_mail_starts_the_recipe_and_is_cleaned_up_once_its_invoice_is_stored() 
         index: &index_path,
         window: WindowMode::Hidden,
         handler: &mut handler,
+        origin: RunOrigin::Manual,
     };
     let mut mails = Vec::new();
 
@@ -1097,6 +1100,7 @@ fn visible_mode_opens_a_window_and_on_demand_switches_with_the_same_profile() {
         dry_run: false,
         window: WindowMode::OnDemand,
         recipe_file: None,
+        origin: RunOrigin::Manual,
     };
 
     let report = block_on(fetch_company(
