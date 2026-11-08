@@ -113,37 +113,6 @@ export function renderSettings(app) {
           h("span", { class: "field-hint" }, t("settings.language.hint")))));
   }
 
-  // How long a link mail of a recipe company waits for its invoice.
-  function linkMailCard() {
-    const fallback = app.defaultGiveUpDays;
-    let days = String(app.config.defaults?.link_mail_give_up_days ?? fallback);
-    const form = h("div", { class: "form" },
-      field({
-        label: t("settings.link_mails.label"),
-        hint: t("settings.link_mails.hint", { days: fallback }),
-        path: "defaults.link_mail_give_up_days",
-        input: textInput({
-          value: days,
-          class: "input-short",
-          inputmode: "numeric",
-          oninput: (event) => { days = event.target.value.trim(); },
-        }),
-      }),
-    );
-    return card({
-      title: t("settings.link_mails.title"),
-      lead: t("settings.link_mails.lead"),
-      form,
-      save: () => {
-        const value = Number(days);
-        if (!days || !Number.isInteger(value) || value < 1) {
-          throw { message: "", issues: [{ path: "defaults.link_mail_give_up_days", message: t("settings.link_mails.invalid") }] };
-        }
-        return withDefault("link_mail_give_up_days", value === fallback ? null : value);
-      },
-    });
-  }
-
   function cleanupCard() {
     const disposal = { ...app.config.mail.disposal };
     return card({
@@ -325,7 +294,6 @@ export function renderSettings(app) {
     pageHeader(t("settings.title"), t("settings.lead")),
     folderCard(),
     downloadsCard(),
-    linkMailCard(),
     cleanupCard(),
     automationCard(),
     aiCard(),

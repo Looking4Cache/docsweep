@@ -164,12 +164,7 @@ Each invoice settles only one link mail. With two mails waiting, say for October
 
 A successful download that found nothing new is not enough, because the invoice may not be in the portal yet. The mail then stays in place, unflagged, and the portal is checked again at most once per day. A new link mail does not wait for that. A failed download leaves the mail in place and flags it.
 
-A link mail does not wait forever. Once it is 45 days old, counted from its date, and no matching invoice was found, Docsweep stops downloading for it and flags the mail, so you can look into it. It is not cleaned up, and later scans leave it alone. A preview already shows this. The number of days is under Settings, or in the file (at least 1):
-
-```yaml
-defaults:
-  link_mail_give_up_days: 45
-```
+A link mail does not wait forever. Once it is 15 days old, counted from its date, and no matching invoice was found, Docsweep stops downloading for it and flags the mail, so you can look into it. It is not cleaned up, and later scans leave it alone. A preview already shows this.
 
 This applies to companies where Docsweep logs in. Invoices you pick up yourself in assisted mode wait until you pick them up or mark them as done.
 

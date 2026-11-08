@@ -793,16 +793,16 @@ async fn a_link_mail_without_an_invoice_for_too_long_is_flagged_and_then_left_al
     scan_links(&config, &index, &mut portal, today()).await;
     assert_eq!(portal.started, 1);
 
-    // The test mails are from 3 November; 45 days later Docsweep stops waiting.
+    // The test mails are from 3 November; 15 days later Docsweep stops waiting.
     let mail_date = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
-    let late = mail_date + chrono::Days::new(45);
+    let late = mail_date + chrono::Days::new(15);
     let mails = scan_links(&config, &index, &mut portal, late).await;
 
     assert_eq!(portal.started, 1, "no download for a mail given up on");
     let Outcome::Failed { message } = &mails[0].outcome else {
         panic!("{:?}", mails[0].outcome);
     };
-    assert!(message.contains("within 45 days"), "{message}");
+    assert!(message.contains("within 15 days"), "{message}");
     let inbox = inspector.contents("INBOX").await;
     assert_eq!(inbox.len(), 1, "the mail stays");
     assert!(is_flagged(&inbox[0].1), "{inbox:?}");

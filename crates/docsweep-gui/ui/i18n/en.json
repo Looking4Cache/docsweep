@@ -405,11 +405,6 @@
   "automation.autostart": "Start Docsweep at login",
   "automation.autostart_hint": "Applies right away. Docsweep then starts in the tray, without a window.",
 
-  "settings.link_mails.title": "Link mails",
-  "settings.link_mails.lead": "A mail that only says your invoice is in the portal starts a download, and waits until its invoice is saved. For portals where Docsweep logs in, it stops waiting at some point and flags the mail for you instead. Invoices you pick up yourself wait until you mark them as done.",
-  "settings.link_mails.label": "Stop waiting after … days",
-  "settings.link_mails.hint": "Counted from the date of the mail. At least 1; the default is {days}.",
-  "settings.link_mails.invalid": "Please enter a whole number of days, at least 1.",
   "settings.language.title": "Language",
   "settings.language.label": "Interface language",
   "settings.language.auto": "Automatic (system language)",

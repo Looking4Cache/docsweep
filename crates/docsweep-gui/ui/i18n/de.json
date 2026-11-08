@@ -405,11 +405,6 @@
   "automation.autostart": "Docsweep bei der Anmeldung starten",
   "automation.autostart_hint": "Gilt sofort. Docsweep startet dann ohne Fenster in der Menüleiste bzw. im Infobereich.",
 
-  "settings.link_mails.title": "Hinweis-Mails",
-  "settings.link_mails.lead": "Eine Mail, die nur sagt, dass deine Rechnung im Portal liegt, startet einen Abruf und wartet, bis ihre Rechnung gespeichert ist. Bei Portalen, an denen sich Docsweep anmeldet, hört es irgendwann auf zu warten und markiert stattdessen die Mail für dich. Rechnungen, die du selbst abholst, warten, bis du sie als erledigt markierst.",
-  "settings.link_mails.label": "Nach … Tagen nicht mehr warten",
-  "settings.link_mails.hint": "Gezählt ab dem Datum der Mail. Mindestens 1; Vorgabe ist {days}.",
-  "settings.link_mails.invalid": "Bitte gib eine ganze Zahl an Tagen ein, mindestens 1.",
   "settings.language.title": "Sprache",
   "settings.language.label": "Sprache der Oberfläche",
   "settings.language.auto": "Automatisch (Systemsprache)",

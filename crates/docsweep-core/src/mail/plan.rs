@@ -142,7 +142,7 @@ pub enum MailAction {
         /// a download nor a cleanup.
         closed: Option<LinkClosure>,
         /// Recipe mode only: the mail has waited at least this many days
-        /// (`defaults.link_mail_give_up_days`) without a matching invoice, so a
+        /// ([`LINK_MAIL_GIVE_UP_DAYS`]) without a matching invoice, so a
         /// real run stops waiting, starts no download and flags it.
         give_up_after_days: Option<u32>,
     },
@@ -291,8 +291,11 @@ fn plan_link_mail(
     })
 }
 
+/// How many days a link mail of a recipe company waits for its invoice.
+pub const LINK_MAIL_GIVE_UP_DAYS: u32 = 15;
+
 /// A waiting link mail of a recipe company is given up once it is at least
-/// `defaults.link_mail_give_up_days` old, counted from the mail's date or, without
+/// [`LINK_MAIL_GIVE_UP_DAYS`] old, counted from the mail's date or, without
 /// one, from the day it was noted. A new mail always gets its first download, and
 /// a mail whose invoice is in the index is left for the cleanup.
 fn give_up_after(
@@ -301,7 +304,7 @@ fn give_up_after(
     mail: &IncomingMail,
     id: (&str, &str, &str),
 ) -> Result<Option<u32>, PlanError> {
-    let days = context.config.defaults.link_mail_give_up_days;
+    let days = LINK_MAIL_GIVE_UP_DAYS;
     let Some(since) = mail
         .date
         .or(index.link_mail_waiting_since(id.0, id.1, id.2)?)

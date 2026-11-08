@@ -553,9 +553,9 @@ mod tests {
         else {
             unreachable!();
         };
-        *give_up_after_days = Some(45);
+        *give_up_after_days = Some(15);
         let text = render(&[report], true);
-        assert!(text.contains("within 45 days"), "{text}");
+        assert!(text.contains("within 15 days"), "{text}");
         assert!(
             text.contains("would stay in place and be flagged"),
             "{text}"

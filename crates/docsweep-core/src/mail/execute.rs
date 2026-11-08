@@ -1732,7 +1732,7 @@ companies:
 
     #[test]
     fn a_link_mail_is_given_up_once_it_waited_the_configured_days() {
-        for (days, given_up) in [(44, false), (45, true), (46, true)] {
+        for (days, given_up) in [(14, false), (15, true), (16, true)] {
             let setup = setup(MOVE, WITH_PORTAL);
             let index = Index::open_in_memory().unwrap();
             let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
@@ -1763,7 +1763,7 @@ companies:
                     panic!("{days} days: {:?}", mails[0].outcome);
                 };
                 assert!(
-                    message.contains("no matching invoice was found in the portal within 45 days"),
+                    message.contains("no matching invoice was found in the portal within 15 days"),
                     "{message}"
                 );
                 assert!(row.given_up_at.is_some());
@@ -1824,35 +1824,6 @@ companies:
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn the_number_of_days_comes_from_the_configuration() {
-        let mut setup = setup(MOVE, WITH_PORTAL);
-        setup.config.defaults.link_mail_give_up_days = 10;
-        let index = Index::open_in_memory().unwrap();
-        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
-        let mut portal = fetcher(fine);
-        scan_with(
-            &setup,
-            &index,
-            &mut mailbox,
-            &mut portal,
-            days_after_the_mail(0),
-        );
-
-        let mails = scan_with(
-            &setup,
-            &index,
-            &mut mailbox,
-            &mut portal,
-            days_after_the_mail(10),
-        );
-
-        let Outcome::Failed { message } = &mails[0].outcome else {
-            panic!("{:?}", mails[0].outcome);
-        };
-        assert!(message.contains("within 10 days"), "{message}");
     }
 
     #[test]
@@ -1928,7 +1899,7 @@ companies:
             rules: &rules,
             index: Some(&index),
             account_id: "main",
-            today: days_after_the_mail(45),
+            today: days_after_the_mail(15),
         };
         let mut mails = Vec::new();
         block_on(scan_read_only(&context, &mut mailbox, &mut mails)).unwrap();
@@ -1936,7 +1907,7 @@ companies:
         assert!(matches!(
             mails[0].plan.action,
             MailAction::PortalFetchRequired {
-                give_up_after_days: Some(45),
+                give_up_after_days: Some(15),
                 fetch_due: false,
                 ..
             }
