@@ -69,6 +69,9 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE invoices ADD COLUMN settled_by INTEGER;
 "#,
+    r#"
+    ALTER TABLE invoices ADD COLUMN dismissed_at TEXT;
+"#,
 ];
 
 /// The first schema version with the column `portal_key`. A dry run reads an
@@ -80,6 +83,9 @@ const AUTOMATION_VERSION: usize = 4;
 /// The first schema version in which a link mail's row names the invoice that
 /// settled it (`settled_by`).
 const SETTLED_BY_VERSION: usize = 6;
+/// The first schema version in which a person can mark a link mail as done
+/// (`dismissed_at`).
+const DISMISSED_VERSION: usize = 7;
 
 /// Where an invoice came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -141,6 +147,16 @@ fn unknown_value(value: &str) -> rusqlite::Error {
     rusqlite::Error::InvalidParameterName(format!("unknown value `{value}` in the index"))
 }
 
+/// How a noted link mail stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkClosure {
+    /// Its invoice is stored and Docsweep cleaned up the mail.
+    Settled,
+    /// A person marked it as done; Docsweep did nothing to the mail.
+    Dismissed,
+}
+
 /// A stored document to add to the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInvoice {
@@ -180,6 +196,9 @@ pub struct InvoiceRecord {
     pub resolved_at: Option<String>,
     /// On a resolved `portal_fetch_required` row: the invoice that settled it.
     pub settled_by: Option<i64>,
+    /// On a resolved `portal_fetch_required` row: when a person marked it as done
+    /// without Docsweep storing an invoice or touching the mail.
+    pub dismissed_at: Option<String>,
 }
 
 impl InvoiceRecord {
@@ -203,6 +222,7 @@ impl InvoiceRecord {
             // A dry run can read an older index, which lacks this column.
             resolved_at: row.get("resolved_at").unwrap_or(None),
             settled_by: row.get("settled_by").unwrap_or(None),
+            dismissed_at: row.get("dismissed_at").unwrap_or(None),
         })
     }
 }
@@ -610,6 +630,59 @@ impl Index {
         )?;
         let rows = statement.query_map([], InvoiceRecord::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether and how a noted link mail stopped waiting. `None` for a mail that is
+    /// not noted or still waits.
+    pub fn link_mail_closure(
+        &self,
+        company_id: &str,
+        mail_account: &str,
+        mail_id: &str,
+    ) -> Result<Option<LinkClosure>, IndexError> {
+        let version = schema_version(&self.conn)?;
+        if version < AUTOMATION_VERSION {
+            return Ok(None);
+        }
+        let dismissed = if version >= DISMISSED_VERSION {
+            "dismissed_at"
+        } else {
+            "NULL"
+        };
+        let query = format!(
+            "SELECT resolved_at, {dismissed} FROM invoices
+             WHERE company_id = ?1 AND mail_account = ?2 AND mail_id = ?3
+               AND status = 'portal_fetch_required'"
+        );
+        let found = self
+            .conn
+            .query_row(&query, params![company_id, mail_account, mail_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })
+            .optional()?;
+        Ok(match found {
+            Some((Some(_), Some(_))) => Some(LinkClosure::Dismissed),
+            Some((Some(_), None)) => Some(LinkClosure::Settled),
+            _ => None,
+        })
+    }
+
+    /// Records that a person marked a waiting link mail as done, for instance
+    /// because they deleted it by hand. Nothing claims an invoice for it, and
+    /// `disposed_at` stays empty, since Docsweep did not touch the mail. Returns
+    /// whether a waiting row was found.
+    pub fn dismiss_link_mail(&self, id: i64) -> Result<bool, IndexError> {
+        let changed = self.conn.execute(
+            "UPDATE invoices
+             SET resolved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                 dismissed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1 AND status = 'portal_fetch_required' AND resolved_at IS NULL",
+            [id],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Records that a link mail's invoice is stored and the mail was cleaned up,
@@ -1294,6 +1367,89 @@ mod tests {
                 .unwrap(),
             "a mail that comes back is not noted again"
         );
+    }
+
+    #[test]
+    fn a_person_can_dismiss_a_waiting_link_mail_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, _) = with_link_mail(dir.path());
+        let link = index.invoices_of("acme").unwrap()[0].id;
+        let stored = index.insert(&invoice(Some("R-1"), "h1")).unwrap();
+        let closure = |index: &Index| index.link_mail_closure("acme", "main", "<link>").unwrap();
+        assert_eq!(closure(&index), None);
+
+        assert!(!index.dismiss_link_mail(stored).unwrap(), "not a link mail");
+        assert!(index.dismiss_link_mail(link).unwrap());
+        assert!(!index.dismiss_link_mail(link).unwrap(), "already done");
+
+        let row = index.invoice(link).unwrap().unwrap();
+        assert!(row.resolved_at.is_some());
+        assert!(row.dismissed_at.is_some());
+        assert_eq!(row.disposed_at, None, "Docsweep did not touch the mail");
+        assert_eq!(row.settled_by, None, "no invoice was claimed");
+        assert_eq!(closure(&index), Some(LinkClosure::Dismissed));
+        assert!(index.waiting_link_mails().unwrap().is_empty());
+        assert!(
+            !index
+                .record_portal_fetch_required("acme", "main", "<link>", None)
+                .unwrap(),
+            "a dismissed mail is not noted again"
+        );
+    }
+
+    #[test]
+    fn a_settled_link_mail_is_closed_as_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, _) = with_link_mail(dir.path());
+        index
+            .resolve_link_mail("acme", "main", "<link>", 7)
+            .unwrap();
+        assert_eq!(
+            index.link_mail_closure("acme", "main", "<link>").unwrap(),
+            Some(LinkClosure::Settled)
+        );
+        assert_eq!(
+            index.link_mail_closure("acme", "main", "<other>").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dry_run_reads_closures_on_an_index_from_before_dismissals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docsweep.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..DISMISSED_VERSION - 1] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", (DISMISSED_VERSION - 1) as i64)
+            .unwrap();
+        drop(conn);
+        let writer = Index {
+            conn: Connection::open(&path).unwrap(),
+        };
+        writer
+            .record_portal_fetch_required("acme", "main", "<link>", None)
+            .unwrap();
+        writer
+            .record_portal_fetch_required("acme", "main", "<open>", None)
+            .unwrap();
+        writer
+            .resolve_link_mail("acme", "main", "<link>", 7)
+            .unwrap();
+        drop(writer);
+
+        let index = Index::open_read_only(&path).unwrap().unwrap();
+
+        assert_eq!(
+            index.link_mail_closure("acme", "main", "<link>").unwrap(),
+            Some(LinkClosure::Settled)
+        );
+        assert_eq!(
+            index.link_mail_closure("acme", "main", "<open>").unwrap(),
+            None
+        );
+        assert_eq!(index.invoices_of("acme").unwrap()[0].dismissed_at, None);
     }
 
     fn ymd(year: i32, month: u32, day: u32) -> NaiveDate {

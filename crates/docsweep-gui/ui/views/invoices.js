@@ -10,6 +10,12 @@ const FILTERS = [
   ["portal", (row) => row.status === "portal_fetch_required" && !row.resolved_at],
 ];
 
+function statusBadge(row) {
+  if (row.dismissed_at) return badge("neutral", t("status.portal_dismissed"));
+  if (row.resolved_at) return badge("success", t("status.portal_resolved"));
+  return badge(STATUS_TONES[row.status], t(`status.${row.status}`));
+}
+
 function renderTemplate(template, date, number) {
   const [year, month, day] = date.split("-");
   const formats = { Y: year, m: month, d: day, y: (year ?? "").slice(2) };
@@ -95,9 +101,7 @@ export function renderInvoices(app) {
       h("td", {}, companyName(row.company_id)),
       h("td", { class: "cell-number" }, row.invoice_no ?? h("span", { class: "muted" }, t("invoices.no_number"))),
       h("td", { class: "cell-amount" }, formatAmount(row.amount, row.currency)),
-      h("td", {}, row.resolved_at
-        ? badge("success", t("status.portal_resolved"))
-        : badge(STATUS_TONES[row.status], t(`status.${row.status}`))),
+      h("td", {}, statusBadge(row)),
       h("td", { class: "cell-actions" },
         inReview && h("button", {
           class: "button button-small button-primary",

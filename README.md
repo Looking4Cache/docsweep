@@ -190,6 +190,8 @@ companies:
 6. The file is saved byte for byte under the company's file name, with the same duplicate check as a mail attachment. Only once it is in the index is the original deleted. A duplicate is reported, and its original stays where it is.
 7. The next scan finds the stored invoice and cleans up the link mail, under the rule for link mails above.
 
+If you deleted the mail yourself, or the invoice is already saved, "Done" on an item ends the wait after you confirm. Docsweep then neither saves anything nor touches the mail, and later scans leave that mail alone.
+
 The folder is `defaults.downloads_dir`, or under Settings; without it, your system's downloads folder.
 
 ```yaml

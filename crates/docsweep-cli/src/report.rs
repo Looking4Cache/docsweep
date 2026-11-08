@@ -3,6 +3,7 @@
 
 use std::fmt::Write;
 
+use docsweep_core::index::LinkClosure;
 use docsweep_core::mail::execute::{AccountReport, MailReport, Outcome};
 use docsweep_core::mail::plan::{
     DisposalAction, Disposition, MailAction, MailDecision, PlannedDocument, ReviewReason,
@@ -206,10 +207,19 @@ fn render_mail(out: &mut String, report: &MailReport, dry_run: bool) {
             fetch_due,
             assisted,
             cleanup,
+            closed,
             ..
         } => {
             let _ = writeln!(out, "    Company: {company_name}");
             match (assisted, cleanup, &report.outcome) {
+                _ if closed.is_some() => {
+                    out.push_str(match closed {
+                        Some(LinkClosure::Dismissed) => {
+                            "    Invoice: marked as done by you\n    Mail: left alone\n"
+                        }
+                        _ => "    Invoice: already stored\n    Mail: left alone\n",
+                    });
+                }
                 (true, Some(disposal), Outcome::Planned) => {
                     out.push_str("    Invoice: stored\n");
                     let _ = writeln!(out, "    Mail: would {}", describe_disposal(disposal));
@@ -477,6 +487,7 @@ mod tests {
                         fetch_due,
                         assisted: false,
                         cleanup: None,
+                        closed: None,
                     },
                 },
             }],
@@ -506,6 +517,19 @@ mod tests {
             true,
         );
         assert!(stored.contains("Invoice: stored"), "{stored}");
+    }
+
+    #[test]
+    fn a_link_mail_marked_as_done_says_so() {
+        let mut report = link_report(Outcome::Completed, false);
+        let MailAction::PortalFetchRequired { closed, .. } = &mut report.mails[0].plan.action
+        else {
+            unreachable!();
+        };
+        *closed = Some(LinkClosure::Dismissed);
+        let text = render(&[report], false);
+        assert!(text.contains("marked as done by you"), "{text}");
+        assert!(text.contains("left alone"), "{text}");
     }
 
     #[test]

@@ -143,11 +143,13 @@ pub fn summarize(reports: &[AccountReport]) -> ScanSummary {
                     }
                     summary.disposed += u32::from(matches!(decision, MailDecision::Dispose(_)));
                 }
-                MailAction::PortalFetchRequired { cleanup, .. } => {
+                MailAction::PortalFetchRequired {
+                    cleanup, closed, ..
+                } => {
                     let planned_cleanup = mail.outcome == Outcome::Planned && cleanup.is_some();
                     if planned_cleanup || matches!(mail.outcome, Outcome::LinkResolved { .. }) {
                         summary.disposed += 1;
-                    } else {
+                    } else if closed.is_none() {
                         summary.portal_fetches += 1;
                     }
                 }
@@ -430,10 +432,14 @@ pub fn decide_link_mails(
 ) -> Vec<LinkStep> {
     let mut steps = Vec::new();
     for (position, mail) in mails.iter_mut().enumerate() {
-        let MailAction::PortalFetchRequired { company_id, .. } = &mail.plan.action else {
+        let MailAction::PortalFetchRequired {
+            company_id, closed, ..
+        } = &mail.plan.action
+        else {
             continue;
         };
-        if mail.outcome != Outcome::Completed {
+        // A mail that no longer waits is left alone.
+        if mail.outcome != Outcome::Completed || closed.is_some() {
             continue;
         }
         let company = config.companies.iter().find(|c| &c.id == company_id);
@@ -621,6 +627,10 @@ async fn execute_plan<W: MailWriter>(
                 }
             }
         }
+        // Its row is done; noting it again or touching the mail would be wrong.
+        MailAction::PortalFetchRequired {
+            closed: Some(_), ..
+        } => Outcome::Completed,
         MailAction::PortalFetchRequired { company_id, .. } => {
             match index.record_portal_fetch_required(
                 company_id,
@@ -1493,6 +1503,7 @@ companies:
                     fetch_due: true,
                     assisted: false,
                     cleanup: None,
+                    closed: None,
                 },
             },
             outcome: Outcome::Failed {
@@ -1555,6 +1566,7 @@ companies:
                     fetch_due: true,
                     assisted: true,
                     cleanup: None,
+                    closed: None,
                 },
             },
             outcome: Outcome::Completed,
@@ -1634,6 +1646,64 @@ companies:
         assert!(portal.started.is_empty());
         assert!(matches!(mails[0].outcome, Outcome::LinkResolved { .. }));
         assert!(setup.dir.path().join("R-1.pdf").exists());
+    }
+
+    #[test]
+    fn a_dismissed_link_mail_is_neither_noted_again_nor_cleaned_up() {
+        let setup = setup(MOVE, ASSISTED);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        let item = crate::pickup::pending_pickups(&setup.config, &index)
+            .unwrap()
+            .remove(0);
+        crate::pickup::dismiss_pickup(&setup.config, &index, item.id).unwrap();
+
+        // Even an invoice that would have matched does not bring it back.
+        store_portal_invoice(&setup, &index, "R-1");
+        let mails = scan_with(&setup, &index, &mut mailbox, &mut portal, day(2));
+
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
+        assert!(portal.started.is_empty());
+        assert_eq!(mails[0].outcome, Outcome::Completed);
+        assert!(matches!(
+            mails[0].plan.action,
+            MailAction::PortalFetchRequired {
+                closed: Some(crate::index::LinkClosure::Dismissed),
+                fetch_due: false,
+                cleanup: None,
+                ..
+            }
+        ));
+        let rows = index.invoices_of("acme").unwrap();
+        assert_eq!(rows.len(), 2, "the link row and the invoice, nothing new");
+        assert_eq!(rows[0].settled_by, None);
+        assert_eq!(rows[0].disposed_at, None);
+        let summary = summarize(&[AccountReport {
+            account_id: "main".into(),
+            mails,
+            error: None,
+        }]);
+        assert_eq!(summary, ScanSummary::default());
+    }
+
+    #[test]
+    fn a_dismissed_link_mail_of_a_recipe_company_starts_no_download() {
+        let setup = setup(MOVE, WITH_PORTAL);
+        let index = Index::open_in_memory().unwrap();
+        let mut mailbox = FakeMailbox::with(vec![link_mail("1@x")]);
+        let mut portal = fetcher(fine);
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(1));
+        let link = index.invoices_of("acme").unwrap()[0].id;
+        assert!(index.dismiss_link_mail(link).unwrap());
+
+        scan_with(&setup, &index, &mut mailbox, &mut portal, day(2));
+
+        assert_eq!(portal.started.len(), 1, "only the first day");
+        assert!(mailbox.untouched());
+        assert!(mailbox.flagged.is_empty());
     }
 
     #[test]

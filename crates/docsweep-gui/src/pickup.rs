@@ -11,7 +11,7 @@ use docsweep_core::config::Config;
 use docsweep_core::index::Index;
 use docsweep_core::pickup::{
     ImportOutcome, LocalFolder, PickupError, PickupItem, PickupSession, SessionView,
-    pending_pickups,
+    dismiss_pickup as dismiss, pending_pickups,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -75,6 +75,19 @@ pub async fn list_pickups(state: State<'_, AppState>) -> Result<Vec<PickupItem>,
             Some(index) => Ok(pending_pickups(&config, &index)?),
             None => Ok(Vec::new()),
         }
+    })
+    .await
+}
+
+/// A person marked a pick-up as done, after the interface asked them to confirm.
+/// It takes the index id of the link mail. The mailbox is not touched.
+#[tauri::command]
+pub async fn dismiss_pickup(state: State<'_, AppState>, id: i64) -> Result<(), UiError> {
+    let paths = state.paths.clone();
+    blocking(move || {
+        let config = Config::load(&paths.config)?;
+        let index = Index::open(&paths.index)?;
+        dismiss(&config, &index, id).map_err(UiError::new)
     })
     .await
 }

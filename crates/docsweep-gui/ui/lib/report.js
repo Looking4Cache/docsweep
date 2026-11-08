@@ -104,7 +104,8 @@ function destination(mail, done) {
 
 // What is happening to the invoice behind a link mail.
 function linkMailNote(mail) {
-  const { assisted, cleanup, already_recorded: noted } = mail.plan.action;
+  const { assisted, cleanup, already_recorded: noted, closed } = mail.plan.action;
+  if (closed) return t(`row.link_${closed}`);
   if (assisted && mail.outcome.kind === "planned" && cleanup) return t("row.pickup_done");
   if (assisted && mail.outcome.kind === "planned" && !noted) return t("row.pickup_new");
   if (assisted && mail.outcome.kind === "planned") return t("row.pickup_waiting");

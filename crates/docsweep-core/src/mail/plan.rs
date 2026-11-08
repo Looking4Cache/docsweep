@@ -11,7 +11,7 @@ use super::IncomingMail;
 use super::rules::RuleSet;
 use crate::config::{Company, CompanyDisposal, Config, DisposalMode};
 use crate::document::{self, InvoiceFacts};
-use crate::index::{DuplicateCheck, Index, IndexError, Status};
+use crate::index::{DuplicateCheck, Index, IndexError, LinkClosure, Status};
 use crate::naming::FilenameTemplate;
 use crate::storage::{self, StorageError, sha256_hex};
 
@@ -137,6 +137,9 @@ pub enum MailAction {
         assisted: bool,
         /// Assisted mode only: its invoice is stored, so a real run would do this.
         cleanup: Option<DisposalAction>,
+        /// The mail no longer waits: its invoice settled it, or a person marked it
+        /// as done. Nothing more happens to it, neither a download nor a cleanup.
+        closed: Option<LinkClosure>,
     },
     /// Rule matches, but there is no PDF and no portal, so nothing can be done.
     NoDocument {
@@ -252,22 +255,24 @@ fn plan_link_mail(
 ) -> Result<MailAction, PlanError> {
     let id = (&company.id, context.account_id, &mail.message_id);
     let assisted = company.is_assisted();
-    let (already_recorded, fetched_today, cleanup) = match context.index {
+    let (already_recorded, fetched_today, cleanup, closed) = match context.index {
         Some(index) => (
             index.is_portal_fetch_recorded(id.0, id.1, id.2)?,
             index.last_link_fetch_on(id.0)? == Some(context.today),
             (assisted && index.has_invoice_for_link_mail(id.0, id.1, id.2)?)
                 .then(|| disposal_for(context.config, company, MailKind::Link)),
+            index.link_mail_closure(id.0, id.1, id.2)?,
         ),
-        None => (false, false, None),
+        None => (false, false, None, None),
     };
     Ok(MailAction::PortalFetchRequired {
         company_id: company.id.clone(),
         company_name: company.name.clone(),
         already_recorded,
-        fetch_due: !assisted && (!already_recorded || !fetched_today),
+        fetch_due: !assisted && closed.is_none() && (!already_recorded || !fetched_today),
         assisted,
         cleanup,
+        closed,
     })
 }
 

@@ -162,6 +162,8 @@ pub enum PickupError {
     OpenBrowser(String),
     #[error("this file is not waiting for your confirmation")]
     NotOffered,
+    #[error("this invoice is no longer waiting to be picked up")]
+    NotPending,
     #[error("cannot read {name}: {source}")]
     Read { name: String, source: io::Error },
     #[error("{0} is not a PDF")]
@@ -638,6 +640,20 @@ pub fn pending_pickups(config: &Config, index: &Index) -> Result<Vec<PickupItem>
         }
     }
     Ok(items)
+}
+
+/// A person says that a pick-up is done, for instance because they deleted the
+/// mail by hand or the invoice is stored already. Only a listed pick-up can be
+/// dismissed. Its row is resolved without an invoice and without anything done
+/// to the mail: the mail stays where it is, and later scans leave it alone.
+pub fn dismiss_pickup(config: &Config, index: &Index, id: i64) -> Result<(), PickupError> {
+    let listed = pending_pickups(config, index)?
+        .iter()
+        .any(|item| item.id == id);
+    if !listed || !index.dismiss_link_mail(id)? {
+        return Err(PickupError::NotPending);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1471,6 +1487,40 @@ companies:
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].company_name, "Acme");
         assert_eq!(items[0].mail_date, date);
+    }
+
+    #[test]
+    fn a_dismissed_pickup_is_no_longer_listed_and_only_listed_ones_can_be_dismissed() {
+        let world = world();
+        let index = world.index();
+        for (company, mail) in [("acme", "a@x"), ("robot", "r@x")] {
+            index
+                .record_portal_fetch_required(company, "main", mail, None)
+                .unwrap();
+        }
+        let rows = |company| index.invoices_of(company).unwrap().remove(0);
+        let robot = rows("robot").id;
+        assert!(matches!(
+            dismiss_pickup(&world.config, &index, robot),
+            Err(PickupError::NotPending)
+        ));
+        assert!(matches!(
+            dismiss_pickup(&world.config, &index, 999),
+            Err(PickupError::NotPending)
+        ));
+        assert_eq!(rows("robot").resolved_at, None);
+
+        let item = pending_pickups(&world.config, &index).unwrap().remove(0);
+        dismiss_pickup(&world.config, &index, item.id).unwrap();
+
+        assert!(pending_pickups(&world.config, &index).unwrap().is_empty());
+        let row = rows("acme");
+        assert!(row.dismissed_at.is_some());
+        assert_eq!(row.disposed_at, None);
+        assert!(matches!(
+            dismiss_pickup(&world.config, &index, item.id),
+            Err(PickupError::NotPending)
+        ));
     }
 
     #[test]

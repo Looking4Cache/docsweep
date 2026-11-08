@@ -3,7 +3,7 @@ import { h, icon, replace } from "../lib/dom.js";
 import { formatDate, formatDateTime, t, tn } from "../lib/i18n.js";
 import { endPickup, startPickup } from "../lib/pickup.js";
 import { plannedEffects, reportList, summaryStats } from "../lib/report.js";
-import { confirmDialog, emptyState, notice, pageHeader } from "../lib/ui.js";
+import { confirmDialog, emptyState, notice, pageHeader, toast } from "../lib/ui.js";
 
 // Survives switching views, so a preview is not lost.
 let current = { phase: "idle" };
@@ -120,6 +120,24 @@ export function renderScan(app) {
     );
   }
 
+  // A person says a pick-up is done, after a confirmation. The mailbox is left alone.
+  async function dismissPickup(item) {
+    const confirmed = await confirmDialog({
+      title: t("pickup.dismiss_title"),
+      text: t("pickup.dismiss_text"),
+      confirmLabel: t("pickup.dismiss_confirm"),
+    });
+    if (!confirmed) return;
+    try {
+      await api.dismissPickup(item.id);
+      app.pickupError = null;
+      toast(t("pickup.dismissed"));
+    } catch (error) {
+      app.pickupError = errorText(error);
+    }
+    app.refreshBadges();
+  }
+
   // Invoices waiting for a person, whatever a scan is up to. Showing them is all
   // that automatic runs ever do about them.
   function pickupPanel() {
@@ -152,7 +170,11 @@ export function renderScan(app) {
               class: "button button-small button-primary",
               disabled: Boolean(app.pickupSession),
               onclick: () => startPickup(app, item.company_id),
-            }, t("pickup.start")))))),
+            }, t("pickup.start")),
+            h("button", {
+              class: "button button-small button-quiet",
+              onclick: () => dismissPickup(item),
+            }, t("pickup.dismiss")))))),
     );
   }
 

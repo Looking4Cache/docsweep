@@ -28,6 +28,7 @@ export const api = {
   autostartEnabled: () => invoke("autostart_enabled"),
   setAutostart: (enabled) => invoke("set_autostart", { enabled }),
   listPickups: () => invoke("list_pickups"),
+  dismissPickup: (id) => invoke("dismiss_pickup", { id }),
   pickupStatus: () => invoke("pickup_status"),
   startPickup: (companyId) => invoke("start_pickup", { companyId }),
   confirmPickup: (fileName) => invoke("confirm_pickup", { fileName }),
