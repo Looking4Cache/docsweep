@@ -6,6 +6,10 @@
 # and the CLI are signed with it before they start, under a fixed identifier, so
 # the permission survives rebuilds. Without the variable, or for any other binary
 # such as tests, this only runs the program.
+#
+# The identity must not be revoked: `find-identity -v` still lists revoked
+# certificates as valid, but macOS then reports the binary as malware and moves
+# it to the trash. Delete revoked certificates from the keychain first.
 set -euo pipefail
 
 binary="$1"
